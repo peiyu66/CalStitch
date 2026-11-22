@@ -109,14 +109,73 @@ struct Rule: Hashable, Identifiable, Codable {
     var displayAppearance: RuleAppearance { appearance ?? .init() }
 
     var recurrenceCaption: String {
+        let count = Self.captionNumber(interval, measure: true)
+        let yearly = interval == 1 ? "每年" : "每\(count)年"
+        let monthly = interval == 1 ? "每月" : "每\(count)個月"
         if parent != nil {
+            let days = Self.captionNumber(offsetDays, measure: true)
             switch position {
-            case .before: "依據日期前 \(offsetDays) 天"
-            case .same: "與依據日期同一天"
-            case .after: "依據日期後 \(offsetDays) 天"
+            case .before: return "依據日期前\(days)天"
+            case .same: return "與依據日期同一天"
+            case .after: return "依據日期後\(days)天"
             }
-        } else {
-            "\(kind.rawValue) · 每 \(interval) \(period.rawValue)"
+        }
+        switch kind {
+        case .solar:
+            return date.isEmpty ? "\(yearly)的指定節氣" : "\(yearly)\(date)"
+        case .lunar:
+            let day = Self.lunarDayCaption(lunarDay)
+            if period == .month { return "農曆\(monthly)\(day)" }
+            let month = lunarMonth == 1 ? "正月" : Self.captionNumber(lunarMonth) + "月"
+            return "農曆\(yearly)\(lunarIsLeap ? "閏" : "")\(month)\(day)"
+        case .gregorian:
+            let startMonth = gregorianCalendar.component(.month, from: start)
+            let startDay = gregorianCalendar.component(.day, from: start)
+            switch period {
+            case .day: return interval == 1 ? "每天" : "每隔\(count)天"
+            case .week:
+                let weekday = Self.captionWeekday(weeklyWeekday ?? gregorianCalendar.component(.weekday, from: start))
+                return interval == 1 ? "每\(weekday)" : "每\(count)週的\(weekday)"
+            case .year, .month:
+                if let pattern = weekdayPattern {
+                    let ordinal = Self.captionNumber(pattern.ordinal)
+                    let weekday = Self.captionWeekday(pattern.weekday)
+                    if period == .year {
+                        let month = Self.captionNumber(pattern.month ?? startMonth)
+                        return "西元\(yearly)\(month)月的第\(ordinal)個\(weekday)"
+                    }
+                    return "西元\(monthly)的第\(ordinal)個\(weekday)"
+                }
+                let date = monthEnd && startDay == gregorianCalendar.range(of: .day, in: .month, for: start)?.last
+                    ? "月底" : Self.captionNumber(startDay) + "日"
+                if period == .year {
+                    return "西元\(yearly)\(Self.captionNumber(startMonth))月\(date == "月底" ? "底" : date)"
+                }
+                return "西元\(monthly)\(date)"
+            }
+        }
+    }
+
+    private static func captionWeekday(_ value: Int) -> String {
+        let weekdays = ["日", "一", "二", "三", "四", "五", "六"]
+        return (1...7).contains(value) ? "星期" + weekdays[value - 1] : "指定星期"
+    }
+
+    private static func captionNumber(_ value: Int, measure: Bool = false) -> String {
+        let digits = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"]
+        if value == 2 && measure { return "兩" }
+        if (0...9).contains(value) { return digits[value] }
+        guard (10...99).contains(value) else { return String(value) }
+        let tens = value / 10, ones = value % 10
+        return (tens == 1 ? "" : digits[tens]) + "十" + (ones == 0 ? "" : digits[ones])
+    }
+
+    private static func lunarDayCaption(_ day: Int) -> String {
+        switch day {
+        case 1...10: return "初" + captionNumber(day)
+        case 20: return "二十"
+        case 21...29: return "廿" + captionNumber(day - 20)
+        default: return captionNumber(day)
         }
     }
 
@@ -317,9 +376,22 @@ private struct RulesHome: View {
         NavigationStack(path: $path) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 23) {
-                    Text("行事曆規則")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                    HStack {
+                        Text("行事曆規則")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        if !isSelectingBatch {
+                            Button { isAdding = true } label: {
+                                Image(systemName: "plus")
+                                    .font(.title3.weight(.semibold))
+                                    .frame(width: 44, height: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .accessibilityLabel("新增規則")
+                            .disabled(!loaded)
+                        }
+                    }
                     if !isSelectingBatch { toolsRow }
                     if loaded && showGettingStarted && !isSelectingBatch { intro }
                     if !loaded && !loadFailed {
@@ -355,14 +427,6 @@ private struct RulesHome: View {
                             isSelectingBatch = false
                         }
                     }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { isAdding = true } label: {
-                        Label("新增規則", systemImage: "plus.circle.fill")
-                            .font(.title3)
-                            .labelStyle(.iconOnly)
-                    }
-                    .disabled(!loaded || isSelectingBatch)
                 }
             }
             .safeAreaInset(edge: .bottom) {
@@ -574,9 +638,20 @@ private struct RulesHome: View {
         return RuleReconciliation(desired: desired, previous: previous, ruleIDs: branchIDs, rules: rules)
     }
 
-    private func preview(_ rule: Rule) throws -> [CalendarChange] {
-        let plan = try resolve(rule)
-        return try calendar.preview(desired: plan.desired, previous: plan.previous, ruleIDs: plan.ruleIDs)
+    private func preview(_ rule: Rule) throws -> RuleEventPreviewResult {
+        do {
+            let plan = try resolve(rule)
+            let rows = try calendar.previewEvents(for: rule.id, desired: plan.desired, previous: plan.previous)
+            return RuleEventPreviewResult(events: rows, warning: nil)
+        } catch {
+            let previous = snapshot.occurrences.filter { $0.ruleID == rule.id }
+            guard !previous.isEmpty else { throw error }
+            let existing = try calendar.existingPreviewEvents(for: rule.id, previous: previous)
+            return RuleEventPreviewResult(
+                events: existing,
+                warning: "目前只能查看已確認的既有事件，無法預覽這次變更。\n\(error.localizedDescription)"
+            )
+        }
     }
 
     private func apply(_ rule: Rule) throws -> Rule {
@@ -903,9 +978,6 @@ private struct RulesHome: View {
             Label("還沒有規則", systemImage: "calendar.badge.plus")
         } description: {
             Text("新增一條日期規則，或從通訊錄選擇生日匯入。")
-        } actions: {
-            Button("新增規則") { isAdding = true }
-                .buttonStyle(.borderedProminent)
         }
     }
 
@@ -1016,22 +1088,39 @@ private struct RulesHome: View {
                 .background(rule.displayAppearance.tint(or: slate).opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
-                Text(rule.name).font(.subheadline.weight(.semibold))
-                Text(rule.recurrenceCaption)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 6)
-            VStack(alignment: .trailing, spacing: 3) {
-                if rule.hasApplied {
-                    Text("下次").font(.caption2)
-                    let next = snapshot.occurrences.lazy.filter { $0.ruleID == rule.id && $0.start > Date() }.map(\.start).min()
-                    Text(next.map(dateCaption) ?? "無後續日期").font(.caption.weight(.medium)).monospacedDigit()
-                } else {
-                    Text("未套用").font(.caption.weight(.medium))
+                let title = Text(rule.name).font(.subheadline.weight(.semibold))
+                let next = snapshot.occurrences.lazy.filter { $0.ruleID == rule.id && $0.start > Date() }.map(\.start).min()
+                let status = rule.hasApplied
+                    ? next.map { "下次 " + dateCaption($0) } ?? "無後續日期"
+                    : "未套用"
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        title.fixedSize(horizontal: true, vertical: false)
+                        Spacer(minLength: 0)
+                        Text(status)
+                            .font(.caption2.weight(.medium))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    title
+                }
+
+                let summary = Text(rule.recurrenceCaption).font(.caption).foregroundStyle(.secondary)
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        summary.fixedSize(horizontal: true, vertical: false)
+                        Text("起始 " + dateCaption(rule.start))
+                            .font(.caption2)
+                            .monospacedDigit()
+                            .foregroundStyle(.tertiary)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    // Allow wrapping for accessibility sizes instead of truncating the summary.
+                    summary.fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
             if !isSelectingBatch {
                 Image(systemName: "chevron.right")
                     .font(.caption2.weight(.semibold))
@@ -1136,14 +1225,14 @@ private struct RuleEditor: View {
     let parent: Rule?
     let allRules: [Rule]
     @ObservedObject var calendar: CalendarIntegration
-    let preview: (Rule) throws -> [CalendarChange]
+    let preview: (Rule) throws -> RuleEventPreviewResult
     let onApply: (Rule) throws -> Rule
     let onApplied: () -> Void
     let onSaveAppearance: (UUID, RuleAppearance) throws -> Bool
     let onOpenChild: (Rule, Bool) -> Void
 
     init(initial: Rule, isNew: Bool, parent: Rule?, allRules: [Rule], calendar: CalendarIntegration,
-         preview: @escaping (Rule) throws -> [CalendarChange], onApply: @escaping (Rule) throws -> Rule,
+         preview: @escaping (Rule) throws -> RuleEventPreviewResult, onApply: @escaping (Rule) throws -> Rule,
          onApplied: @escaping () -> Void,
          onSaveAppearance: @escaping (UUID, RuleAppearance) throws -> Bool,
          onOpenChild: @escaping (Rule, Bool) -> Void) {
@@ -1269,6 +1358,8 @@ private struct RuleEditor: View {
                 rootDate
             }
 
+            if parent == nil { cutoff }
+
             Section {
                 Toggle("整日", isOn: Binding(
                     get: { rule.timing == .allDay },
@@ -1288,15 +1379,13 @@ private struct RuleEditor: View {
                 }
             } header: { Text("單次事件") }
 
-            if parent == nil { cutoff }
-
             Section {
                 NavigationLink {
-                    ChangePreview { try preview(rule) }
+                    EventPreview { try preview(rule) }
                 } label: {
-                    Label("預覽變更", systemImage: "list.bullet.rectangle")
+                    Label("預覽事件", systemImage: "list.bullet.rectangle")
                 }
-                .accessibilityIdentifier("preview-changes")
+                .accessibilityIdentifier("preview-events")
             }
 
             Section {
@@ -1794,9 +1883,15 @@ private struct RuleEditor: View {
     }
 }
 
-private struct ChangePreview: View {
-    let load: () throws -> [CalendarChange]
-    @State private var changes: [CalendarChange]?
+struct RuleEventPreviewResult {
+    let events: [CalendarPreviewEvent]
+    let warning: String?
+}
+
+private struct EventPreview: View {
+    let load: () throws -> RuleEventPreviewResult
+    @State private var events: [CalendarPreviewEvent]?
+    @State private var warning: String?
     @State private var failure: String?
 
     var body: some View {
@@ -1806,59 +1901,89 @@ private struct ChangePreview: View {
                     Label(failure, systemImage: "exclamationmark.circle")
                         .foregroundStyle(.secondary)
                     Button("重新整理", action: refresh)
-                } else if let changes {
-                    if changes.isEmpty {
-                        Label("沒有需要更新的行事曆事件", systemImage: "checkmark.circle")
+                } else if let events {
+                    if let warning {
+                        Label(warning, systemImage: "exclamationmark.circle")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    if events.isEmpty {
+                        Text("此規則沒有可預覽的事件")
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach(changes) { delta in
-                            switch delta.verb {
-                            case "新增":
-                                change(delta.verb, delta.title, dateCaption(delta.date), symbol: "plus.circle", tint: .green)
-                            case "移除":
-                                change(delta.verb, delta.title, dateCaption(delta.date), symbol: "minus.circle", tint: .red)
-                            default:
-                                change(delta.verb, delta.title, dateCaption(delta.date), symbol: "arrow.clockwise", tint: slate)
-                            }
-                        }
+                        ForEach(events) { event in eventRow(event) }
                     }
                 } else {
-                    ProgressView("正在比對行事曆…")
+                    ProgressView("正在讀取事件…")
                 }
-            } header: { Text("變更明細") }
-              footer: { Text("預覽不會寫入行事曆。") }
+            } footer: {
+                Text("預覽只顯示這條規則的事件，不會寫入行事曆。")
+            }
         }
-        .navigationTitle("預覽變更")
+        .navigationTitle("預覽事件")
         .navigationBarTitleDisplayMode(.inline)
         .task { refresh() }
     }
 
     private func refresh() {
         do {
-            changes = try load()
+            let result = try load()
+            events = result.events.sorted {
+                ($0.start, $0.id) < ($1.start, $1.id)
+            }
+            warning = result.warning
             failure = nil
         } catch {
+            events = nil
+            warning = nil
             failure = error.localizedDescription
         }
     }
 
-    private func change(_ verb: String, _ title: String, _ date: String, symbol: String, tint: Color) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 11) {
-            Image(systemName: symbol)
-                .foregroundStyle(tint)
-                .frame(width: 21)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.subheadline.weight(.semibold))
-                Text(date)
-                    .font(.caption.monospacedDigit())
+    private func eventRow(_ event: CalendarPreviewEvent) -> some View {
+        let status: (label: String, color: Color)? = switch event.kind {
+        case .unchanged: nil
+        case .insert: ("將新增", .green)
+        case .update: ("將修改", slate)
+        case .remove: ("將移除", .red)
+        }
+        let revisedTime: Bool
+        if case .update = event.kind, let oldStart = event.previousStart {
+            revisedTime = oldStart != event.start || event.previousEnd != event.end || event.previousIsAllDay != event.isAllDay
+        } else {
+            revisedTime = false
+        }
+        return VStack(alignment: .leading, spacing: 4) {
+            Text(event.title).font(.subheadline.weight(.semibold))
+            if revisedTime, let oldStart = event.previousStart {
+                Text("原：\(eventTime(start: oldStart, end: event.previousEnd ?? oldStart, allDay: event.previousIsAllDay ?? event.isAllDay))")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Spacer()
-            Text(verb).font(.caption.weight(.semibold)).foregroundStyle(tint)
+            Text("\(revisedTime ? "改為：" : "")\(eventTime(start: event.start, end: event.end, allDay: event.isAllDay))")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            if let status {
+                Text(status.label)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(status.color)
+            }
         }
+        .foregroundStyle(event.isPast ? Color.secondary : Color.primary)
+        .opacity(event.isPast ? 0.65 : 1)
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
+    }
+
+    private func eventTime(start: Date, end: Date, allDay: Bool) -> String {
+        let date = dateCaption(start)
+        if allDay {
+            let lastDay = gregorianCalendar.date(byAdding: .day, value: -1, to: end) ?? end
+            return lastDay > start ? "\(date) 至 \(dateCaption(lastDay))" : date
+        }
+        guard end > start else { return "\(date) \(timeCaption(start))" }
+        let endDate = gregorianCalendar.isDate(start, inSameDayAs: end) ? "" : "\(dateCaption(end)) "
+        return "\(date) \(timeCaption(start)) 至 \(endDate)\(timeCaption(end))"
     }
 }
 

@@ -18,6 +18,22 @@ struct CalendarChange: Identifiable {
     let date: Date
 }
 
+struct CalendarPreviewEvent: Identifiable {
+    enum Kind: Equatable { case unchanged, insert, update, remove }
+
+    let id: String
+    let title: String
+    let start: Date
+    let end: Date
+    let isAllDay: Bool
+    let isPast: Bool
+    let kind: Kind
+    var previousStart: Date? = nil
+    var previousEnd: Date? = nil
+    var previousIsAllDay: Bool? = nil
+}
+
+
 enum CalendarIntegrationError: LocalizedError {
     case denied, noLocalSource, noDestination, readOnlyDestination, conflictingDestination
     case invalidPlan, ambiguousEvent, missingEvent, excessiveRange
@@ -187,6 +203,37 @@ final class CalendarIntegration: ObservableObject {
         var operations: [Operation]
         var snapshot: [PlannedOccurrence]
         var calendars: [String: EKCalendar] = [:]
+        var previewEvents: [CalendarPreviewEvent] = []
+    }
+
+    func previewEvents(for ruleID: UUID, desired: [PlannedOccurrence], previous: [PlannedOccurrence]) throws -> [CalendarPreviewEvent] {
+        let scope: Set<UUID> = [ruleID]
+        return try reconcile(desired: desired.filter { scope.contains($0.ruleID) },
+                             previous: previous.filter { scope.contains($0.ruleID) },
+                             ruleIDs: scope, now: .now, includingEvents: true).previewEvents
+    }
+
+    func existingPreviewEvents(for ruleID: UUID, previous: [PlannedOccurrence]) throws -> [CalendarPreviewEvent] {
+        let previous = previous.filter { $0.ruleID == ruleID }
+        guard let id = previous.first?.calendarID else { return [] }
+        guard hasFullAccess else { throw CalendarIntegrationError.denied }
+        guard !id.isEmpty, let calendar = store.calendar(withIdentifier: id) else {
+            throw CalendarIntegrationError.noDestination
+        }
+        #if targetEnvironment(simulator)
+        guard defaults.string(forKey: Self.destinationKey) == id, calendar.source?.sourceType == .local else {
+            throw CalendarIntegrationError.noDestination
+        }
+        #endif
+        let known = try table(previous, calendarID: id, ruleIDs: [ruleID])
+        guard let first = previous.map({ storageDate($0.start, allDay: $0.isAllDay) }).min(),
+              let last = previous.map({ storageDate($0.end, allDay: $0.isAllDay) }).max() else { return [] }
+        // Live rows are filtered by the known snapshot; a missing occurrence isn't
+        // fabricated. Conflicting markers still fail closed rather than guessing.
+        let found = try findEvents(from: first, through: last, calendar: calendar, ruleIDs: [ruleID])
+            .filter { known[$0.key] != nil }
+        return makePreviewEvents(found: found, operations: [], now: .now)
+            .sorted { $0.start == $1.start ? $0.id < $1.id : $0.start < $1.start }
     }
 
     func preview(desired: [PlannedOccurrence], previous: [PlannedOccurrence], ruleIDs: Set<UUID>) throws -> [CalendarChange] {
@@ -263,7 +310,7 @@ final class CalendarIntegration: ObservableObject {
         return result
     }
 
-    private func reconcile(desired: [PlannedOccurrence], previous: [PlannedOccurrence], ruleIDs: Set<UUID>, now: Date) throws -> Reconciliation {
+    private func reconcile(desired: [PlannedOccurrence], previous: [PlannedOccurrence], ruleIDs: Set<UUID>, now: Date, includingEvents: Bool = false) throws -> Reconciliation {
         let all = desired + previous
         guard !all.isEmpty else { return .init(operations: [], snapshot: []) }
         guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else {
@@ -290,20 +337,22 @@ final class CalendarIntegration: ObservableObject {
         for id in destinationGroups.keys.sorted() {
             let calendar = try writableCalendar(id: id)
             let group = try reconcileCalendar(desired: wantedGroups[id] ?? [], previous: priorGroups[id] ?? [],
-                                              ruleIDs: destinationGroups[id] ?? [], now: now, calendar: calendar)
+                                              ruleIDs: destinationGroups[id] ?? [], now: now, calendar: calendar, includingEvents: includingEvents)
             batch.calendars[id] = calendar
             batch.operations.append(contentsOf: group.operations)
             batch.snapshot.append(contentsOf: group.snapshot)
+            batch.previewEvents.append(contentsOf: group.previewEvents)
         }
         batch.operations.sort {
             if $0.change.date == $1.change.date { return $0.change.id < $1.change.id }
             return $0.change.date < $1.change.date
         }
+        batch.previewEvents.sort { $0.start == $1.start ? $0.id < $1.id : $0.start < $1.start }
         return batch
     }
 
     private func reconcileCalendar(desired: [PlannedOccurrence], previous: [PlannedOccurrence], ruleIDs: Set<UUID>,
-                                   now: Date, calendar: EKCalendar) throws -> Reconciliation {
+                                   now: Date, calendar: EKCalendar, includingEvents: Bool) throws -> Reconciliation {
         let wanted = try table(desired, calendarID: calendar.calendarIdentifier, ruleIDs: ruleIDs)
         let prior = try table(previous, calendarID: calendar.calendarIdentifier, ruleIDs: ruleIDs)
         let all = desired + previous
@@ -362,7 +411,39 @@ final class CalendarIntegration: ObservableObject {
             if $0.change.date == $1.change.date { return $0.change.id < $1.change.id }
             return $0.change.date < $1.change.date
         }
-        return .init(operations: operations, snapshot: snapshot.sorted { $0.key.displayID < $1.key.displayID }.map(\.value))
+        return .init(operations: operations, snapshot: snapshot.sorted { $0.key.displayID < $1.key.displayID }.map(\.value),
+                     previewEvents: includingEvents ? makePreviewEvents(found: found, operations: operations, now: now) : [])
+    }
+
+    private func makePreviewEvents(found: [Identity: EKEvent], operations: [Operation], now: Date) -> [CalendarPreviewEvent] {
+        // Reconciliation already checked exact target, matching marker and applied snapshot
+        // for every event in found. Never synthesize a live record from the cached snapshot.
+        func existing(_ identity: Identity, _ event: EKEvent, kind: CalendarPreviewEvent.Kind) -> CalendarPreviewEvent {
+            .init(id: identity.displayID, title: event.title ?? "無標題",
+                  start: plannedDate(event.startDate, allDay: event.isAllDay),
+                  end: plannedEndDate(event.endDate, allDay: event.isAllDay),
+                  isAllDay: event.isAllDay, isPast: event.endDate <= now, kind: kind)
+        }
+
+        var rows: [Identity: CalendarPreviewEvent] = [:]
+        for (key, event) in found {
+            rows[key] = existing(key, event, kind: .unchanged)
+        }
+        for operation in operations {
+            switch operation {
+            case let .insert(identity, occurrence):
+                rows[identity] = .init(id: identity.displayID, title: occurrence.title, start: occurrence.start,
+                                       end: occurrence.end, isAllDay: occurrence.isAllDay, isPast: false, kind: .insert)
+            case let .update(identity, event, occurrence):
+                let old = existing(identity, event, kind: .unchanged)
+                rows[identity] = .init(id: identity.displayID, title: occurrence.title, start: occurrence.start,
+                                       end: occurrence.end, isAllDay: occurrence.isAllDay, isPast: false, kind: .update,
+                                       previousStart: old.start, previousEnd: old.end, previousIsAllDay: old.isAllDay)
+            case let .remove(identity, event):
+                rows[identity] = existing(identity, event, kind: .remove)
+            }
+        }
+        return Array(rows.values)
     }
 
     private func findEvents(from first: Date, through last: Date, calendar: EKCalendar, ruleIDs: Set<UUID>) throws -> [Identity: EKEvent] {

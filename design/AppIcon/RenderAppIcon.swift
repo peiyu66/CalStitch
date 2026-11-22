@@ -40,7 +40,8 @@ context.addLine(to: CGPoint(x: 455, y: 418))
 context.strokePath()
 context.setFillColor(cream)
 let diameter: CGFloat = 100
-for (x, y): (CGFloat, CGFloat) in [(115, 148), (286, 283), (455, 418)] {
+// The opposite corners remain separate; only upper-left and lower-right are joined.
+for (x, y): (CGFloat, CGFloat) in [(115, 148), (286, 283), (455, 418), (455, 148), (115, 418)] {
     context.fillEllipse(in: CGRect(x: x - diameter / 2, y: y - diameter / 2, width: diameter, height: diameter))
 }
 let url = URL(fileURLWithPath: CommandLine.arguments[1])
