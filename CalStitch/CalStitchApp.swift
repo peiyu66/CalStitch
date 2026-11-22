@@ -379,7 +379,11 @@ private struct RulesHome: View {
     @State private var isAdding = false
     @State private var contactPickerRequest: UUID?
     @State private var birthdaySelection: BirthdayPickerSelection?
+    @State private var showingBirthdayRoutes = false
+    @State private var pendingBirthdayRoute: BirthdayImportRoute?
     @State private var selectingBirthdayGroup = false
+    @State private var choosingPeopleAfterGroup = false
+    private enum BirthdayImportRoute { case people, group }
     @State private var isSelectingBatch = false
     @State private var batchSelection: Set<UUID> = []
     @State private var isShowingBatch = false
@@ -404,6 +408,8 @@ private struct RulesHome: View {
                             .foregroundStyle(.secondary)
                         if !isSelectingBatch { toolsRow }
                     }
+                    // Match the native large title's leading margin, independent of the cards.
+                    .padding(.leading, -4)
                     if loaded && showGettingStarted && !isSelectingBatch { intro }
                     if !loaded && !loadFailed {
                         ProgressView("正在讀取規則…")
@@ -418,21 +424,14 @@ private struct RulesHome: View {
                     }
                     if loaded && !isSelectingBatch {
                         Button {
-                            contactPickerRequest = UUID()
+                            showingBirthdayRoutes = true
                         } label: {
-                            Label("從通訊錄匯入生日", systemImage: "person.crop.rectangle")
+                            Label("匯入生日", systemImage: "person.crop.rectangle")
                                 .font(.subheadline.weight(.semibold))
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .padding(.horizontal, 3)
-                        Button {
-                            selectingBirthdayGroup = true
-                        } label: {
-                            Label("依群組匯入生日", systemImage: "person.2")
-                                .font(.subheadline.weight(.semibold))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .padding(.horizontal, 3)
+                        .accessibilityIdentifier("open-birthday-import")
                     }
                 }
                 .padding(.horizontal, 20)
@@ -490,9 +489,20 @@ private struct RulesHome: View {
                 BirthdayImportView(selection: selection, calendar: calendar, categories: batchCategories,
                                    status: birthdayStatus, onImport: importBirthdays)
             }
-            .sheet(isPresented: $selectingBirthdayGroup) {
+            .sheet(isPresented: $showingBirthdayRoutes, onDismiss: openSelectedBirthdayRoute) {
+                birthdayRouteSheet
+            }
+            .sheet(isPresented: $selectingBirthdayGroup, onDismiss: {
+                if choosingPeopleAfterGroup {
+                    choosingPeopleAfterGroup = false
+                    contactPickerRequest = UUID()
+                }
+            }) {
                 BirthdayGroupImportView(calendar: calendar, categories: batchCategories,
-                                        status: birthdayStatus, onImport: importBirthdays)
+                                        status: birthdayStatus, onChoosePeople: {
+                                            choosingPeopleAfterGroup = true
+                                            selectingBirthdayGroup = false
+                                        }, onImport: importBirthdays)
             }
             .sheet(isPresented: $isShowingBatch) {
                 BatchActionsView(selectedCount: batchSelection.count,
@@ -547,6 +557,45 @@ private struct RulesHome: View {
     }
 
     private var rootRules: [Rule] { snapshot.rules.filter { $0.parent == nil } }
+
+    private var birthdayRouteSheet: some View {
+        NavigationStack {
+            List {
+                Button {
+                    pendingBirthdayRoute = .people
+                    showingBirthdayRoutes = false
+                } label: {
+                    Label("個別選人", systemImage: "person.crop.rectangle")
+                }
+                .accessibilityIdentifier("birthday-route-people")
+                Button {
+                    pendingBirthdayRoute = .group
+                    showingBirthdayRoutes = false
+                } label: {
+                    Label("依群組匯入", systemImage: "person.2")
+                }
+                .accessibilityIdentifier("birthday-route-group")
+            }
+            .navigationTitle("匯入生日")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { showingBirthdayRoutes = false }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private func openSelectedBirthdayRoute() {
+        let selected = pendingBirthdayRoute
+        pendingBirthdayRoute = nil
+        switch selected {
+        case .people: contactPickerRequest = UUID()
+        case .group: selectingBirthdayGroup = true
+        case nil: break
+        }
+    }
 
     private func groupAppearance(_ key: GroupAppearanceKey) -> RuleAppearance {
         snapshot.groupAppearances?.first { $0.key == key }?.value ?? .init()
@@ -876,7 +925,7 @@ private struct RulesHome: View {
         return .available
     }
 
-    private func importBirthdays(_ candidates: [BirthdayCandidate], years: Int, target: String?,
+    private func importBirthdays(_ candidates: [BirthdayCandidate], years: Int, target: String, applyNow: Bool,
                                  category: String, subcategory: String) throws {
         guard loaded, (1...999).contains(years), !candidates.isEmpty else {
             throw RuleOperationError("請選擇要匯入的生日並填寫有效的期間。")
@@ -884,11 +933,7 @@ private struct RulesHome: View {
         let category = category.trimmingCharacters(in: .whitespacesAndNewlines)
         let subcategory = subcategory.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !category.isEmpty else { throw RuleOperationError("請輸入生日規則的分類。") }
-        let target = target.flatMap { value -> String? in
-            let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            return clean.isEmpty ? nil : clean
-        }
-        if let target, !calendar.destinations.contains(where: { $0.id == target && $0.isWritable }) {
+        guard calendar.destinations.contains(where: { $0.id == target && $0.isWritable }) else {
             throw RuleOperationError("目的行事曆已不可用，請重新選擇。")
         }
         var updated = snapshot
@@ -932,8 +977,8 @@ private struct RulesHome: View {
                 // Birthdays are fixed month/day, not the final day of every February.
                 rule.monthEnd = false
             }
-            if let target {
-                rule.target = target
+            rule.target = target
+            if applyNow {
                 rule.hasApplied = true
                 do {
                     planned += try RuleEngine.plan(root: rule, rules: [rule])
@@ -944,7 +989,7 @@ private struct RulesHome: View {
             imported.append(rule)
         }
         updated.rules.append(contentsOf: imported)
-        if target != nil {
+        if applyNow {
             do {
                 var staging = updated
                 staging.occurrences += planned
@@ -959,12 +1004,12 @@ private struct RulesHome: View {
         do {
             try updated.write()
         } catch {
-            throw RuleOperationError(target == nil
-                ? "未能儲存匯入的生日，行事曆沒有變更。請確認裝置空間後重試。"
-                : "已寫入行事曆，但本機規則未能儲存。請先確認裝置空間及行事曆，不要重複匯入。")
+            throw RuleOperationError(applyNow
+                ? "已寫入行事曆，但本機規則未能儲存。請先確認裝置空間及行事曆，不要重複匯入。"
+                : "未能儲存匯入的生日，行事曆沒有變更。請確認裝置空間後重試。")
         }
         snapshot = updated
-        if target == nil, imported.count == 1, let only = imported.first {
+        if !applyNow, imported.count == 1, let only = imported.first {
             path.append(.edit(only, isNew: true))
         }
     }
@@ -975,8 +1020,13 @@ private struct RulesHome: View {
                 batchSelection.removeAll()
                 isSelectingBatch = true
             } label: {
-                Label("批次調整", systemImage: "checklist")
-                    .frame(minHeight: 44)
+                Label {
+                    Text("批次調整")
+                } icon: {
+                    Image(systemName: "checklist")
+                        .padding(.leading, -1) // Compensate for the SF Symbol's left side bearing.
+                }
+                .frame(minHeight: 44)
             }
             .disabled(!loaded || rootRules.isEmpty)
             .accessibilityIdentifier("start-batch")
@@ -1013,7 +1063,7 @@ private struct RulesHome: View {
 
     private var addRuleButton: some View {
         Button { isAdding = true } label: {
-            Image(systemName: "plus.circle")
+            Image(systemName: "plus.circle.fill")
                 .font(.title2.weight(.semibold))
                 .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
@@ -1149,19 +1199,10 @@ private struct RulesHome: View {
                     title
                 }
 
-                let summary = Text(rule.recurrenceCaption).font(.caption).foregroundStyle(.secondary)
-                ViewThatFits(in: .horizontal) {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        summary.fixedSize(horizontal: true, vertical: false)
-                        Text("起始 " + dateCaption(rule.start))
-                            .font(.caption2)
-                            .monospacedDigit()
-                            .foregroundStyle(.tertiary)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-                    // Allow wrapping for accessibility sizes instead of truncating the summary.
-                    summary.fixedSize(horizontal: false, vertical: true)
-                }
+                Text(rule.recurrenceCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             if !isSelectingBatch {

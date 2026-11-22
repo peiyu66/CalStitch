@@ -88,7 +88,7 @@ struct BirthdayImportView: View {
     @ObservedObject var calendar: CalendarIntegration
     let categories: [BatchCategoryOption]
     let status: (BirthdayCandidate) -> BirthdayDuplicateStatus
-    let onImport: ([BirthdayCandidate], Int, String?, String, String) throws -> Void
+    let onImport: ([BirthdayCandidate], Int, String, Bool, String, String) throws -> Void
     private let cameFromGroup: Bool
 
     private enum ImportMode: String, CaseIterable {
@@ -118,7 +118,7 @@ struct BirthdayImportView: View {
     init(selection: BirthdayPickerSelection,
          calendar: CalendarIntegration, categories: [BatchCategoryOption],
          status: @escaping (BirthdayCandidate) -> BirthdayDuplicateStatus,
-         onImport: @escaping ([BirthdayCandidate], Int, String?, String, String) throws -> Void) {
+         onImport: @escaping ([BirthdayCandidate], Int, String, Bool, String, String) throws -> Void) {
         self.calendar = calendar
         self.categories = categories
         self.status = status
@@ -149,7 +149,7 @@ struct BirthdayImportView: View {
     }
 
     private var canImport: Bool {
-        !categoryName.isEmpty && !importable.isEmpty && (mode == .draft || destination != nil)
+        !categoryName.isEmpty && !importable.isEmpty && destination != nil
     }
 
     var body: some View {
@@ -244,11 +244,10 @@ struct BirthdayImportView: View {
                     } else {
                         importModePicker.pickerStyle(.segmented)
                     }
+                    birthdayCalendarFields
                     if mode == .draft {
-                        Text("只建立草稿，不會寫入行事曆。")
+                        Text("會保存目的行事曆，但現在只建立草稿，不寫入事件。")
                             .font(.footnote).foregroundStyle(.secondary)
-                    } else {
-                        birthdayCalendarFields
                     }
                     Button {
                         performImport()
@@ -316,7 +315,7 @@ struct BirthdayImportView: View {
             Text(calendarError).font(.footnote).foregroundStyle(.red)
         }
         if !calendar.destinations.contains(where: \.isWritable) {
-            Text("沒有可寫入的行事曆時，仍可匯入草稿。")
+            Text("匯入前請先連接或選擇一個可寫入的行事曆。")
                 .font(.footnote).foregroundStyle(.secondary)
         }
     }
@@ -331,11 +330,10 @@ struct BirthdayImportView: View {
     }
 
     private func performImport() {
-        guard canImport else { return }
+        guard canImport, let destination else { return }
         errorMessage = nil
         do {
-            let target = mode == .apply ? destination?.id : nil
-            try onImport(importable, years, target, categoryName, subcategoryName)
+            try onImport(importable, years, destination.id, mode == .apply, categoryName, subcategoryName)
             dismiss()
         } catch {
             errorMessage = error.localizedDescription
@@ -500,10 +498,12 @@ struct BirthdayGroupImportView: View {
     @ObservedObject var calendar: CalendarIntegration
     let categories: [BatchCategoryOption]
     let status: (BirthdayCandidate) -> BirthdayDuplicateStatus
-    let onImport: ([BirthdayCandidate], Int, String?, String, String) throws -> Void
+    let onChoosePeople: () -> Void
+    let onImport: ([BirthdayCandidate], Int, String, Bool, String, String) throws -> Void
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
+    @Environment(\.scenePhase) private var scenePhase
     @State private var state: State = .intro
     @State private var task: Task<Void, Never>?
     @State private var selection: BirthdayPickerSelection?
@@ -554,6 +554,9 @@ struct BirthdayGroupImportView: View {
                             Text("無法讀取通訊錄群組或成員。請檢查權限後重試。")
                             Button("重新讀取", action: loadGroups)
                         }
+                        Section {
+                            Button("改用個別選人", action: onChoosePeople)
+                        }
                     }
                     .navigationTitle("從群組匯入生日")
                     .navigationBarTitleDisplayMode(.inline)
@@ -561,6 +564,18 @@ struct BirthdayGroupImportView: View {
                         ToolbarItem(placement: .cancellationAction) {
                             Button("取消") { dismiss() }
                         }
+                    }
+                }
+                .task {
+                    if case .intro = state,
+                       CNContactStore.authorizationStatus(for: .contacts) != .notDetermined {
+                        loadGroups()
+                    }
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    if phase == .active, case .settings = state,
+                       CNContactStore.authorizationStatus(for: .contacts) == .authorized {
+                        loadGroups()
                     }
                 }
                 .onDisappear { task?.cancel() }
