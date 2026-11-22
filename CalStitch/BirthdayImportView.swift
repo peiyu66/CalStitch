@@ -15,7 +15,7 @@ enum BirthdayDuplicateStatus: Equatable {
     case available, imported, possibleDuplicate, changed
 }
 
-struct BirthdayCandidate: Identifiable, Equatable {
+struct BirthdayCandidate: Identifiable, Equatable, Sendable {
     struct Key: Hashable {
         let contactID: String
         let isLunar: Bool
@@ -69,12 +69,14 @@ struct BirthdayCandidate: Identifiable, Equatable {
     }
 }
 
-struct BirthdayPickerSelection: Identifiable {
+struct BirthdayPickerSelection: Identifiable, Sendable {
     let id = UUID()
     let candidates: [BirthdayCandidate]
     let skipped: Int
+    let groupName: String?
 
-    init(_ contacts: [CNContact]) {
+    init(_ contacts: [CNContact], groupName: String? = nil) {
+        self.groupName = groupName
         let extracted = contacts.map(BirthdayCandidate.extract)
         var ids = Set<BirthdayCandidate.Key>()
         candidates = extracted.flatMap { $0 }.filter { ids.insert($0.id).inserted }
@@ -87,6 +89,7 @@ struct BirthdayImportView: View {
     let categories: [BatchCategoryOption]
     let status: (BirthdayCandidate) -> BirthdayDuplicateStatus
     let onImport: ([BirthdayCandidate], Int, String?, String, String) throws -> Void
+    private let cameFromGroup: Bool
 
     private enum ImportMode: String, CaseIterable {
         case draft = "草稿"
@@ -120,6 +123,8 @@ struct BirthdayImportView: View {
         self.categories = categories
         self.status = status
         self.onImport = onImport
+        cameFromGroup = selection.groupName != nil
+        _subcategory = State(initialValue: selection.groupName ?? "")
         _candidates = State(initialValue: selection.candidates)
         _selected = State(initialValue: Set(selection.candidates.filter { status($0) == .available }.map(\.id)))
         _skipped = State(initialValue: selection.skipped)
@@ -203,10 +208,12 @@ struct BirthdayImportView: View {
                         .disabled(itemStatus == .imported)
                         .accessibilityAddTraits(checked ? .isSelected : [])
                     }
-                    Button {
-                        request = UUID()
-                    } label: {
-                        Label("再選聯絡人", systemImage: "person.badge.plus")
+                    if !cameFromGroup {
+                        Button {
+                            request = UUID()
+                        } label: {
+                            Label("再選聯絡人", systemImage: "person.badge.plus")
+                        }
                     }
                 } header: {
                     Text("要匯入的生日")
@@ -484,5 +491,173 @@ struct ContactPickerPresenter: UIViewControllerRepresentable {
                 }
             }
         }
+    }
+}
+
+/// Group lookup is intentionally separate from the system picker. Only this flow
+/// requests Contacts access; it reads birthdays solely from the chosen group.
+struct BirthdayGroupImportView: View {
+    @ObservedObject var calendar: CalendarIntegration
+    let categories: [BatchCategoryOption]
+    let status: (BirthdayCandidate) -> BirthdayDuplicateStatus
+    let onImport: ([BirthdayCandidate], Int, String?, String, String) throws -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
+    @State private var state: State = .intro
+    @State private var task: Task<Void, Never>?
+    @State private var selection: BirthdayPickerSelection?
+
+    private enum State {
+        case intro, loading, settings, restricted, groups([GroupOption]), lookupFailed
+    }
+
+    var body: some View {
+        Group {
+            if let selection {
+                BirthdayImportView(selection: selection, calendar: calendar, categories: categories,
+                                   status: status, onImport: onImport)
+            } else {
+                NavigationStack {
+                    List {
+                        switch state {
+                        case .intro:
+                            Text("讀取群組需要完整通訊錄存取。CalStitch 只會讀取所選群組成員的姓名和生日；若不想開放完整存取，可回上一頁使用個別選人。")
+                            Button("讀取聯絡人群組", action: loadGroups)
+                        case .loading:
+                            ProgressView("讀取中…")
+                        case .settings:
+                            Text("目前沒有完整的通訊錄存取權限。可到設定變更權限，或改用個別選人。")
+                            Button("開啟設定") {
+                                if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
+                            }
+                            Button("重新讀取", action: loadGroups)
+                        case .restricted:
+                            Text("這台裝置限制了通訊錄存取，無法讀取群組。請回上一頁使用個別選人。")
+                        case .groups(let groups):
+                            if groups.isEmpty {
+                                Text("找不到通訊錄群組。可改用個別選人。")
+                            } else {
+                                ForEach(groups) { group in
+                                    Button { loadSelection(for: group) } label: {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text(group.name)
+                                            if let detail = group.detail {
+                                                Text(detail).font(.subheadline).foregroundStyle(.secondary)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Button("重新讀取", action: loadGroups)
+                        case .lookupFailed:
+                            Text("無法讀取通訊錄群組或成員。請檢查權限後重試。")
+                            Button("重新讀取", action: loadGroups)
+                        }
+                    }
+                    .navigationTitle("從群組匯入生日")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("取消") { dismiss() }
+                        }
+                    }
+                }
+                .onDisappear { task?.cancel() }
+            }
+        }
+    }
+
+    private func loadGroups() {
+        task?.cancel()
+        state = .loading
+        task = Task { @MainActor in
+            do {
+                if CNContactStore.authorizationStatus(for: .contacts) == .notDetermined {
+                    _ = try await CNContactStore().requestAccess(for: .contacts)
+                }
+                guard !Task.isCancelled else { return }
+                switch CNContactStore.authorizationStatus(for: .contacts) {
+                case .authorized:
+                    let groups = try await Task.detached(priority: .userInitiated) {
+                        try Self.readGroups()
+                    }.value
+                    guard !Task.isCancelled else { return }
+                    state = .groups(groups)
+                case .restricted:
+                    state = .restricted
+                default:
+                    state = .settings // Includes the iOS 18 limited-access mode.
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                state = CNContactStore.authorizationStatus(for: .contacts) == .authorized ? .lookupFailed : .settings
+            }
+        }
+    }
+
+    private func loadSelection(for group: GroupOption) {
+        task?.cancel()
+        state = .loading
+        task = Task { @MainActor in
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try Self.readMembers(of: group)
+                }.value
+                guard !Task.isCancelled else { return }
+                selection = result
+            } catch {
+                guard !Task.isCancelled else { return }
+                state = CNContactStore.authorizationStatus(for: .contacts) == .authorized ? .lookupFailed : .settings
+            }
+        }
+    }
+
+    private struct GroupOption: Identifiable, Sendable {
+        let id: String
+        let name: String
+        let detail: String?
+    }
+
+    nonisolated private static func readGroups() throws -> [GroupOption] {
+        let store = CNContactStore()
+        let groups = try store.groups(matching: nil).sorted { lhs, rhs in
+            let order = lhs.name.localizedStandardCompare(rhs.name)
+            return order == .orderedSame ? lhs.identifier < rhs.identifier : order == .orderedAscending
+        }
+        let duplicateNames = Set(Dictionary(grouping: groups, by: \.name).filter { $0.value.count > 1 }.keys)
+        var sourceNames: [String: String] = [:]
+        if !duplicateNames.isEmpty, let containers = try? store.containers(matching: nil) {
+            for container in containers {
+                let name = container.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { continue }
+                let predicate = CNGroup.predicateForGroupsInContainer(withIdentifier: container.identifier)
+                for group in (try? store.groups(matching: predicate)) ?? [] where duplicateNames.contains(group.name) {
+                    sourceNames[group.identifier] = name
+                }
+            }
+        }
+
+        let distinct = groups.map { group in
+            GroupOption(id: group.identifier, name: group.name, detail: sourceNames[group.identifier])
+        }
+        return distinct.map { group in
+            let matches = distinct.filter { $0.name == group.name && $0.detail == group.detail }
+            guard matches.count > 1, let index = matches.firstIndex(where: { $0.id == group.id }) else { return group }
+            return GroupOption(id: group.id, name: group.name, detail: "\(group.detail ?? "同名群組") · \(index + 1)")
+        }
+    }
+
+    nonisolated private static func readMembers(of group: GroupOption) throws -> BirthdayPickerSelection {
+        let store = CNContactStore()
+        let keys: [any CNKeyDescriptor] = [
+            CNContactFormatter.descriptorForRequiredKeys(for: .fullName),
+            CNContactGivenNameKey as NSString, CNContactFamilyNameKey as NSString,
+            CNContactOrganizationNameKey as NSString,
+            CNContactBirthdayKey as NSString, CNContactNonGregorianBirthdayKey as NSString
+        ]
+        let predicate = CNContact.predicateForContactsInGroup(withIdentifier: group.id)
+        return BirthdayPickerSelection(try store.unifiedContacts(matching: predicate, keysToFetch: keys),
+                                       groupName: group.name)
     }
 }

@@ -107,6 +107,27 @@ struct Rule: Hashable, Identifiable, Codable {
 
     var displayName: String { name.isEmpty ? "未命名規則" : name }
     var displayAppearance: RuleAppearance { appearance ?? .init() }
+    var defaultSymbol: String {
+        category.contains("生日") || subcategory.contains("生日") ? "birthday.cake" : kind.symbol
+    }
+
+    var suggestedTitle: String? {
+        guard parent == nil else { return nil }
+        if kind == .solar { return SolarTerms.names.contains(date) ? date : nil }
+        guard kind == .gregorian, period == .year, interval == 1,
+              let pattern = weekdayPattern, pattern.ordinal == 2, pattern.weekday == 1,
+              (pattern.month ?? gregorianCalendar.component(.month, from: start)) == 5 else { return nil }
+        return "母親節"
+    }
+
+    var suggestedCategory: String? {
+        guard parent == nil, birthdaySource == nil else { return nil }
+        switch kind {
+        case .solar: return "節氣"
+        case .lunar: return "祭祀"
+        case .gregorian: return suggestedTitle == "母親節" ? "節日" : nil
+        }
+    }
 
     var recurrenceCaption: String {
         let count = Self.captionNumber(interval, measure: true)
@@ -358,6 +379,7 @@ private struct RulesHome: View {
     @State private var isAdding = false
     @State private var contactPickerRequest: UUID?
     @State private var birthdaySelection: BirthdayPickerSelection?
+    @State private var selectingBirthdayGroup = false
     @State private var isSelectingBatch = false
     @State private var batchSelection: Set<UUID> = []
     @State private var isShowingBatch = false
@@ -376,23 +398,12 @@ private struct RulesHome: View {
         NavigationStack(path: $path) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 23) {
-                    HStack {
+                    VStack(alignment: .leading, spacing: 8) {
                         Text("行事曆規則")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
-                        Spacer(minLength: 8)
-                        if !isSelectingBatch {
-                            Button { isAdding = true } label: {
-                                Image(systemName: "plus")
-                                    .font(.title3.weight(.semibold))
-                                    .frame(width: 44, height: 44)
-                                    .contentShape(Rectangle())
-                            }
-                            .accessibilityLabel("新增規則")
-                            .disabled(!loaded)
-                        }
+                        if !isSelectingBatch { toolsRow }
                     }
-                    if !isSelectingBatch { toolsRow }
                     if loaded && showGettingStarted && !isSelectingBatch { intro }
                     if !loaded && !loadFailed {
                         ProgressView("正在讀取規則…")
@@ -401,8 +412,9 @@ private struct RulesHome: View {
                     } else if rootRules.isEmpty {
                         emptyState
                     }
-                    ForEach(uniqueNames(rootRules.map(\.category)), id: \.self) { name in
-                        category(name, rules: rootRules.filter { $0.category == name })
+                    let names = uniqueNames(rootRules.map(\.category))
+                    ForEach(names, id: \.self) { name in
+                        category(name, rules: rootRules.filter { $0.category == name }, isFirst: name == names.first)
                     }
                     if loaded && !isSelectingBatch {
                         Button {
@@ -413,9 +425,19 @@ private struct RulesHome: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .padding(.horizontal, 3)
+                        Button {
+                            selectingBirthdayGroup = true
+                        } label: {
+                            Label("依群組匯入生日", systemImage: "person.2")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(.horizontal, 3)
                     }
                 }
-                .padding(20)
+                .padding(.horizontal, 20)
+                .padding(.top, 2)
+                .padding(.bottom, 20)
             }
             .background(paper)
             .navigationTitle("CalStitch")
@@ -467,6 +489,10 @@ private struct RulesHome: View {
             .sheet(item: $birthdaySelection) { selection in
                 BirthdayImportView(selection: selection, calendar: calendar, categories: batchCategories,
                                    status: birthdayStatus, onImport: importBirthdays)
+            }
+            .sheet(isPresented: $selectingBirthdayGroup) {
+                BirthdayGroupImportView(calendar: calendar, categories: batchCategories,
+                                        status: birthdayStatus, onImport: importBirthdays)
             }
             .sheet(isPresented: $isShowingBatch) {
                 BatchActionsView(selectedCount: batchSelection.count,
@@ -974,21 +1000,38 @@ private struct RulesHome: View {
     }
 
     private var emptyState: some View {
-        ContentUnavailableView {
-            Label("還沒有規則", systemImage: "calendar.badge.plus")
-        } description: {
-            Text("新增一條日期規則，或從通訊錄選擇生日匯入。")
+        VStack(alignment: .trailing, spacing: 0) {
+            if !isSelectingBatch { addRuleButton }
+            ContentUnavailableView {
+                Label("還沒有規則", systemImage: "calendar.badge.plus")
+            } description: {
+                Text("新增一條日期規則，或從通訊錄選擇生日匯入。")
+            }
+            .frame(maxWidth: .infinity)
         }
     }
 
-    private func category(_ title: String, rules: [Rule]) -> some View {
+    private var addRuleButton: some View {
+        Button { isAdding = true } label: {
+            Image(systemName: "plus.circle")
+                .font(.title2.weight(.semibold))
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("新增規則")
+        .accessibilityIdentifier("add-rule")
+    }
+
+    private func category(_ title: String, rules: [Rule], isFirst: Bool) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             if isSelectingBatch {
                 groupCheck(title, ids: Set(rules.map(\.id)), isTop: true)
             } else {
-                groupLabel(.init(category: title))
-                    .padding(.leading, 3)
-                    .accessibilityAddTraits(.isHeader)
+                HStack(spacing: 8) {
+                    groupLabel(.init(category: title))
+                        .padding(.leading, 3)
+                    if isFirst { addRuleButton }
+                }
             }
             ForEach(uniqueNames(rules.map(\.subcategory)), id: \.self) { subcategory in
                 let group = rules.filter { $0.subcategory == subcategory }
@@ -1081,7 +1124,7 @@ private struct RulesHome: View {
                     .foregroundStyle(slate)
                     .accessibilityHidden(true)
             }
-            Image(systemName: rule.displayAppearance.symbol(or: rule.kind.symbol))
+            Image(systemName: rule.displayAppearance.symbol(or: rule.defaultSymbol))
                 .foregroundStyle(rule.displayAppearance.tint(or: slate))
                 .font(.subheadline.weight(.semibold))
                 .frame(width: 34, height: 34)
@@ -1220,6 +1263,8 @@ private struct RuleEditor: View {
     @State private var connecting = false
     @State private var collapsedBranches: Set<UUID> = []
     @State private var editingAppearance = false
+    @State private var followsSuggestedTitle: Bool
+    @State private var followsSuggestedCategory: Bool
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.dismiss) private var dismiss
     let parent: Rule?
@@ -1236,9 +1281,17 @@ private struct RuleEditor: View {
          onApplied: @escaping () -> Void,
          onSaveAppearance: @escaping (UUID, RuleAppearance) throws -> Bool,
          onOpenChild: @escaping (Rule, Bool) -> Void) {
-        _rule = State(initialValue: initial)
+        let isFresh = isNew && !allRules.contains { $0.id == initial.id }
+        let shouldSuggest = isFresh && initial.name.isEmpty
+        let shouldSuggestCategory = isFresh && initial.category.isEmpty
+        var startingRule = initial
+        if shouldSuggest, let suggestion = startingRule.suggestedTitle { startingRule.name = suggestion }
+        if shouldSuggestCategory, let suggestion = startingRule.suggestedCategory { startingRule.category = suggestion }
+        _followsSuggestedTitle = State(initialValue: shouldSuggest)
+        _followsSuggestedCategory = State(initialValue: shouldSuggestCategory)
+        _rule = State(initialValue: startingRule)
         _baseline = State(initialValue: isNew ? nil : initial)
-        _exitBaseline = State(initialValue: initial)
+        _exitBaseline = State(initialValue: startingRule)
         self.parent = parent
         self.allRules = allRules
         self.calendar = calendar
@@ -1309,41 +1362,6 @@ private struct RuleEditor: View {
 
     var body: some View {
         Form {
-            Section {
-                HStack(spacing: 9) {
-                    Button {
-                        editingAppearance = true
-                    } label: {
-                        Image(systemName: rule.displayAppearance.symbol(or: rule.kind.symbol))
-                            .foregroundStyle(rule.displayAppearance.tint(or: slate))
-                            .frame(width: 44, height: 44)
-                            .background(rule.displayAppearance.tint(or: slate).opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("調整規則圖示與顏色")
-                    .accessibilityIdentifier("rule-appearance")
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("事件標題（必填）")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(hasTitle ? Color.primary : Color.red)
-                            .accessibilityHidden(true)
-                        TextField("輸入事件標題", text: $rule.name)
-                            .accessibilityLabel("事件標題（必填）")
-                            .accessibilityIdentifier("rule-title")
-                    }
-                }
-                if parent == nil {
-                    let layout = dynamicTypeSize.isAccessibilitySize
-                        ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10))
-                        : AnyLayout(HStackLayout(alignment: .top, spacing: 10))
-                    layout {
-                        categoryEntry("分類", placeholder: "請輸入", selection: $rule.category, options: categoryOptions)
-                        categoryEntry("次類", placeholder: "可留空", selection: $rule.subcategory, options: subcategoryOptions, optional: true)
-                    }
-                }
-                calendarFields
-            }
-
             if let parent {
                 Section {
                     LabeledContent("依據規則", value: parent.displayName)
@@ -1356,6 +1374,53 @@ private struct RuleEditor: View {
                 } header: { Text("延伸日期") }
             } else {
                 rootDate
+            }
+
+            Section {
+                HStack(spacing: 9) {
+                    Button {
+                        editingAppearance = true
+                    } label: {
+                        Image(systemName: rule.displayAppearance.symbol(or: rule.defaultSymbol))
+                            .foregroundStyle(rule.displayAppearance.tint(or: slate))
+                            .frame(width: 44, height: 44)
+                            .background(rule.displayAppearance.tint(or: slate).opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("調整規則圖示與顏色")
+                    .accessibilityIdentifier("rule-appearance")
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("事件標題（必填）")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(hasTitle ? Color.primary : Color.red)
+                            .accessibilityHidden(true)
+                        TextField("輸入事件標題", text: Binding(
+                            get: { rule.name },
+                            set: {
+                                followsSuggestedTitle = false
+                                rule.name = $0
+                            }
+                        ))
+                            .accessibilityLabel("事件標題（必填）")
+                            .accessibilityIdentifier("rule-title")
+                    }
+                }
+                if parent == nil {
+                    let layout = dynamicTypeSize.isAccessibilitySize
+                        ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10))
+                        : AnyLayout(HStackLayout(alignment: .top, spacing: 10))
+                    layout {
+                        categoryEntry("分類", placeholder: "請輸入", selection: Binding(
+                            get: { rule.category },
+                            set: {
+                                followsSuggestedCategory = false
+                                rule.category = $0
+                            }
+                        ), options: categoryOptions)
+                        categoryEntry("次類", placeholder: "可留空", selection: $rule.subcategory, options: subcategoryOptions, optional: true)
+                    }
+                }
+                calendarFields
             }
 
             if parent == nil { cutoff }
@@ -1406,10 +1471,16 @@ private struct RuleEditor: View {
             } header: { Text("子規則") }
               footer: { Text(baseline == nil ? "先套用這條規則，才能新增它的子規則。" : "可編輯直接子規則；縮排的下游項目僅供查看。") }
         }
+        .onChange(of: rule.suggestedTitle) { _, suggestion in
+            if followsSuggestedTitle { rule.name = suggestion ?? "" }
+        }
+        .onChange(of: rule.suggestedCategory) { _, suggestion in
+            if followsSuggestedCategory { rule.category = suggestion ?? "" }
+        }
         .navigationTitle(baseline == nil ? "新增規則" : "編輯規則")
         .sheet(isPresented: $editingAppearance) {
             AppearanceEditSheet(title: rule.displayName, initial: rule.displayAppearance,
-                                defaultSymbol: rule.kind.symbol) { appearance in
+                                defaultSymbol: rule.defaultSymbol) { appearance in
                 let value = appearance.isDefault ? nil : appearance
                 guard rule.appearance != value else { return }
                 let alreadySaved = try onSaveAppearance(rule.id, appearance)
@@ -1668,7 +1739,7 @@ private struct RuleEditor: View {
 
     private func treeLabel(_ row: TreeRow) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: row.item.displayAppearance.symbol(or: row.item.kind.symbol))
+            Image(systemName: row.item.displayAppearance.symbol(or: row.item.defaultSymbol))
                 .foregroundStyle(row.item.displayAppearance.tint(or: slate))
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
@@ -1917,7 +1988,7 @@ private struct EventPreview: View {
                     ProgressView("正在讀取事件…")
                 }
             } footer: {
-                Text("預覽只顯示這條規則的事件，不會寫入行事曆。")
+                Text("這裡列出本規則已寫入行事曆的事件，以及尚未套用的變更。按「套用」後才會更新行事曆。")
             }
         }
         .navigationTitle("預覽事件")
