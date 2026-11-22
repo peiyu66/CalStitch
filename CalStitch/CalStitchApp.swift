@@ -1669,7 +1669,7 @@ private struct RuleEditor: View {
         } header: { Text("日期與週期") }
           footer: {
               if rule.kind == .solar {
-                  Text("節氣資料依臺北市立天文科學教育館年曆，涵蓋 \(SolarTerms.supportedYears.lowerBound)～\(SolarTerms.supportedYears.upperBound) 年。請將規則起訖設在此範圍。")
+                  Text("節氣一律以台灣日期為準。內建資料涵蓋 \(SolarTerms.supportedYears.lowerBound)～\(SolarTerms.supportedYears.upperBound) 年，無須連網。")
               } else if rule.kind == .lunar {
                   Text(rule.lunarIsLeap ? "目前無法套用閏月生日規則。" : "按月重複若遇到閏月，請先縮短期間；閏月排程方式尚未確定。")
               } else if allowsMonthEnd {
