@@ -503,6 +503,30 @@ struct ContactPickerPresenter: UIViewControllerRepresentable {
     }
 }
 
+/// Only the intent to return to group lookup is persisted; no group or contact data.
+@MainActor
+enum BirthdayGroupSettingsReturn {
+    private static let key = "birthday.pendingGroupSettingsReturn"
+
+    static func begin(defaults: UserDefaults = .standard) -> UUID {
+        let token = UUID()
+        defaults.set(token.uuidString, forKey: key)
+        return token
+    }
+
+    @discardableResult
+    static func consume(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.string(forKey: key) != nil else { return false }
+        defaults.removeObject(forKey: key)
+        return true
+    }
+
+    static func clear(ifMatching token: UUID? = nil, defaults: UserDefaults = .standard) {
+        if let token, defaults.string(forKey: key) != token.uuidString { return }
+        defaults.removeObject(forKey: key)
+    }
+}
+
 /// Group lookup is intentionally separate from the system picker. Only this flow
 /// requests Contacts access; it reads birthdays solely from the chosen group.
 struct BirthdayGroupImportView: View {
@@ -514,11 +538,11 @@ struct BirthdayGroupImportView: View {
     let onImport: ([BirthdayCandidate], Int, String, Bool, String, String) throws -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.openURL) private var openURL
     @Environment(\.scenePhase) private var scenePhase
     @State private var state: State = .intro
     @State private var task: Task<Void, Never>?
     @State private var selection: BirthdayPickerSelection?
+    @State private var settingsOpenFailed = false
 
     private enum State {
         case intro, loading, settings, restricted, groups([GroupOption]), lookupFailed
@@ -535,15 +559,16 @@ struct BirthdayGroupImportView: View {
                         switch state {
                         case .intro:
                             Text("讀取群組需要完整通訊錄存取。CalStitch 只會讀取所選群組成員的姓名和生日；若不想開放完整存取，可回上一頁使用個別選人。")
-                            Button("讀取聯絡人群組", action: loadGroups)
+                            Button("讀取聯絡人群組") { loadGroups(allowPrompt: true) }
                         case .loading:
                             ProgressView("讀取中…")
                         case .settings:
-                            Text("目前沒有完整的通訊錄存取權限。可到設定變更權限，或改用個別選人。")
-                            Button("開啟設定") {
-                                if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
+                            Text("群組匯入需要完整的通訊錄存取權限，請到設定變更權限。")
+                            Button("開啟設定", action: openSettings)
+                            if settingsOpenFailed {
+                                Text("無法開啟設定，請手動到設定變更權限。")
+                                    .font(.footnote).foregroundStyle(.secondary)
                             }
-                            Button("重新讀取", action: loadGroups)
                         case .restricted:
                             Text("這台裝置限制了通訊錄存取，無法讀取群組。請回上一頁使用個別選人。")
                         case .groups(let groups):
@@ -561,20 +586,27 @@ struct BirthdayGroupImportView: View {
                                     }
                                 }
                             }
-                            Button("重新讀取", action: loadGroups)
                         case .lookupFailed:
                             Text("無法讀取通訊錄群組或成員。請檢查權限後重試。")
-                            Button("重新讀取", action: loadGroups)
+                            Button("重試") { loadGroups() }
                         }
                         Section {
-                            Button("改用個別選人", action: onChoosePeople)
+                            Button("改用個別選人") {
+                                BirthdayGroupSettingsReturn.clear()
+                                task?.cancel()
+                                onChoosePeople()
+                            }
                         }
                     }
                     .navigationTitle("從群組匯入生日")
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
-                            Button("取消") { dismiss() }
+                            Button("取消") {
+                                BirthdayGroupSettingsReturn.clear()
+                                task?.cancel()
+                                dismiss()
+                            }
                         }
                     }
                 }
@@ -585,8 +617,10 @@ struct BirthdayGroupImportView: View {
                     }
                 }
                 .onChange(of: scenePhase) { _, phase in
-                    if phase == .active, case .settings = state,
-                       CNContactStore.authorizationStatus(for: .contacts) == .authorized {
+                    guard phase == .active, case .settings = state else { return }
+                    let returnedFromSettings = BirthdayGroupSettingsReturn.consume()
+                    if returnedFromSettings || CNContactStore.authorizationStatus(for: .contacts) == .authorized {
+                        settingsOpenFailed = false
                         loadGroups()
                     }
                 }
@@ -595,12 +629,27 @@ struct BirthdayGroupImportView: View {
         }
     }
 
-    private func loadGroups() {
+    private func openSettings() {
+        settingsOpenFailed = false
+        guard let url = URL(string: UIApplication.openSettingsURLString) else {
+            BirthdayGroupSettingsReturn.clear()
+            settingsOpenFailed = true
+            return
+        }
+        let token = BirthdayGroupSettingsReturn.begin()
+        UIApplication.shared.open(url) { didOpen in
+            guard !didOpen else { return }
+            BirthdayGroupSettingsReturn.clear(ifMatching: token)
+            settingsOpenFailed = true
+        }
+    }
+
+    private func loadGroups(allowPrompt: Bool = false) {
         task?.cancel()
         state = .loading
         task = Task { @MainActor in
             do {
-                if CNContactStore.authorizationStatus(for: .contacts) == .notDetermined {
+                if allowPrompt, CNContactStore.authorizationStatus(for: .contacts) == .notDetermined {
                     _ = try await CNContactStore().requestAccess(for: .contacts)
                 }
                 guard !Task.isCancelled else { return }

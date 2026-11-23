@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @main
 struct CalStitchApp: App {
@@ -8,6 +9,18 @@ struct CalStitchApp: App {
 }
 
 private let slate = Color(red: 67/255, green: 88/255, blue: 119/255)
+
+private func readableTint(light: UInt32, dark: UInt32) -> Color {
+    Color(uiColor: UIColor { traits in
+        let rgb = traits.userInterfaceStyle == .dark ? dark : light
+        return UIColor(red: CGFloat((rgb >> 16) & 255) / 255,
+                       green: CGFloat((rgb >> 8) & 255) / 255,
+                       blue: CGFloat(rgb & 255) / 255, alpha: 1)
+    })
+}
+
+let requiredFieldTint = readableTint(light: 0x995357, dark: 0xD79599)
+
 private let paper = Color(uiColor: .systemGroupedBackground)
 private let card = Color(uiColor: .secondarySystemGroupedBackground)
 
@@ -91,6 +104,7 @@ struct Rule: Hashable, Identifiable, Codable {
     var startTime = gregorianCalendar.date(bySettingHour: 9, minute: 0, second: 0, of: Date()) ?? Date()
     var durationDays = 1
     var durationHalfHours = 1
+    var solarTimeZoneIdentifier: String? = nil
     var endMode: EndMode = .duration
     var endCount = 5
     var endUnit: PeriodUnit = .year
@@ -200,7 +214,24 @@ struct Rule: Hashable, Identifiable, Codable {
         }
     }
 
+    mutating func pinSolarTimeZone() {
+        let currentZone = RuleEngine.civilCalendar(for: self)
+        let selected = UserDefaults.standard.string(forKey: "settings.defaultTimeZoneIdentifier")
+            .flatMap(TimeZone.init(identifier:)) ?? TimeZone.current
+        var local = Calendar(identifier: .gregorian)
+        local.timeZone = selected
+        func civilDay(_ input: Date) -> Date {
+            local.date(from: currentZone.dateComponents([.year, .month, .day], from: input)) ?? input
+        }
+        let oldTime = currentZone.dateComponents([.hour, .minute], from: startTime)
+        start = civilDay(start)
+        endDate = civilDay(endDate)
+        startTime = local.date(bySettingHour: oldTime.hour ?? 9, minute: oldTime.minute ?? 0, second: 0, of: local.startOfDay(for: Date())) ?? startTime
+        solarTimeZoneIdentifier = selected.identifier
+    }
+
     mutating func useSolarDefaultDuration() {
+        let gregorianCalendar = RuleEngine.civilCalendar(for: self)
         guard let coverageEnd = gregorianCalendar.date(from: DateComponents(
             year: SolarTerms.supportedYears.upperBound, month: 12, day: 31
         )) else { return }
@@ -313,8 +344,8 @@ private struct RuleReconciliation {
     let rules: [Rule]
 }
 
-func dateCaption(_ date: Date) -> String {
-    let parts = gregorianCalendar.dateComponents([.year, .month, .day, .weekday], from: date)
+func dateCaption(_ date: Date, calendar: Calendar = gregorianCalendar) -> String {
+    let parts = calendar.dateComponents([.year, .month, .day, .weekday], from: date)
     let civilDate = "\(parts.year ?? 0)年\(parts.month ?? 0)月\(parts.day ?? 0)日"
     let weekdays = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"]
     guard let weekday = parts.weekday, (1...7).contains(weekday) else { return civilDate }
@@ -322,8 +353,8 @@ func dateCaption(_ date: Date) -> String {
 }
 
 private let taiwanClockLocale = Locale(identifier: "zh_TW@hours=h12")
-private func timeCaption(_ date: Date) -> String {
-    let parts = gregorianCalendar.dateComponents([.hour, .minute], from: date)
+private func timeCaption(_ date: Date, calendar: Calendar = gregorianCalendar) -> String {
+    let parts = calendar.dateComponents([.hour, .minute], from: date)
     let hour = parts.hour ?? 0
     let hour12 = hour % 12 == 0 ? 12 : hour % 12
     return "\(hour < 12 ? "上午" : "下午") \(String(format: "%02d:%02d", hour12, parts.minute ?? 0))"
@@ -334,6 +365,7 @@ private struct RuleDateField: View {
     let title: String
     @Binding var selection: Date
     var kind: Kind = .date
+    var civilCalendar: Calendar = gregorianCalendar
     @State private var showingPicker = false
     @State private var draft = Date()
 
@@ -342,7 +374,7 @@ private struct RuleDateField: View {
             draft = selection
             showingPicker = true
         } label: {
-            LabeledContent(title, value: kind == .date ? dateCaption(selection) : timeCaption(selection))
+            LabeledContent(title, value: kind == .date ? dateCaption(selection, calendar: civilCalendar) : timeCaption(selection, calendar: civilCalendar))
                 .foregroundStyle(.primary)
         }
         .buttonStyle(.plain)
@@ -373,6 +405,8 @@ private struct RuleDateField: View {
                 }
             }
             .environment(\.locale, taiwanClockLocale)
+            .environment(\.calendar, civilCalendar)
+            .environment(\.timeZone, civilCalendar.timeZone)
             .presentationDetents([.medium, .large])
         }
     }
@@ -393,10 +427,9 @@ private struct RulesHome: View {
     @State private var showingOrphanCleanup = false
     @State private var pendingBirthdayRoute: BirthdayImportRoute?
     @State private var selectingBirthdayGroup = false
+    @State private var checkedBirthdaySettingsReturn = false
     @State private var choosingPeopleAfterGroup = false
     private enum BirthdayImportRoute { case people, group }
-    @State private var isSelectingBatch = false
-    @State private var batchSelection: Set<UUID> = []
     @State private var isShowingBatch = false
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.openURL) private var openURL
@@ -418,11 +451,9 @@ private struct RulesHome: View {
                         Text("行事曆規則")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
-                        if !isSelectingBatch { toolsRow }
+                        toolsRow
                     }
-                    // Match the native large title's leading margin, independent of the cards.
-                    .padding(.leading, -4)
-                    if loaded && showGettingStarted && !isSelectingBatch { intro }
+                    if loaded && showGettingStarted { intro }
                     if !loaded && !loadFailed {
                         ProgressView("正在讀取規則…")
                     } else if loadFailed {
@@ -434,7 +465,7 @@ private struct RulesHome: View {
                     ForEach(names, id: \.self) { name in
                         category(name, rules: rootRules.filter { $0.category == name }, isFirst: name == names.first)
                     }
-                    if loaded && !isSelectingBatch {
+                    if loaded {
                         let layout = dynamicTypeSize.isAccessibilitySize
                             ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10))
                             : AnyLayout(HStackLayout(spacing: 20))
@@ -467,35 +498,11 @@ private struct RulesHome: View {
             .navigationTitle("CalStitch")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    if !isSelectingBatch {
-                        NavigationLink(value: Route.settings) {
-                            Image(systemName: "gearshape")
-                        }
-                        .accessibilityLabel("設定")
-                        .accessibilityIdentifier("open-settings")
+                    NavigationLink(value: Route.settings) {
+                        Image(systemName: "gearshape")
                     }
-                }
-                ToolbarItem(placement: .topBarLeading) {
-                    if isSelectingBatch {
-                        Button("取消") {
-                            batchSelection.removeAll()
-                            isSelectingBatch = false
-                        }
-                    }
-                }
-            }
-            .safeAreaInset(edge: .bottom) {
-                if isSelectingBatch {
-                    Button {
-                        isShowingBatch = true
-                    } label: {
-                        Text("調整 \(batchSelection.count) 條規則")
-                            .frame(maxWidth: .infinity, minHeight: 36)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(batchSelection.isEmpty)
-                    .padding(16)
-                    .background(.bar)
+                    .accessibilityLabel("設定")
+                    .accessibilityIdentifier("open-settings")
                 }
             }
             .navigationDestination(for: Route.self) { route in
@@ -546,10 +553,12 @@ private struct RulesHome: View {
                 OrphanCleanupView(calendar: calendar, existingRuleIDs: { Set(snapshot.rules.map(\.id)) })
             }
             .sheet(isPresented: $isShowingBatch) {
-                BatchActionsView(selectedCount: batchSelection.count,
-                                 categories: batchCategories,
-                                 durationPreview: previewBatch, durationApply: applyBatch,
-                                 move: moveSelected, removalPreview: previewRemoval, remove: removeSelected)
+                BatchActionsView(rules: rootRules.map {
+                    .init(id: $0.id, title: $0.displayName, subtitle: $0.recurrenceCaption,
+                          category: $0.category, subcategory: $0.subcategory)
+                }, initiallySelected: [], categories: batchCategories,
+                preview: previewBatch, apply: applyBatch,
+                removalPreview: previewRemoval, remove: removeSelected)
             }
             .sheet(item: $appearanceGroup) { key in
                 AppearanceEditSheet(title: key.title, initial: groupAppearance(key),
@@ -586,6 +595,10 @@ private struct RulesHome: View {
         .task {
             calendar.refreshCalendars()
             if !loaded && !loadFailed { load() }
+            if !checkedBirthdaySettingsReturn {
+                checkedBirthdaySettingsReturn = true
+                if BirthdayGroupSettingsReturn.consume() { selectingBirthdayGroup = true }
+            }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { calendar.refreshCalendars() }
@@ -793,13 +806,14 @@ private struct RulesHome: View {
         return updated.rules.first { $0.id == rule.id } ?? rule
     }
 
-    private func batchPlan(years: Int) throws -> (plan: RuleReconciliation, rows: [BatchDurationRule]) {
-        guard loaded, (1...999).contains(years), !batchSelection.isEmpty else {
-            throw RuleOperationError("請選取至少一條規則，並輸入正整數年數。")
+    private func batchPlan(_ edit: BatchEdit) throws -> (plan: RuleReconciliation, rows: [BatchDurationRule]) {
+        guard edit.classification != nil || edit.durationYears != nil else {
+            throw RuleOperationError("請指定要調整的項目。")
         }
-        let selected = rootRules.filter { batchSelection.contains($0.id) }
-        guard selected.count == batchSelection.count else {
-            throw RuleOperationError("選取的規則已變更，請返回列表重新選取。")
+        let selected = rootRules.filter { edit.ruleIDs.contains($0.id) }
+        let tree = try selectedTreeIDs(edit.ruleIDs)
+        if let years = edit.durationYears, !(1...999).contains(years) {
+            throw RuleOperationError("請輸入正整數年數。")
         }
         var desired: [PlannedOccurrence] = []
         var previous: [PlannedOccurrence] = []
@@ -807,6 +821,7 @@ private struct RulesHome: View {
         var updates: [UUID: Rule] = [:]
         var rows: [BatchDurationRule] = []
         for var rule in selected {
+            guard let years = edit.durationYears else { break }
             rule.endMode = .duration
             rule.endCount = years
             rule.endUnit = .year
@@ -824,17 +839,28 @@ private struct RulesHome: View {
                     _ = try RuleEngine.plan(root: rule, rules: [rule])
                 }
                 updates[rule.id] = rule
-                rows.append(.init(id: rule.id, title: rule.displayName, cutoff: cutoff, isDraft: !rule.hasApplied))
+                let local = RuleEngine.civilCalendar(for: rule)
+                let civilCutoff = gregorianCalendar.date(from: local.dateComponents([.year, .month, .day], from: cutoff)) ?? cutoff
+                rows.append(.init(id: rule.id, title: rule.displayName, cutoff: civilCutoff, isDraft: !rule.hasApplied))
             } catch {
                 throw RuleOperationError("「\(rule.displayName)」：\(error.localizedDescription)")
             }
         }
-        let rules = snapshot.rules.map { updates[$0.id] ?? $0 }
+        var rules = snapshot.rules.map { updates[$0.id] ?? $0 }
+        if let classification = edit.classification {
+            let category = classification.category.trimmingCharacters(in: .whitespacesAndNewlines)
+            let subcategory = classification.subcategory.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !category.isEmpty else { throw RuleOperationError("請指定移動後的分類。") }
+            for index in rules.indices where tree.contains(rules[index].id) {
+                rules[index].category = category
+                rules[index].subcategory = subcategory
+            }
+        }
         return (RuleReconciliation(desired: desired, previous: previous, ruleIDs: affected, rules: rules), rows)
     }
 
-    private func previewBatch(years: Int) throws -> BatchDurationPreview {
-        let batch = try batchPlan(years: years)
+    private func previewBatch(_ edit: BatchEdit) throws -> BatchDurationPreview {
+        let batch = try batchPlan(edit)
         let plan = batch.plan
         let changes = plan.ruleIDs.isEmpty ? [] : try calendar.preview(
             desired: plan.desired, previous: plan.previous, ruleIDs: plan.ruleIDs
@@ -842,8 +868,8 @@ private struct RulesHome: View {
         return BatchDurationPreview(rules: batch.rows, changes: changes)
     }
 
-    private func applyBatch(years: Int) throws {
-        let plan = try batchPlan(years: years).plan
+    private func applyBatch(_ edit: BatchEdit) throws {
+        let plan = try batchPlan(edit).plan
         var updated = snapshot
         updated.rules = plan.rules
         if !plan.ruleIDs.isEmpty {
@@ -866,8 +892,6 @@ private struct RulesHome: View {
                 : "行事曆已寫入，但規則未能儲存。請先檢查裝置空間與行事曆，不要重複套用。")
         }
         snapshot = updated
-        batchSelection.removeAll()
-        isSelectingBatch = false
     }
 
     private var batchCategories: [BatchCategoryOption] {
@@ -877,13 +901,13 @@ private struct RulesHome: View {
         }
     }
 
-    private func selectedTreeIDs() throws -> Set<UUID> {
-        guard loaded, !batchSelection.isEmpty,
-              batchSelection.isSubset(of: Set(rootRules.map(\.id))) else {
+    private func selectedTreeIDs(_ selected: Set<UUID>) throws -> Set<UUID> {
+        guard loaded, !selected.isEmpty,
+              selected.isSubset(of: Set(rootRules.map(\.id))) else {
             throw RuleOperationError("請重新選擇要處理的根規則。")
         }
         let branches = Dictionary(grouping: snapshot.rules, by: \.parent)
-        var ids = batchSelection
+        var ids = selected
         var pending = Array(ids)
         while let parent = pending.popLast() {
             for child in branches[parent] ?? [] where ids.insert(child.id).inserted {
@@ -893,28 +917,8 @@ private struct RulesHome: View {
         return ids
     }
 
-    private func finishBatch() {
-        batchSelection.removeAll()
-        isSelectingBatch = false
-    }
-
-    private func moveSelected(category: String, subcategory: String) throws {
-        let ids = try selectedTreeIDs()
-        let category = category.trimmingCharacters(in: .whitespacesAndNewlines)
-        let subcategory = subcategory.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !category.isEmpty else { throw RuleOperationError("請指定移動後的分類。") }
-        var updated = snapshot
-        for index in updated.rules.indices where ids.contains(updated.rules[index].id) {
-            updated.rules[index].category = category
-            updated.rules[index].subcategory = subcategory
-        }
-        try updated.write()
-        snapshot = updated
-        finishBatch()
-    }
-
-    private func previewRemoval() throws -> BatchRemovalPreview {
-        let ids = try selectedTreeIDs()
+    private func previewRemoval(_ selected: Set<UUID>) throws -> BatchRemovalPreview {
+        let ids = try selectedTreeIDs(selected)
         let appliedIDs = Set(snapshot.rules.filter { ids.contains($0.id) && $0.hasApplied }.map(\.id))
         let changes = appliedIDs.isEmpty ? [] : try calendar.preview(
             desired: [], previous: snapshot.occurrences.filter { appliedIDs.contains($0.ruleID) }, ruleIDs: appliedIDs
@@ -922,8 +926,8 @@ private struct RulesHome: View {
         return BatchRemovalPreview(ruleCount: ids.count, eventCount: changes.count)
     }
 
-    private func removeSelected() throws {
-        let ids = try selectedTreeIDs()
+    private func removeSelected(_ selected: Set<UUID>) throws {
+        let ids = try selectedTreeIDs(selected)
         let appliedIDs = Set(snapshot.rules.filter { ids.contains($0.id) && $0.hasApplied }.map(\.id))
         var updated = snapshot
         updated.rules.removeAll { ids.contains($0.id) }
@@ -941,7 +945,6 @@ private struct RulesHome: View {
                 : "已處理行事曆，但無法儲存本機規則。請保留畫面並先確認裝置空間。")
         }
         snapshot = updated
-        finishBatch()
     }
 
     private func birthdayStatus(_ candidate: BirthdayCandidate) -> BirthdayDuplicateStatus {
@@ -1058,14 +1061,13 @@ private struct RulesHome: View {
     private var toolsRow: some View {
         HStack {
             Button {
-                batchSelection.removeAll()
-                isSelectingBatch = true
+                isShowingBatch = true
             } label: {
                 Label {
                     Text("批次調整")
                 } icon: {
                     Image(systemName: "checklist")
-                        .padding(.leading, -1) // Compensate for the SF Symbol's left side bearing.
+                        .padding(.leading, 1) // Account for the checklist and title glyphs independently.
                 }
                 .frame(minHeight: 44)
             }
@@ -1092,7 +1094,7 @@ private struct RulesHome: View {
 
     private var emptyState: some View {
         VStack(alignment: .trailing, spacing: 0) {
-            if !isSelectingBatch { addRuleButton }
+            addRuleButton
             ContentUnavailableView {
                 Label("還沒有規則", systemImage: "calendar.badge.plus")
             } description: {
@@ -1115,46 +1117,27 @@ private struct RulesHome: View {
 
     private func category(_ title: String, rules: [Rule], isFirst: Bool) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            if isSelectingBatch {
-                groupCheck(title, ids: Set(rules.map(\.id)), isTop: true)
-            } else {
-                HStack(spacing: 8) {
-                    groupLabel(.init(category: title))
-                        .padding(.leading, 3)
-                    if isFirst { addRuleButton }
-                }
+            HStack(spacing: 8) {
+                groupLabel(.init(category: title))
+                    .padding(.leading, 3)
+                if isFirst { addRuleButton }
             }
             ForEach(uniqueNames(rules.map(\.subcategory)), id: \.self) { subcategory in
                 let group = rules.filter { $0.subcategory == subcategory }
                 VStack(alignment: .leading, spacing: 0) {
                     if !subcategory.isEmpty {
-                        if isSelectingBatch {
-                            groupCheck(subcategory, ids: Set(group.map(\.id)), isTop: false)
-                                .padding(.horizontal, 15)
-                        } else {
-                            groupLabel(.init(category: title, subcategory: subcategory))
-                                .padding(.horizontal, 8)
-                                .accessibilityAddTraits(.isHeader)
-                        }
+                        groupLabel(.init(category: title, subcategory: subcategory))
+                            .padding(.horizontal, 8)
+                            .accessibilityAddTraits(.isHeader)
                     }
                     ForEach(group) { rule in
                         if !subcategory.isEmpty || rule.id != group.first?.id {
                             Divider().padding(.leading, 15)
                         }
-                        if isSelectingBatch {
-                            Button {
-                                if !batchSelection.insert(rule.id).inserted { batchSelection.remove(rule.id) }
-                            } label: {
-                                ruleRow(rule)
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityAddTraits(batchSelection.contains(rule.id) ? .isSelected : [])
-                        } else {
-                            NavigationLink(value: Route.edit(rule, isNew: !rule.hasApplied)) {
-                                ruleRow(rule)
-                            }
-                            .buttonStyle(.plain)
+                        NavigationLink(value: Route.edit(rule, isNew: !rule.hasApplied)) {
+                            ruleRow(rule)
                         }
+                        .buttonStyle(.plain)
                     }
                 }
                 .background(card, in: RoundedRectangle(cornerRadius: 18))
@@ -1186,36 +1169,8 @@ private struct RulesHome: View {
         }
     }
 
-    private func groupCheck(_ name: String, ids: Set<UUID>, isTop: Bool) -> some View {
-        let count = ids.intersection(batchSelection).count
-        let full = count == ids.count
-        let symbol = full ? "checkmark.circle.fill" : count > 0 ? "minus.circle.fill" : "circle"
-        return Button {
-            if full { batchSelection.subtract(ids) } else { batchSelection.formUnion(ids) }
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: symbol).foregroundStyle(slate).accessibilityHidden(true)
-                Text(name).font(isTop ? .headline : .subheadline.weight(.semibold))
-                Spacer()
-                Text("\(count)/\(ids.count)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-            .frame(minHeight: 44)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityValue("已選 \(count) 條，共 \(ids.count) 條")
-        .accessibilityHint(full ? "取消選取這個分類" : "選取這個分類的所有規則")
-    }
-
     private func ruleRow(_ rule: Rule) -> some View {
         HStack(spacing: 11) {
-            if isSelectingBatch {
-                Image(systemName: batchSelection.contains(rule.id) ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(slate)
-                    .accessibilityHidden(true)
-            }
             Image(systemName: rule.displayAppearance.symbol(or: rule.defaultSymbol))
                 .foregroundStyle(rule.displayAppearance.tint(or: slate))
                 .font(.subheadline.weight(.semibold))
@@ -1224,9 +1179,9 @@ private struct RulesHome: View {
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 let title = Text(rule.name).font(.subheadline.weight(.semibold))
-                let next = snapshot.occurrences.lazy.filter { $0.ruleID == rule.id && $0.start > Date() }.map(\.start).min()
+                let next = snapshot.occurrences.lazy.filter { $0.ruleID == rule.id && $0.start > Date() }.min { $0.start < $1.start }
                 let status = rule.hasApplied
-                    ? next.map { "下次 " + dateCaption($0) } ?? "無後續日期"
+                    ? next.map { "下次 " + dateCaption($0.start, calendar: $0.isAllDay ? gregorianCalendar : RuleEngine.civilCalendar(for: rule)) } ?? "無後續日期"
                     : "未套用"
                 ViewThatFits(in: .horizontal) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -1247,12 +1202,10 @@ private struct RulesHome: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            if !isSelectingBatch {
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-                    .accessibilityHidden(true)
-            }
+            Image(systemName: "chevron.right")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.tertiary)
+                .accessibilityHidden(true)
         }
         .padding(.horizontal, 15)
         .padding(.vertical, 12)
@@ -1267,7 +1220,11 @@ private struct RulesHome: View {
                 ForEach(RuleKind.allCases) { kind in
                     Button {
                         var rule = Rule(name: "", kind: kind, date: kind.dates.first ?? "", category: "")
-                        if kind == .solar { rule.useSolarDefaultDuration() }
+                        if kind == .solar {
+                            rule.pinSolarTimeZone()
+                            rule.start = RuleEngine.civilCalendar(for: rule).startOfDay(for: Date())
+                            rule.useSolarDefaultDuration()
+                        }
                         isAdding = false
                         path.append(.edit(rule, isNew: true))
                     } label: {
@@ -1353,6 +1310,7 @@ private struct RuleEditor: View {
     @Environment(\.dismiss) private var dismiss
     let parent: Rule?
     let allRules: [Rule]
+    private let isFreshRule: Bool
     @ObservedObject var calendar: CalendarIntegration
     let preview: (Rule) throws -> RuleEventPreviewResult
     let onApply: (Rule) throws -> Rule
@@ -1366,6 +1324,7 @@ private struct RuleEditor: View {
          onSaveAppearance: @escaping (UUID, RuleAppearance) throws -> Bool,
          onOpenChild: @escaping (Rule, Bool) -> Void) {
         let isFresh = isNew && !allRules.contains { $0.id == initial.id }
+        self.isFreshRule = isFresh
         let shouldSuggest = isFresh && initial.name.isEmpty
         let shouldSuggestCategory = isFresh && initial.category.isEmpty
         var startingRule = initial
@@ -1392,6 +1351,14 @@ private struct RuleEditor: View {
         let depth: Int
         let hasChildren: Bool
         var id: UUID { item.id }
+    }
+
+    private var ruleCalendar: Calendar {
+        var current = rule
+        var visited = Set<UUID>()
+        while let id = current.parent, visited.insert(id).inserted,
+              let ancestor = allRules.first(where: { $0.id == id }) { current = ancestor }
+        return RuleEngine.civilCalendar(for: current)
     }
 
     private var children: [Rule] { allRules.filter { $0.parent == rule.id } }
@@ -1481,7 +1448,7 @@ private struct RuleEditor: View {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("事件標題（必填）")
                             .font(.caption.weight(.medium))
-                            .foregroundStyle(hasTitle ? Color.primary : Color.red)
+                            .foregroundStyle(hasTitle ? Color.primary : requiredFieldTint)
                             .accessibilityHidden(true)
                         TextField("輸入事件標題", text: Binding(
                             get: { rule.name },
@@ -1521,7 +1488,7 @@ private struct RuleEditor: View {
                 ))
                 .accessibilityIdentifier("all-day-toggle")
                 if rule.timing == .timed {
-                    RuleDateField(title: "開始時間", selection: $rule.startTime, kind: .time)
+                    RuleDateField(title: "開始時間", selection: $rule.startTime, kind: .time, civilCalendar: ruleCalendar)
                         .id("single-event-time")
                 }
                 if rule.timing == .allDay {
@@ -1535,7 +1502,7 @@ private struct RuleEditor: View {
 
             Section {
                 NavigationLink {
-                    EventPreview {
+                    EventPreview(civilCalendar: ruleCalendar) {
                         var submitted = rule
                         submitted.target = destinationID
                         return try preview(submitted)
@@ -1555,6 +1522,7 @@ private struct RuleEditor: View {
                 }
                 Button {
                     var child = Rule(name: "", kind: rule.kind, date: rule.date, category: rule.category, subcategory: rule.subcategory, parent: rule.id)
+                    child.startTime = ruleCalendar.date(bySettingHour: 9, minute: 0, second: 0, of: Date()) ?? child.startTime
                     child.target = rule.target
                     onOpenChild(child, true)
                 } label: {
@@ -1720,7 +1688,7 @@ private struct RuleEditor: View {
                     Text(chosenDestination)
                 } label: {
                     Text("指定行事曆（必填）")
-                        .foregroundStyle(hasDestination ? Color.primary : Color.red)
+                        .foregroundStyle(hasDestination ? Color.primary : requiredFieldTint)
                 }
             } else {
                 CalendarDestinationField(title: "指定行事曆（必填）", selectedTitle: chosenDestination,
@@ -1742,7 +1710,7 @@ private struct RuleEditor: View {
             Text(optional ? label : "\(label)（必填）")
                 .font(.caption.weight(.medium))
                 .foregroundStyle(!optional && selection.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                 ? Color.red : Color.primary)
+                                 ? requiredFieldTint : Color.primary)
                 .accessibilityHidden(true)
             HStack(spacing: 2) {
                 TextField(placeholder, text: selection)
@@ -1856,14 +1824,28 @@ private struct RuleEditor: View {
             Picker("類型", selection: $rule.kind) {
                 ForEach(RuleKind.allCases) { Text($0.rawValue).tag($0) }
             }
-            .onChange(of: rule.kind) { _, kind in
+            .onChange(of: rule.kind) { previousKind, kind in
                 rule.date = kind.dates.first ?? ""
                 if !availablePeriods.contains(rule.period) { rule.period = .year }
                 if kind != .gregorian {
                     rule.weekdayPattern = nil
                     rule.weeklyWeekday = nil
                 }
-                if kind == .solar { rule.useSolarDefaultDuration() }
+                if kind == .solar {
+                    if isFreshRule && rule.solarTimeZoneIdentifier == nil { rule.pinSolarTimeZone() }
+                    rule.useSolarDefaultDuration()
+                } else if previousKind == .solar, rule.solarTimeZoneIdentifier != nil {
+                    var solar = rule
+                    solar.kind = .solar
+                    let source = RuleEngine.civilCalendar(for: solar)
+                    func localComponents(_ date: Date) -> Date {
+                        gregorianCalendar.date(from: source.dateComponents([.year, .month, .day, .hour, .minute], from: date)) ?? date
+                    }
+                    rule.start = localComponents(rule.start)
+                    rule.endDate = localComponents(rule.endDate)
+                    rule.startTime = localComponents(rule.startTime)
+                    rule.solarTimeZoneIdentifier = nil
+                }
             }
             if rule.kind == .lunar {
                 if rule.period == .year {
@@ -1882,7 +1864,7 @@ private struct RuleEditor: View {
                     ForEach(RuleKind.solar.dates, id: \.self) { Text($0).tag($0) }
                 }
             }
-            RuleDateField(title: "起始日", selection: $rule.start)
+            RuleDateField(title: "起始日", selection: $rule.start, civilCalendar: ruleCalendar)
                 .onChange(of: rule.start) { oldStart, _ in
                     if allowsMonthEnd { rule.monthEnd = true }
                     if rule.kind == .solar && baseline == nil && rule.endMode == .duration {
@@ -2004,7 +1986,7 @@ private struct RuleEditor: View {
         do {
             let next = try RuleEngine.plan(root: root, rules: [root])
                 .first(where: { $0.start >= today })?.start
-            return next.map(dateCaption) ?? "期間內沒有下次日期"
+            return next.map { dateCaption($0) } ?? "期間內沒有下次日期"
         } catch {
             return "無法換算"
         }
@@ -2034,12 +2016,12 @@ private struct RuleEditor: View {
                 }
                 Stepper("重複期間：\(rule.endCount) \(rule.endUnit.rawValue)", value: $rule.endCount, in: 1...999)
                 if let date = try? RuleEngine.cutoff(for: rule) {
-                    LabeledContent("換算截止日", value: dateCaption(date))
+                    LabeledContent("換算截止日", value: dateCaption(date, calendar: ruleCalendar))
                 } else {
                     LabeledContent("換算截止日", value: "無法換算")
                 }
             } else {
-                RuleDateField(title: "截止日期", selection: $rule.endDate)
+                RuleDateField(title: "截止日期", selection: $rule.endDate, civilCalendar: ruleCalendar)
             }
         } header: { Text("規則截止") }
           footer: { Text("截止包含指定日期當天。") }
@@ -2057,6 +2039,7 @@ struct RuleEventPreviewResult {
 }
 
 private struct EventPreview: View {
+    let civilCalendar: Calendar
     let load: () throws -> RuleEventPreviewResult
     @State private var events: [CalendarPreviewEvent]?
     @State private var warning: String?
@@ -2111,9 +2094,9 @@ private struct EventPreview: View {
     private func eventRow(_ event: CalendarPreviewEvent) -> some View {
         let status: (label: String, color: Color)? = switch event.kind {
         case .unchanged: nil
-        case .insert: ("將新增", .green)
-        case .update: ("將修改", slate)
-        case .remove: ("將移除", .red)
+        case .insert: ("將新增", readableTint(light: 0x456B52, dark: 0x91AA98))
+        case .update: ("將修改", readableTint(light: 0x536780, dark: 0x98A9BF))
+        case .remove: ("將移除", requiredFieldTint)
         }
         let revisedTime: Bool
         if case .update = event.kind, let oldStart = event.previousStart {
@@ -2121,20 +2104,25 @@ private struct EventPreview: View {
         } else {
             revisedTime = false
         }
-        return VStack(alignment: .leading, spacing: 4) {
-            Text(event.title).font(.subheadline.weight(.semibold))
-            if revisedTime, let oldStart = event.previousStart {
-                Text("原：\(eventTime(start: oldStart, end: event.previousEnd ?? oldStart, allDay: event.previousIsAllDay ?? event.isAllDay))")
-                    .font(.caption)
+        return HStack(alignment: .firstTextBaseline, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(event.title).font(.subheadline.weight(.semibold))
+                if revisedTime, let oldStart = event.previousStart {
+                    Text("原：\(eventTime(start: oldStart, end: event.previousEnd ?? oldStart, allDay: event.previousIsAllDay ?? event.isAllDay))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text("\(revisedTime ? "改為：" : "")\(eventTime(start: event.start, end: event.end, allDay: event.isAllDay))")
+                    .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Text("\(revisedTime ? "改為：" : "")\(eventTime(start: event.start, end: event.end, allDay: event.isAllDay))")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
             if let status {
                 Text(status.label)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(status.color)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
             }
         }
         .foregroundStyle(event.isPast ? Color.secondary : Color.primary)
@@ -2144,14 +2132,15 @@ private struct EventPreview: View {
     }
 
     private func eventTime(start: Date, end: Date, allDay: Bool) -> String {
-        let date = dateCaption(start)
+        let date = dateCaption(start, calendar: allDay ? gregorianCalendar : civilCalendar)
         if allDay {
             let lastDay = gregorianCalendar.date(byAdding: .day, value: -1, to: end) ?? end
             return lastDay > start ? "\(date) 至 \(dateCaption(lastDay))" : date
         }
-        guard end > start else { return "\(date) \(timeCaption(start))" }
-        let endDate = gregorianCalendar.isDate(start, inSameDayAs: end) ? "" : "\(dateCaption(end)) "
-        return "\(date) \(timeCaption(start)) 至 \(endDate)\(timeCaption(end))"
+        let startTime = timeCaption(start, calendar: civilCalendar)
+        guard end > start else { return "\(date) \(startTime)" }
+        let endDate = civilCalendar.isDate(start, inSameDayAs: end) ? "" : "\(dateCaption(end, calendar: civilCalendar)) "
+        return "\(date) \(startTime) 至 \(endDate)\(timeCaption(end, calendar: civilCalendar))"
     }
 }
 
@@ -2208,7 +2197,7 @@ struct CalendarDestinationField: View {
                 }
                 .multilineTextAlignment(.trailing)
             } label: {
-                Text(title).foregroundStyle(isValid ? Color.primary : Color.red)
+                Text(title).foregroundStyle(isValid ? Color.primary : requiredFieldTint)
             }
         }
         .accessibilityLabel(title)
@@ -2218,7 +2207,6 @@ struct CalendarDestinationField: View {
 
 private struct CalStitchSettingsView: View {
     @AppStorage("settings.defaultTimeZoneIdentifier") private var overrideIdentifier = ""
-    @Environment(\.locale) private var locale
 
     private var currentIdentifier: String {
         overrideIdentifier.isEmpty ? TimeZone.autoupdatingCurrent.identifier : overrideIdentifier
@@ -2230,21 +2218,21 @@ private struct CalStitchSettingsView: View {
                 NavigationLink {
                     TimeZoneOptionsView(overrideIdentifier: $overrideIdentifier)
                 } label: {
-                    LabeledContent {
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        Text("預設時區")
+                        Spacer(minLength: 0)
                         VStack(alignment: .trailing, spacing: 3) {
-                            Text(timeZoneDisplayName(currentIdentifier, locale: locale))
+                            Text(currentIdentifier)
                             if overrideIdentifier.isEmpty {
-                                Text("跟隨 iOS").font(.caption).foregroundStyle(.secondary)
+                                Text("使用本機時區").font(.caption).foregroundStyle(.secondary)
                             }
                         }
                         .multilineTextAlignment(.trailing)
-                    } label: {
-                        Text("預設時區")
                     }
                 }
                 .accessibilityIdentifier("default-time-zone")
             } footer: {
-                Text("目前只儲存偏好，尚未用於規則排程。")
+                Text("適用於新建的節氣規則，不會變更既有規則。")
             }
 
             Section {
@@ -2270,33 +2258,51 @@ private struct CalStitchSettingsView: View {
 private struct TimeZoneOptionsView: View {
     @Binding var overrideIdentifier: String
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.locale) private var locale
     @State private var query = ""
 
     private struct Option: Identifiable {
         let id: String
-        let name: String
+        var components: [String] { id.split(separator: "/").map(String.init) }
+        var area: String { components.count > 1 ? components[0] : "" }
+        var place: String { components.last ?? id }
+        var region: String? {
+            if components.count > 2 {
+                return components.dropFirst().dropLast().joined(separator: " / ")
+                    .replacingOccurrences(of: "_", with: " ")
+            }
+            // IANA zone.tab explicitly groups these seven zone records under Alaska.
+            switch id {
+            case "America/Anchorage", "America/Juneau", "America/Sitka", "America/Metlakatla",
+                 "America/Yakutat", "America/Nome", "America/Adak": return "Alaska"
+            default: return nil
+            }
+        }
+    }
+
+    private static let allOptions = TimeZone.knownTimeZoneIdentifiers.map { Option(id: $0) }.sorted { lhs, rhs in
+        let left = [lhs.area, lhs.region ?? lhs.place, lhs.place, lhs.id]
+        let right = [rhs.area, rhs.region ?? rhs.place, rhs.place, rhs.id]
+        for (a, b) in zip(left, right) {
+            let comparison = a.compare(b, options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            if comparison != .orderedSame { return comparison == .orderedAscending }
+        }
+        return lhs.id < rhs.id
     }
 
     private var options: [Option] {
         let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        return TimeZone.knownTimeZoneIdentifiers.compactMap { identifier in
-            let name = timeZoneDisplayName(identifier, locale: locale)
-            guard search.isEmpty ||
-                    identifier.localizedStandardContains(search) ||
-                    identifier.replacingOccurrences(of: "_", with: " ").localizedStandardContains(search) ||
-                    name.localizedStandardContains(search) else { return nil }
-            return Option(id: identifier, name: name)
-        }.sorted { lhs, rhs in
-            let comparison = lhs.name.localizedStandardCompare(rhs.name)
-            return comparison == .orderedSame ? lhs.id < rhs.id : comparison == .orderedAscending
+        guard !search.isEmpty else { return Self.allOptions }
+        return Self.allOptions.filter { item in
+            item.id.localizedStandardContains(search) ||
+                item.id.replacingOccurrences(of: "_", with: " ").localizedStandardContains(search) ||
+                (item.region?.localizedStandardContains(search) ?? false)
         }
     }
 
     var body: some View {
         List {
             Section {
-                option("跟隨 iOS", detail: timeZoneDisplayName(TimeZone.autoupdatingCurrent.identifier, locale: locale),
+                option("使用本機時區", detail: TimeZone.autoupdatingCurrent.identifier,
                        identifier: "")
             }
             Section("時區") {
@@ -2305,7 +2311,7 @@ private struct TimeZoneOptionsView: View {
                     Text("找不到符合的時區").foregroundStyle(.secondary)
                 } else {
                     ForEach(matches) { item in
-                        option(item.name, detail: item.id, identifier: item.id)
+                        option(item.id, detail: item.region, identifier: item.id)
                     }
                 }
             }
@@ -2315,7 +2321,7 @@ private struct TimeZoneOptionsView: View {
         .navigationBarTitleDisplayMode(.inline)
     }
 
-    private func option(_ name: String, detail: String, identifier: String) -> some View {
+    private func option(_ name: String, detail: String?, identifier: String) -> some View {
         let selected = overrideIdentifier == identifier
         return Button {
             overrideIdentifier = identifier
@@ -2324,7 +2330,7 @@ private struct TimeZoneOptionsView: View {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(name).foregroundStyle(.primary)
-                    if name != detail {
+                    if let detail {
                         Text(detail).font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -2336,15 +2342,6 @@ private struct TimeZoneOptionsView: View {
         }
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
-}
-
-private func timeZoneDisplayName(_ identifier: String, locale: Locale) -> String {
-    guard let zone = TimeZone(identifier: identifier) else { return identifier }
-    let city = identifier.split(separator: "/").last?.replacingOccurrences(of: "_", with: " ") ?? identifier
-    if let localized = zone.localizedName(for: .generic, locale: locale), localized != city {
-        return "\(localized) · \(city)"
-    }
-    return city
 }
 
 private struct OrphanCleanupView: View {

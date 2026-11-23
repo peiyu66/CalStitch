@@ -672,7 +672,7 @@ final class CalendarIntegration: ObservableObject {
     private func configure(_ event: EKEvent, with occurrence: PlannedOccurrence) {
         event.title = occurrence.title
         event.isAllDay = occurrence.isAllDay
-        event.timeZone = occurrence.isAllDay ? nil : TimeZone(identifier: "Asia/Taipei")
+        event.timeZone = occurrence.isAllDay ? nil : (occurrence.timeZoneIdentifier.flatMap(TimeZone.init(identifier:)) ?? RuleEngine.timeZone)
         event.startDate = storageDate(occurrence.start, allDay: occurrence.isAllDay)
         let exclusiveEnd = storageDate(occurrence.end, allDay: occurrence.isAllDay)
         // EventKit expands an all-day end to the end of the selected civil day.

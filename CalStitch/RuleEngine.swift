@@ -16,6 +16,8 @@ struct PlannedOccurrence: Hashable, Codable {
     var end: Date
     var isAllDay: Bool
     var calendarID: String
+    // All-day start/end remain Taipei-encoded floating dates; timed values are absolute.
+    var timeZoneIdentifier: String? = nil
 }
 
 enum RuleEngine {
@@ -45,33 +47,55 @@ enum RuleEngine {
     private static let dayLimit = 36_600
     private static let occurrenceLimit = 10_000
 
+    static func civilCalendar(for rule: Rule) -> Calendar {
+        guard rule.kind == .solar, let identifier = rule.solarTimeZoneIdentifier,
+              let zone = TimeZone(identifier: identifier) else { return civil }
+        var calendar = civil
+        calendar.timeZone = zone
+        return calendar
+    }
+
     static func cutoff(for rule: Rule) throws -> Date {
-        let start = civil.startOfDay(for: rule.start)
+        if rule.kind == .solar, let identifier = rule.solarTimeZoneIdentifier,
+           TimeZone(identifier: identifier) == nil {
+            throw PlanningError.unsupported("找不到原規則的時區，請重新設定。")
+        }
+        let calendar = civilCalendar(for: rule)
+        let pinned = rule.kind == .solar && rule.solarTimeZoneIdentifier != nil
+        let start = calendar.startOfDay(for: rule.start)
         let cutoff: Date
         switch rule.endMode {
         case .date:
-            cutoff = civil.startOfDay(for: rule.endDate)
+            cutoff = calendar.startOfDay(for: rule.endDate)
         case .duration:
             guard (1...36_600).contains(rule.endCount) else { throw PlanningError.tooMany }
             let anniversary: Date
             switch rule.endUnit {
             case .day, .week:
-                anniversary = try adding(.day, rule.endCount * (rule.endUnit == .week ? 7 : 1), to: start)
+                anniversary = try adding(.day, rule.endCount * (rule.endUnit == .week ? 7 : 1), to: start, calendar: calendar)
             case .month, .year:
-                anniversary = try monthShift(from: start, count: rule.endCount, unit: rule.endUnit, forceMonthEnd: false, rejectShortMonth: true)
+                anniversary = try monthShift(from: start, count: rule.endCount, unit: rule.endUnit, forceMonthEnd: false, rejectShortMonth: true, calendar: calendar)
             }
-            cutoff = try adding(.day, -1, to: anniversary)
+            cutoff = try adding(.day, -1, to: anniversary, calendar: calendar)
         }
         guard cutoff >= start else { throw PlanningError.invalidRange }
-        return cutoff
+        return pinned ? calendar.startOfDay(for: cutoff) : cutoff
     }
 
     static func plan(root: Rule, rules: [Rule]) throws -> [PlannedOccurrence] {
         guard root.parent == nil, (1...36_600).contains(root.interval) else { throw PlanningError.invalidRule }
-        let start = civil.startOfDay(for: root.start)
+        let calendar = civilCalendar(for: root)
+        let pinnedZone = root.kind == .solar ? root.solarTimeZoneIdentifier : nil
+        let start = calendar.startOfDay(for: root.start)
         let last = try cutoff(for: root)
-        let exclusive = try adding(.day, 1, to: last)
-        guard let span = civil.dateComponents([.day], from: start, to: exclusive).day,
+        func shiftDay(_ day: Date, by count: Int) throws -> Date {
+            let shifted = try adding(.day, count, to: day, calendar: calendar)
+            // Some zones skip midnight at DST transitions. Restore the actual civil boundary
+            // after offsetting from a day that began at a non-midnight local wall time.
+            return pinnedZone == nil ? shifted : calendar.startOfDay(for: shifted)
+        }
+        let exclusive = try shiftDay(last, by: 1)
+        guard let span = calendar.dateComponents([.day], from: start, to: exclusive).day,
               span <= dayLimit else { throw PlanningError.tooMany }
 
         let days: [Date]
@@ -87,7 +111,7 @@ enum RuleEngine {
         case .lunar:
             days = try lunarDays(root: root, start: start, exclusive: exclusive)
         case .solar:
-            days = try solarDays(root: root, start: start, last: last)
+            days = try solarDays(root: root, start: start, last: last, calendar: calendar)
         }
 
         let children = Dictionary(grouping: rules.filter { $0.id != root.id }, by: \.parent)
@@ -105,21 +129,28 @@ enum RuleEngine {
             switch rule.timing {
             case .allDay:
                 guard (1...3660).contains(rule.durationDays) else { throw PlanningError.invalidRule }
-                begin = day
-                end = try adding(.day, rule.durationDays, to: day)
+                let localEnd = try shiftDay(day, by: rule.durationDays)
+                if pinnedZone != nil {
+                    // Calendar integrations store civil all-day dates independently of a timezone.
+                    begin = try floatingDate(day, from: calendar)
+                    end = try floatingDate(localEnd, from: calendar)
+                } else {
+                    begin = day
+                    end = localEnd
+                }
             case .timed:
                 guard (1...17_520).contains(rule.durationHalfHours) else { throw PlanningError.invalidRule }
-                let hour = civil.component(.hour, from: rule.startTime)
-                let minute = civil.component(.minute, from: rule.startTime)
-                guard let timed = civil.date(bySettingHour: hour, minute: minute, second: 0, of: day),
-                      civil.isDate(timed, inSameDayAs: day),
-                      civil.component(.hour, from: timed) == hour,
-                      civil.component(.minute, from: timed) == minute else { throw PlanningError.invalidRule }
+                let hour = calendar.component(.hour, from: rule.startTime)
+                let minute = calendar.component(.minute, from: rule.startTime)
+                guard let timed = calendar.date(bySettingHour: hour, minute: minute, second: 0, of: day),
+                      calendar.isDate(timed, inSameDayAs: day),
+                      calendar.component(.hour, from: timed) == hour,
+                      calendar.component(.minute, from: timed) == minute else { throw PlanningError.invalidRule }
                 begin = timed
                 end = begin.addingTimeInterval(Double(rule.durationHalfHours) * 1800)
             }
             output.append(.init(ruleID: rule.id, key: String(ordinal), title: rule.name, start: begin, end: end,
-                                isAllDay: rule.timing == .allDay, calendarID: rule.target))
+                                isAllDay: rule.timing == .allDay, calendarID: rule.target, timeZoneIdentifier: pinnedZone))
             for child in children[rule.id] ?? [] {
                 guard (0...3660).contains(child.offsetDays) else { throw PlanningError.invalidRule }
                 let delta: Int
@@ -128,7 +159,7 @@ enum RuleEngine {
                 case .same: delta = 0
                 case .after: delta = child.offsetDays
                 }
-                try add(child, day: adding(.day, delta, to: day), ordinal: ordinal)
+                try add(child, day: shiftDay(day, by: delta), ordinal: ordinal)
             }
         }
         for (ordinal, day) in days.enumerated() { try add(root, day: day, ordinal: ordinal) }
@@ -211,16 +242,22 @@ enum RuleEngine {
         throw PlanningError.tooMany
     }
 
-    private static func solarDays(root: Rule, start: Date, last: Date) throws -> [Date] {
+    private static func solarDays(root: Rule, start: Date, last: Date, calendar: Calendar) throws -> [Date] {
         guard root.period == .year else {
             throw PlanningError.unsupported("節氣規則目前只支援按年重複。")
         }
         guard SolarTerms.names.contains(root.date) else { throw PlanningError.invalidRule }
-        let startYear = civil.component(.year, from: start)
-        let endYear = civil.component(.year, from: last)
+        let startYear = calendar.component(.year, from: start)
+        let endYear = calendar.component(.year, from: last)
         let coverage = SolarTerms.supportedYears
         func term(_ year: Int) throws -> Date {
-            guard let date = SolarTerms.date(for: root.date, year: year, calendar: civil) else {
+            let date: Date?
+            if root.solarTimeZoneIdentifier == nil {
+                date = SolarTerms.date(for: root.date, year: year, calendar: civil)
+            } else {
+                date = SolarTerms.instant(for: root.date, year: year).map { calendar.startOfDay(for: $0) }
+            }
+            guard let date else {
                 throw PlanningError.unsupported("節氣日期目前只涵蓋 \(coverage.lowerBound) 至 \(coverage.upperBound) 年；請調整規則的起訖日期。")
             }
             return date
@@ -297,23 +334,29 @@ enum RuleEngine {
         var leap: Bool
     }
 
-    private static func monthShift(from date: Date, count: Int, unit: PeriodUnit, forceMonthEnd: Bool, rejectShortMonth: Bool = false) throws -> Date {
-        let parts = civil.dateComponents([.year, .month, .day], from: date)
+    private static func floatingDate(_ date: Date, from calendar: Calendar) throws -> Date {
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        guard let floating = civil.date(from: components) else { throw PlanningError.invalidRule }
+        return floating
+    }
+
+    private static func monthShift(from date: Date, count: Int, unit: PeriodUnit, forceMonthEnd: Bool, rejectShortMonth: Bool = false, calendar: Calendar = civil) throws -> Date {
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
         guard let day = parts.day,
-              let first = civil.date(from: DateComponents(year: parts.year, month: parts.month, day: 1)) else {
+              let first = calendar.date(from: DateComponents(year: parts.year, month: parts.month, day: 1)) else {
             throw PlanningError.invalidRule
         }
         let monthDelta = count * (unit == .year ? 12 : 1)
-        let candidate = try adding(.month, monthDelta, to: first)
-        guard let maximum = civil.range(of: .day, in: .month, for: candidate)?.last else { throw PlanningError.invalidRule }
+        let candidate = try adding(.month, monthDelta, to: first, calendar: calendar)
+        guard let maximum = calendar.range(of: .day, in: .month, for: candidate)?.last else { throw PlanningError.invalidRule }
         if rejectShortMonth && day > maximum {
             throw PlanningError.unsupported("按期間換算時沒有對應的截止日，請改用指定截止日期。")
         }
-        return try adding(.day, (forceMonthEnd ? maximum : min(day, maximum)) - 1, to: candidate)
+        return try adding(.day, (forceMonthEnd ? maximum : min(day, maximum)) - 1, to: candidate, calendar: calendar)
     }
 
-    private static func adding(_ component: Calendar.Component, _ value: Int, to date: Date) throws -> Date {
-        guard let result = civil.date(byAdding: component, value: value, to: date) else { throw PlanningError.invalidRule }
+    private static func adding(_ component: Calendar.Component, _ value: Int, to date: Date, calendar: Calendar = civil) throws -> Date {
+        guard let result = calendar.date(byAdding: component, value: value, to: date) else { throw PlanningError.invalidRule }
         return result
     }
 }
