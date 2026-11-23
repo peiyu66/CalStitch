@@ -1,6 +1,6 @@
 import Foundation
 
-// swiftc CalStitch/SolarTerms.swift Tests/SolarTermsTests.swift -o /tmp/calstitch-solar-tests
+// swiftc CalStitch/L10n.swift CalStitch/SolarTerms.swift Tests/SolarTermsTests.swift -o /tmp/calstitch-solar-tests
 // /tmp/calstitch-solar-tests
 @main
 struct SolarTermsTests {

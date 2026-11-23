@@ -24,6 +24,7 @@ struct BirthdayCandidate: Identifiable, Equatable, Sendable {
     let contactID: String
     var id: Key { Key(contactID: contactID, isLunar: isLunar) }
     let name: String
+    var nickname: String? = nil
     let month: Int
     let day: Int
     let isLunar: Bool
@@ -34,13 +35,24 @@ struct BirthdayCandidate: Identifiable, Equatable, Sendable {
         .init(contactID: contactID, isLunar: isLunar, month: month, day: day, isLeapMonth: isLeapMonth, year: year)
     }
 
-    var eventTitle: String { name + (isLunar ? "農曆生日" : "生日") }
+    private func chineseTitle(for text: String) -> String { text + (isLunar ? "農曆生日" : "生日") }
+    private func englishTitle(for text: String) -> String { text + (isLunar ? "’s Lunar Birthday" : "’s Birthday") }
+
+    func eventTitle(preferNickname: Bool) -> String {
+        let text = preferNickname ? (nickname ?? name) : name
+        return L10n.text(chineseTitle(for: text), englishTitle(for: text))
+    }
+
+    var duplicateTitles: Set<String> {
+        Set([name, nickname].compactMap { $0 }.flatMap { [$0, chineseTitle(for: $0), englishTitle(for: $0)] })
+    }
 
     var dateLabel: String {
         if isLunar {
-            return "農曆\(isLeapMonth ? "閏" : "")\(month) 月 \(day) 日"
+            return L10n.text("農曆\(isLeapMonth ? "閏" : "")\(month) 月 \(day) 日",
+                             isLeapMonth ? "Lunar leap month \(month), day \(day)" : "Lunar month \(month), day \(day)")
         }
-        return "西元 \(month) 月 \(day) 日"
+        return L10n.text("西元 \(month) 月 \(day) 日", "Gregorian \(month)/\(day)")
     }
 
     static func extract(from contact: CNContact) -> [Self] {
@@ -53,19 +65,22 @@ struct BirthdayCandidate: Identifiable, Equatable, Sendable {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty }
         guard let name else { return [] }
+        let rawNickname = contact.isKeyAvailable(CNContactNicknameKey)
+            ? contact.nickname.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        let nickname = rawNickname.isEmpty ? nil : rawNickname
 
         var candidates: [Self] = []
         if contact.isKeyAvailable(CNContactBirthdayKey), let birth = contact.birthday,
            let month = birth.month, let day = birth.day,
            (1...12).contains(month), day >= 1,
            day <= [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] {
-            candidates.append(.init(contactID: contact.identifier, name: name, month: month, day: day, isLunar: false, isLeapMonth: false, year: birth.year))
+            candidates.append(.init(contactID: contact.identifier, name: name, nickname: nickname, month: month, day: day, isLunar: false, isLeapMonth: false, year: birth.year))
         }
         if contact.isKeyAvailable(CNContactNonGregorianBirthdayKey), let birth = contact.nonGregorianBirthday,
            birth.calendar?.identifier == .chinese,
            let month = birth.month, let day = birth.day,
            (1...12).contains(month), (1...30).contains(day) {
-            candidates.append(.init(contactID: contact.identifier, name: name, month: month, day: day, isLunar: true, isLeapMonth: birth.isLeapMonth == true, year: birth.year))
+            candidates.append(.init(contactID: contact.identifier, name: name, nickname: nickname, month: month, day: day, isLunar: true, isLeapMonth: birth.isLeapMonth == true, year: birth.year))
         }
         return candidates
     }
@@ -91,12 +106,17 @@ struct BirthdayImportView: View {
     let categories: [BatchCategoryOption]
     let presetCalendarIDs: () -> [String: String]
     let status: (BirthdayCandidate) -> BirthdayDuplicateStatus
-    let onImport: ([BirthdayCandidate], Int, String, Bool, String, String) throws -> Void
+    let onImport: ([BirthdayCandidate], Int, String, Bool, String, String, Bool) throws -> Void
     private let cameFromGroup: Bool
 
-    private enum ImportMode: String, CaseIterable {
-        case draft = "草稿"
-        case apply = "匯入後套用"
+    private enum ImportMode: CaseIterable, Hashable {
+        case draft, apply
+        var label: String {
+            switch self {
+            case .draft: L10n.text("草稿", "Drafts")
+            case .apply: L10n.text("匯入後套用", "Import and Apply")
+            }
+        }
     }
 
     @State private var mode: ImportMode = .draft
@@ -111,6 +131,7 @@ struct BirthdayImportView: View {
     @State private var candidates: [BirthdayCandidate] = []
     @State private var selected = Set<BirthdayCandidate.Key>()
     @State private var explicitlyUnchecked = Set<BirthdayCandidate.Key>()
+    @State private var preferNickname = false
     @State private var showWestern = true
     @State private var showLunar = true
     @State private var years = 5
@@ -122,7 +143,7 @@ struct BirthdayImportView: View {
          calendar: CalendarIntegration, categories: [BatchCategoryOption],
          presetCalendarIDs: @escaping () -> [String: String],
          status: @escaping (BirthdayCandidate) -> BirthdayDuplicateStatus,
-         onImport: @escaping ([BirthdayCandidate], Int, String, Bool, String, String) throws -> Void) {
+         onImport: @escaping ([BirthdayCandidate], Int, String, Bool, String, String, Bool) throws -> Void) {
         self.calendar = calendar
         self.categories = categories
         self.presetCalendarIDs = presetCalendarIDs
@@ -171,23 +192,33 @@ struct BirthdayImportView: View {
                         Label(errorMessage, systemImage: "exclamationmark.triangle")
                             .foregroundStyle(.red)
                     } header: {
-                        Text("無法匯入")
+                        Text(L10n.text("無法匯入", "Unable to Import"))
                     }
                 }
                 Section {
+                    capsulePicker([false, true], selection: $preferNickname, identifier: "birthday-name-preference",
+                                  label: { $0 ? L10n.text("暱稱", "Nickname") : L10n.text("姓名", "Name") },
+                                  optionIdentifier: { $0 ? "birthday-name-nickname" : "birthday-name-full" },
+                                  softTint: { !$0 })
+                } header: {
+                    Text(L10n.text("生日名稱", "Birthday Title"))
+                } footer: {
+                    Text(L10n.text("沒有暱稱的聯絡人仍使用姓名。", "Contacts without a nickname still use their name."))
+                }
+                Section {
                     HStack(spacing: 28) {
-                        checkbox("西元", checked: showWestern) { showWestern.toggle() }
-                        checkbox("農曆", checked: showLunar) { showLunar.toggle() }
+                        checkbox(L10n.text("西元", "Gregorian"), checked: showWestern) { showWestern.toggle() }
+                        checkbox(L10n.text("農曆", "Lunar"), checked: showLunar) { showLunar.toggle() }
                     }
                 } header: {
-                    Text("生日類型")
+                    Text(L10n.text("生日類型", "Birthday Calendars"))
                 }
 
                 Section {
                     if candidates.isEmpty {
-                        Text("沒有可匯入的生日").foregroundStyle(.secondary)
+                        Text(L10n.text("沒有可匯入的生日", "No birthdays to import")).foregroundStyle(.secondary)
                     } else if visible.isEmpty {
-                        Text("沒有符合所選類型的生日").foregroundStyle(.secondary)
+                        Text(L10n.text("沒有符合所選類型的生日", "No birthdays match the selected calendars")).foregroundStyle(.secondary)
                     }
                     ForEach(visible) { candidate in
                         let itemStatus = status(candidate)
@@ -204,7 +235,7 @@ struct BirthdayImportView: View {
                             HStack(spacing: 12) {
                                 checkIcon(checked)
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text(candidate.eventTitle).foregroundStyle(.primary)
+                                    Text(candidate.eventTitle(preferNickname: preferNickname)).foregroundStyle(.primary)
                                     Text(candidate.dateLabel).font(.subheadline).foregroundStyle(.secondary)
                                     if let note = statusText(itemStatus) {
                                         Text(note).font(.footnote)
@@ -223,45 +254,49 @@ struct BirthdayImportView: View {
                         Button {
                             request = UUID()
                         } label: {
-                            Label("再選聯絡人", systemImage: "person.badge.plus")
+                            Label(L10n.text("再選聯絡人", "Select More Contacts"), systemImage: "person.badge.plus")
                         }
                     }
                 } header: {
-                    Text("要匯入的生日")
+                    Text(L10n.text("要匯入的生日", "Birthdays to Import"))
                 } footer: {
                     if skipped > 0 {
-                        Text("這次挑選有 \(skipped) 位聯絡人缺少可匯入的姓名或生日。")
+                        Text(L10n.text("這次挑選有 \(skipped) 位聯絡人缺少可匯入的姓名或生日。",
+                                      skipped == 1 ? "1 selected contact is missing a name or birthday."
+                                                   : "\(skipped) selected contacts are missing a name or birthday."))
                     }
                 }
 
                 Section {
-                    Stepper("重複期間：\(years) 年", value: $years, in: 1...999)
+                    Stepper(L10n.text("重複期間：\(years) 年", "Repeat for \(years) \(years == 1 ? "year" : "years")"), value: $years, in: 1...999)
                 } footer: {
-                    Text("這個期間套用到本次匯入的生日規則。")
+                    Text(L10n.text("這個期間套用到本次匯入的生日規則。", "This duration applies to all the birthdays in this import."))
                 }
 
                 Section {
                     HStack(alignment: .top, spacing: 16) {
-                        categoryField("分類", value: $category, choices: categories.map(\.name))
-                        categoryField("次類", value: $subcategory, choices: availableSubcategories)
+                        categoryField(L10n.text("分類", "Category"), value: $category, choices: categories.map(\.name))
+                        categoryField(L10n.text("次類", "Subcategory"), value: $subcategory, choices: availableSubcategories, isSubcategory: true)
                     }
                 } footer: {
-                    Text("次類可留空，也可輸入聯絡人群組的名稱。")
+                    Text(L10n.text("次類可留空，也可輸入聯絡人群組的名稱。", "Leave the subcategory blank or enter the contact list name."))
                 }
 
-                Section("匯入方式") {
+                Section(L10n.text("匯入方式", "Import Mode")) {
                     importModePicker
                     birthdayCalendarFields
                     if mode == .draft {
-                        Text("會保存目的行事曆，但現在只建立草稿，不寫入事件。")
+                        Text(L10n.text("會保存目的行事曆，但現在只建立草稿，不寫入事件。", "The destination calendar is saved with the drafts. No events are written yet."))
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                     Button {
                         performImport()
                     } label: {
                         Text(mode == .draft
-                             ? "匯入 \(importable.count) 筆草稿"
-                             : "匯入並套用 \(importable.count) 筆")
+                             ? L10n.text("匯入 \(importable.count) 筆草稿",
+                                         "Import \(importable.count) \(importable.count == 1 ? "Draft" : "Drafts")")
+                             : L10n.text("匯入並套用 \(importable.count) 筆",
+                                         "Import and Apply \(importable.count)"))
                             .fontWeight(.semibold)
                             .frame(maxWidth: .infinity, minHeight: 32)
                     }
@@ -270,11 +305,11 @@ struct BirthdayImportView: View {
                     .accessibilityIdentifier("confirm-birthday-import")
                 }
             }
-            .navigationTitle("匯入生日")
+            .navigationTitle(L10n.text("匯入生日", "Import Birthdays"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { dismiss() }
+                    Button(L10n.text("取消", "Cancel")) { dismiss() }
                 }
             }
             .background {
@@ -301,19 +336,19 @@ struct BirthdayImportView: View {
                 }
             } label: {
                 if connecting {
-                    ProgressView("正在連接行事曆…")
+                    ProgressView(L10n.text("正在連接行事曆…", "Connecting to Calendars…"))
                 } else {
-                    Label("連接行事曆", systemImage: "calendar.badge.plus")
+                    Label(L10n.text("連接行事曆", "Connect Calendars"), systemImage: "calendar.badge.plus")
                 }
             }
             .disabled(connecting)
         } else if !calendar.destinations.isEmpty {
             let selected = calendar.destinations.first { $0.id == targetID }
             CalendarDestinationField(
-                title: "目的行事曆",
+                title: L10n.text("目的行事曆", "Destination Calendar"),
                 selectedTitle: destination?.displayTitle
-                    ?? selected.map { "\($0.displayTitle)（唯讀）" }
-                    ?? (targetID == nil ? "請選擇" : "已無法使用"),
+                    ?? selected.map { L10n.text("\($0.displayTitle)（唯讀）", "\($0.displayTitle) (read-only)") }
+                    ?? (targetID == nil ? L10n.text("請選擇", "Choose a calendar") : L10n.text("已無法使用", "No longer available")),
                 selectedID: targetID ?? "", isValid: destination != nil,
                 destinations: calendar.destinations
             ) { explicitlySelectedCalendarID = $0 }
@@ -322,33 +357,44 @@ struct BirthdayImportView: View {
             Text(calendarError).font(.footnote).foregroundStyle(.red)
         }
         if !calendar.destinations.contains(where: \.isWritable) {
-            Text("匯入前請先連接或選擇一個可寫入的行事曆。")
+            Text(L10n.text("匯入前請先連接或選擇一個可寫入的行事曆。", "Connect or select a writable calendar before importing."))
                 .font(.footnote).foregroundStyle(.secondary)
         }
     }
 
     private var importModePicker: some View {
+        capsulePicker(ImportMode.allCases, selection: $mode, identifier: "birthday-import-mode",
+                      label: { $0.label },
+                      optionIdentifier: { $0 == .draft ? "birthday-import-draft" : "birthday-import-apply" },
+                      softTint: { $0 == .draft })
+    }
+
+    private func capsulePicker<Value: Hashable>(
+        _ options: [Value], selection: Binding<Value>, identifier: String,
+        label: @escaping (Value) -> String, optionIdentifier: @escaping (Value) -> String, softTint: @escaping (Value) -> Bool
+    ) -> some View {
         let layout = dynamicTypeSize.isAccessibilitySize
             ? AnyLayout(VStackLayout(spacing: 3))
             : AnyLayout(HStackLayout(spacing: 3))
         return layout {
-            ForEach(ImportMode.allCases, id: \.self) { option in
-                importModeButton(option)
+            ForEach(options, id: \.self) { option in
+                capsuleButton(label(option), isSelected: selection.wrappedValue == option,
+                              softTint: softTint(option), identifier: optionIdentifier(option)) {
+                    selection.wrappedValue = option
+                }
             }
         }
         .padding(3)
-        .background(Color(uiColor: .quaternarySystemFill), in: RoundedRectangle(cornerRadius: 12))
+        .background(Color(uiColor: .quaternarySystemFill), in: Capsule())
         .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("birthday-import-mode")
+        .accessibilityIdentifier(identifier)
     }
 
-    private func importModeButton(_ option: ImportMode) -> some View {
-        let isSelected = mode == option
-        let shape = RoundedRectangle(cornerRadius: 9)
-        return Button {
-            mode = option
-        } label: {
-            Text(option.rawValue)
+    private func capsuleButton(_ title: String, isSelected: Bool, softTint: Bool, identifier: String,
+                               action: @escaping () -> Void) -> some View {
+        let shape = Capsule()
+        return Button(action: action) {
+            Text(title)
                 .font(.body.weight(isSelected ? .semibold : .regular))
                 .foregroundStyle(isSelected ? Color.primary : Color.secondary)
                 .multilineTextAlignment(.center)
@@ -359,7 +405,7 @@ struct BirthdayImportView: View {
                     if isSelected {
                         shape.fill(Color(uiColor: .systemBackground))
                             .overlay {
-                                if option == .draft {
+                                if softTint {
                                     shape.fill(Color(red: 0.38, green: 0.50, blue: 0.64).opacity(0.18))
                                 }
                             }
@@ -370,13 +416,14 @@ struct BirthdayImportView: View {
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityIdentifier(identifier)
     }
 
     private func performImport() {
         guard canImport, let destination else { return }
         errorMessage = nil
         do {
-            try onImport(importable, years, destination.id, mode == .apply, categoryName, subcategoryName)
+            try onImport(importable, years, destination.id, mode == .apply, categoryName, subcategoryName, preferNickname)
             dismiss()
         } catch {
             errorMessage = error.localizedDescription
@@ -386,32 +433,40 @@ struct BirthdayImportView: View {
     private func statusText(_ status: BirthdayDuplicateStatus) -> String? {
         switch status {
         case .available: nil
-        case .imported: "已匯入"
-        case .possibleDuplicate: "可能重複"
-        case .changed: "生日與舊規則不同，匯入不會覆寫舊規則"
+        case .imported: L10n.text("已匯入", "Already imported")
+        case .possibleDuplicate: L10n.text("可能重複", "Possible duplicate")
+        case .changed: L10n.text("生日與舊規則不同，匯入不會覆寫舊規則", "This birthday differs from the existing rule. Importing it will not replace that rule.")
         }
     }
 
-    private func categoryField(_ title: String, value: Binding<String>, choices: [String]) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+    private func categoryField(_ title: String, value: Binding<String>, choices: [String], isSubcategory: Bool = false) -> some View {
+        let displayValue = isSubcategory ? value : Binding(
+            get: { L10n.category(value.wrappedValue) },
+            set: { newValue in
+                // Keep exact preset identities intact when presenting a translated label.
+                guard newValue != L10n.category(value.wrappedValue) else { return }
+                value.wrappedValue = newValue
+            }
+        )
+        return VStack(alignment: .leading, spacing: 4) {
             Text(title).font(.caption).foregroundStyle(.secondary)
             HStack(spacing: 4) {
-                TextField(title == "次類" ? "選填" : "必填", text: value)
+                TextField(isSubcategory ? L10n.text("選填", "Optional") : L10n.text("必填", "Required"), text: displayValue)
                     .accessibilityLabel(title)
                 if !choices.isEmpty {
                     Menu {
-                        if title == "次類" {
-                            Button("無次類") { value.wrappedValue = "" }
+                        if isSubcategory {
+                            Button(L10n.text("無次類", "No Subcategory")) { value.wrappedValue = "" }
                         }
                         ForEach(choices, id: \.self) { choice in
-                            Button(choice) { value.wrappedValue = choice }
+                            Button(isSubcategory ? choice : L10n.category(choice)) { value.wrappedValue = choice }
                         }
                     } label: {
                         Image(systemName: "chevron.down")
                             .font(.footnote.weight(.semibold))
                             .frame(minWidth: 32, minHeight: 44)
                     }
-                    .accessibilityLabel("選擇\(title)")
+                    .accessibilityLabel(isSubcategory ? L10n.text("選擇次類", "Choose a subcategory") : L10n.text("選擇分類", "Choose a category"))
                     .buttonStyle(.borderless)
                 }
             }
@@ -497,7 +552,7 @@ struct ContactPickerPresenter: UIViewControllerRepresentable {
             handled = request
             let picker = CNContactPickerViewController()
             picker.delegate = self
-            picker.displayedPropertyKeys = [CNContactBirthdayKey, CNContactNonGregorianBirthdayKey]
+            picker.displayedPropertyKeys = [CNContactBirthdayKey, CNContactNonGregorianBirthdayKey, CNContactNicknameKey]
             picker.predicateForSelectionOfContact = NSPredicate(value: true)
             present(picker, animated: true)
         }
@@ -567,7 +622,7 @@ struct BirthdayGroupImportView: View {
     let presetCalendarIDs: () -> [String: String]
     let status: (BirthdayCandidate) -> BirthdayDuplicateStatus
     let onChoosePeople: () -> Void
-    let onImport: ([BirthdayCandidate], Int, String, Bool, String, String) throws -> Void
+    let onImport: ([BirthdayCandidate], Int, String, Bool, String, String, Bool) throws -> Void
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
@@ -590,22 +645,30 @@ struct BirthdayGroupImportView: View {
                     List {
                         switch state {
                         case .intro:
-                            Text("讀取群組需要完整通訊錄存取。CalStitch 只會讀取所選群組成員的姓名和生日；若不想開放完整存取，可回上一頁使用個別選人。")
-                            Button("讀取聯絡人群組") { loadGroups(allowPrompt: true) }
+                            Text(L10n.text(
+                                "按「讀取聯絡人群組」後，iPhone 會顯示系統授權視窗。請在視窗中選擇「完整取用權限」。",
+                                "Tap Load Contact Lists to open the iPhone permission prompt, then choose Full Access."
+                            ))
+                            Text(L10n.text(
+                                "CalStitch 只會讀取所選群組成員的姓名、暱稱和生日。若不想授予完整取用權限，可以改用個別選人。",
+                                "CalStitch reads only the names, nicknames, and birthdays of people in the list you select. If you prefer not to grant full access, you can select people individually instead."
+                            ))
+                            .foregroundStyle(.secondary)
+                            Button(L10n.text("讀取聯絡人群組", "Load Contact Lists")) { loadGroups(allowPrompt: true) }
                         case .loading:
-                            ProgressView("讀取中…")
+                            ProgressView(L10n.text("讀取中…", "Loading…"))
                         case .settings:
-                            Text("群組匯入需要通訊錄的「完整取用權限」，請到「設定」變更權限。")
-                            Button("開啟設定", action: openSettings)
+                            Text(L10n.text("群組匯入需要通訊錄的「完整取用權限」，請到「設定」變更權限。", "Importing contact lists requires Full Access to Contacts. You can change this in Settings."))
+                            Button(L10n.text("開啟設定", "Open Settings"), action: openSettings)
                             if settingsOpenFailed {
-                                Text("無法開啟設定，請手動到設定變更權限。")
+                                Text(L10n.text("無法開啟設定，請手動到設定變更權限。", "Could not open Settings. Open Settings directly to change access."))
                                     .font(.footnote).foregroundStyle(.secondary)
                             }
                         case .restricted:
-                            Text("這台裝置限制了通訊錄存取，無法讀取群組。請回上一頁使用個別選人。")
+                            Text(L10n.text("這台裝置限制了通訊錄存取，無法讀取群組。請回上一頁使用個別選人。", "Contacts access is restricted on this device. Go back and select people individually."))
                         case .groups(let groups):
                             if groups.isEmpty {
-                                Text("找不到通訊錄群組。可改用個別選人。")
+                                Text(L10n.text("找不到通訊錄群組。可改用個別選人。", "No contact lists found. You can select people individually instead."))
                             } else {
                                 ForEach(groups) { group in
                                     Button { loadSelection(for: group) } label: {
@@ -619,22 +682,22 @@ struct BirthdayGroupImportView: View {
                                 }
                             }
                         case .lookupFailed:
-                            Text("無法讀取通訊錄群組或成員。請檢查權限後重試。")
-                            Button("重試") { loadGroups() }
+                            Text(L10n.text("無法讀取通訊錄群組或成員。請檢查權限後重試。", "Could not read contact lists or their members. Check access and try again."))
+                            Button(L10n.text("重試", "Try Again")) { loadGroups() }
                         }
                         Section {
-                            Button("改用個別選人") {
+                            Button(L10n.text("改用個別選人", "Select People Individually")) {
                                 BirthdayGroupSettingsReturn.clear()
                                 task?.cancel()
                                 onChoosePeople()
                             }
                         }
                     }
-                    .navigationTitle("從群組匯入生日")
+                    .navigationTitle(L10n.text("從群組匯入生日", "Import Birthdays from a List"))
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
-                            Button("取消") {
+                            Button(L10n.text("取消", "Cancel")) {
                                 BirthdayGroupSettingsReturn.clear()
                                 task?.cancel()
                                 dismiss()
@@ -752,7 +815,7 @@ struct BirthdayGroupImportView: View {
         return distinct.map { group in
             let matches = distinct.filter { $0.name == group.name && $0.detail == group.detail }
             guard matches.count > 1, let index = matches.firstIndex(where: { $0.id == group.id }) else { return group }
-            return GroupOption(id: group.id, name: group.name, detail: "\(group.detail ?? "同名群組") · \(index + 1)")
+            return GroupOption(id: group.id, name: group.name, detail: "\(group.detail ?? L10n.text("同名群組", "Same-name list")) · \(index + 1)")
         }
     }
 
@@ -761,7 +824,7 @@ struct BirthdayGroupImportView: View {
         let keys: [any CNKeyDescriptor] = [
             CNContactFormatter.descriptorForRequiredKeys(for: .fullName),
             CNContactGivenNameKey as NSString, CNContactFamilyNameKey as NSString,
-            CNContactOrganizationNameKey as NSString,
+            CNContactOrganizationNameKey as NSString, CNContactNicknameKey as NSString,
             CNContactBirthdayKey as NSString, CNContactNonGregorianBirthdayKey as NSString
         ]
         let predicate = CNContact.predicateForContactsInGroup(withIdentifier: group.id)

@@ -12,22 +12,23 @@
   <header><nav class="wrap" aria-label="Main navigation"><a href="./">Back to Home</a> <a href="guide.html" aria-current="page">User Guide</a> <a href="privacy.html">Privacy Policy</a> <a href="support.html">Support</a> <a href="../guide.html" lang="zh-TW" hreflang="zh-TW">中文</a></nav></header>
   <main class="wrap">
 <h1>User Guide</h1>
-<p class="note">This guide uses English explanations alongside the relevant Chinese labels in the current test build.</p>
 <h2>Create a rule</h2>
 <ol><li>Tap “＋” on the home screen, choose Gregorian, lunar, or solar terms, then set the start date, repeat interval, and end condition.</li>
 <li>Enter an event title and category, choose a calendar, and set the all-day or start-time and duration options. The subcategory is optional.</li>
-<li>Open Preview Events (「預覽事件」) to check existing and planned events. Tap Apply (「套用」) to write them to your calendar.</li></ol>
+<li>Open Preview Events to check existing and planned events. Tap Apply to write them to your calendar.</li></ol>
 <p>The start date is the beginning of the scheduling window. For the second Sunday in May each year, you can start on May 1. Add child rules under a main rule to schedule reminders or follow-up events.</p>
 <h2>Choose a calendar</h2>
-<p>When you first tap Connect Calendar (「連接行事曆」), grant full access so CalStitch can read back events it creates. Read-only calendars are listed but cannot be selected. If your iPhone already syncs your iCloud or Google calendar, there is no extra sign-in. For your first test, try a dedicated calendar.</p>
+<p>When you first tap Connect Calendar, grant full access so CalStitch can read back events it creates. Read-only calendars are listed but cannot be selected. If your iPhone already syncs your iCloud or Google calendar, there is no extra sign-in. To try scheduling without affecting your main calendar, choose a separate calendar.</p>
 <h2>Import birthdays</h2>
-<p>Open Import Birthdays (「匯入生日」) from the home screen. Pick individuals in the system contact picker, or grant full Contacts access to import by group. If access was denied or limited, change it in iPhone Settings and return to CalStitch.</p>
-<p>Review the birthdays and choose a destination calendar before importing. Draft (「草稿」) saves the rules only. Import and Apply (「匯入後套用」) also writes the events when the import completes.</p>
+<p>Open Import Birthdays from the home screen. Pick individuals in the system contact picker, or grant full Contacts access to import by group. If access was denied or limited, change it in iPhone Settings and return to CalStitch.</p>
+<p>Choose whether to use names or nicknames for event titles. If a contact has no nickname, CalStitch uses their name. Review the birthdays and choose a destination calendar before importing. Draft saves the rules only. Import and Apply also writes the events when the import completes.</p>
 <h2>Edit in bulk and remove events</h2>
-<p>Use Batch Edit (「批次調整」) to update categories, subcategories, or repeat periods. Batch Remove (「整批移除」) deletes the selected rules and matching events that have not started, only after you tap Apply and confirm. Events that have already started are kept.</p>
-<p>Clean Up Leftover Events (「清除遺留事件」) finds tagged CalStitch events without a matching rule on this iPhone. If you use the same calendar on multiple devices, check that another device does not manage the events before deleting them.</p>
-<h2>Solar terms and current limitations</h2>
-<p>Solar term dates are available offline for 1901–2100. The default time zone applies to new solar term rules and does not shift existing events. The test build may block certain lunar rules involving leap months or short months.</p>
+<p>Use Batch Edit to update categories, subcategories, or repeat periods in years, months, or days. In Remove Selected Rules, preview the rules, their child rules, and upcoming events to be removed. Tap Apply and confirm to remove them. Events that have already started are kept.</p>
+<p>Clean Up Leftover Events finds tagged CalStitch events without a matching rule on this iPhone. If you use the same calendar on multiple devices, check that another device does not manage the events before deleting them.</p>
+<h2>Lunar leap months and short months</h2>
+<p>Yearly rules for a regular lunar month use only the regular month. If you choose a leap month, the event uses that leap month when it occurs and the regular month of the same name in other years. Monthly rules include leap months by default; you can turn this off. If you choose day 30, an occurrence in a 29-day month falls on day 29 without changing the rule.</p>
+<h2>Solar terms and time zones</h2>
+<p>Solar term dates are available offline for 1901–2100. The default time zone applies only to new solar term rules. Changing it does not move existing events.</p>
   </main>
   <footer><div class="wrap">CalStitch · <a href="https://github.com/peiyu66/CalStitch">GitHub</a></div></footer>
 </body>

@@ -48,19 +48,28 @@ struct AppearancePicker: View {
 
     private struct Choice: Identifiable {
         let id: String
-        let title: String
-        init(_ id: String, _ title: String) {
+        let chinese: String
+        let english: String
+        var title: String { L10n.text(chinese, english) }
+
+        init(_ id: String, _ chinese: String, _ english: String) {
             self.id = id
-            self.title = title
+            self.chinese = chinese
+            self.english = english
         }
     }
 
     private struct Swatch: Identifiable {
-        let title: String
+        let id: UInt32
+        let chinese: String
+        let english: String
         let color: AppearanceColor
-        var id: String { title }
-        init(_ title: String, _ rgb: UInt32) {
-            self.title = title
+        var title: String { L10n.text(chinese, english) }
+
+        init(_ chinese: String, _ english: String, _ rgb: UInt32) {
+            self.id = rgb
+            self.chinese = chinese
+            self.english = english
             color = AppearanceColor(
                 red: Double((rgb >> 16) & 255) / 255,
                 green: Double((rgb >> 8) & 255) / 255,
@@ -70,29 +79,29 @@ struct AppearancePicker: View {
     }
 
     private static let symbols = [
-        Choice("calendar", "行事曆"), Choice("folder", "資料夾"), Choice("tag", "標籤"),
-        Choice("star", "星星"), Choice("heart", "愛心"), Choice("bell", "提醒"),
-        Choice("birthday.cake", "生日蛋糕"), Choice("gift", "禮物"), Choice("sparkles", "閃光"),
-        Choice("house", "家"), Choice("person.2", "人物"), Choice("briefcase", "公事包"),
-        Choice("book", "書本"), Choice("graduationcap", "學習"), Choice("list.bullet", "清單"),
-        Choice("moon", "月亮"), Choice("sun.max", "太陽"), Choice("leaf", "葉子"),
-        Choice("flame", "火焰"), Choice("cup.and.saucer", "茶杯"), Choice("fork.knife", "餐具"),
-        Choice("airplane", "飛機"), Choice("car", "汽車"), Choice("figure.walk", "步行"),
-        Choice("dumbbell", "健身"), Choice("music.note", "音符"), Choice("cart", "購物"),
-        Choice("clock", "時鐘"), Choice("checkmark.circle", "完成"), Choice("flag", "旗幟")
+        Choice("calendar", "行事曆", "Calendar"), Choice("folder", "資料夾", "Folder"), Choice("tag", "標籤", "Tag"),
+        Choice("star", "星星", "Star"), Choice("heart", "愛心", "Heart"), Choice("bell", "提醒", "Bell"),
+        Choice("birthday.cake", "生日蛋糕", "Birthday Cake"), Choice("gift", "禮物", "Gift"), Choice("sparkles", "閃光", "Sparkles"),
+        Choice("house", "家", "Home"), Choice("person.2", "人物", "People"), Choice("briefcase", "公事包", "Briefcase"),
+        Choice("book", "書本", "Book"), Choice("graduationcap", "學習", "Education"), Choice("list.bullet", "清單", "List"),
+        Choice("moon", "月亮", "Moon"), Choice("sun.max", "太陽", "Sun"), Choice("leaf", "葉子", "Leaf"),
+        Choice("flame", "火焰", "Flame"), Choice("cup.and.saucer", "茶杯", "Cup and Saucer"), Choice("fork.knife", "餐具", "Cutlery"),
+        Choice("airplane", "飛機", "Airplane"), Choice("car", "汽車", "Car"), Choice("figure.walk", "步行", "Walking"),
+        Choice("dumbbell", "健身", "Dumbbell"), Choice("music.note", "音符", "Music Note"), Choice("cart", "購物", "Shopping Cart"),
+        Choice("clock", "時鐘", "Clock"), Choice("checkmark.circle", "完成", "Checkmark"), Choice("flag", "旗幟", "Flag")
     ].filter { UIImage(systemName: $0.id) != nil }
 
     private static let swatches = [
-        Swatch("灰藍", 0x637892), Swatch("藍", 0x2663A6), Swatch("青綠", 0x287775),
-        Swatch("綠", 0x3C7743), Swatch("金", 0xA06C24), Swatch("橘", 0xAD552A),
-        Swatch("紅", 0xB04452), Swatch("紫", 0x795895)
+        Swatch("灰藍", "Slate Blue", 0x637892), Swatch("藍", "Blue", 0x2663A6), Swatch("青綠", "Teal", 0x287775),
+        Swatch("綠", "Green", 0x3C7743), Swatch("金", "Gold", 0xA06C24), Swatch("橘", "Orange", 0xAD552A),
+        Swatch("紅", "Red", 0xB04452), Swatch("紫", "Purple", 0x795895)
     ]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             preview
             VStack(alignment: .leading, spacing: 10) {
-                heading("圖示", isDefault: appearance.symbol == nil) { appearance.symbol = nil }
+                heading(L10n.text("圖示", "Icon"), isDefault: appearance.symbol == nil) { appearance.symbol = nil }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 44), spacing: 8)], spacing: 8) {
                     ForEach(Self.symbols) { choice in
                         let selected = appearance.symbol == choice.id
@@ -118,7 +127,7 @@ struct AppearancePicker: View {
                 }
             }
             VStack(alignment: .leading, spacing: 10) {
-                heading("顏色", isDefault: appearance.color == nil) { appearance.color = nil }
+                heading(L10n.text("顏色", "Color"), isDefault: appearance.color == nil) { appearance.color = nil }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 44), spacing: 4)], spacing: 4) {
                     ForEach(Self.swatches) { swatch in
                         let selected = appearance.color == swatch.color
@@ -143,9 +152,9 @@ struct AppearancePicker: View {
                         .accessibilityAddTraits(selected ? .isSelected : [])
                     }
                 }
-                ColorPicker("自訂顏色", selection: customColor, supportsOpacity: false)
+                ColorPicker(L10n.text("自訂顏色", "Custom Color"), selection: customColor, supportsOpacity: false)
             }
-            Button("全部恢復預設") { appearance = RuleAppearance() }
+            Button(L10n.text("全部恢復預設", "Reset All to Defaults")) { appearance = RuleAppearance() }
                 .disabled(appearance.isDefault)
         }
     }
@@ -160,8 +169,8 @@ struct AppearancePicker: View {
                 .background(tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 12))
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
-                Text("預覽").font(.caption).foregroundStyle(.secondary)
-                Text(title.isEmpty ? "尚未命名" : title).font(.body.weight(.semibold))
+                Text(L10n.text("預覽", "Preview")).font(.caption).foregroundStyle(.secondary)
+                Text(title.isEmpty ? L10n.text("尚未命名", "Untitled") : title).font(.body.weight(.semibold))
             }
             Spacer(minLength: 0)
         }
@@ -184,10 +193,10 @@ struct AppearancePicker: View {
                 .font(.headline)
                 .accessibilityAddTraits(.isHeader)
             Spacer(minLength: 8)
-            Button(isDefault ? "使用預設" : "恢復預設", action: reset)
+            Button(isDefault ? L10n.text("使用預設", "Using Default") : L10n.text("恢復預設", "Reset to Default"), action: reset)
                 .font(.subheadline)
                 .disabled(isDefault)
-                .accessibilityLabel(isDefault ? "\(title)使用預設" : "\(title)恢復預設")
+                .accessibilityLabel(isDefault ? L10n.text("\(title)使用預設", "Using the default for \(title.lowercased())") : L10n.text("\(title)恢復預設", "Reset \(title.lowercased()) to default"))
         }
     }
 }

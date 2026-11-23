@@ -1,0 +1,2 @@
+"NSContactsUsageDescription" = "CalStitch 需要讀取聯絡人群組，才能讓你選擇群組並匯入其生日。個別選人不需要授權整本通訊錄。";
+"NSCalendarsFullAccessUsageDescription" = "CalStitch 需要讀回自己建立的行程，才能預覽、更新或移除未來行程，避免重複新增。";

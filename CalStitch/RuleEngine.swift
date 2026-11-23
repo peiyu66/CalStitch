@@ -25,9 +25,9 @@ enum RuleEngine {
         case invalidRange, tooMany, invalidRule, unsupported(String)
         var errorDescription: String? {
             switch self {
-            case .invalidRange: "截止日期不得早於起始日。"
-            case .tooMany: "這條規則涵蓋的日期或事件太多，請縮短期間後再試。"
-            case .invalidRule: "規則的日期、時間或關聯結構無法計算。"
+            case .invalidRange: L10n.text("截止日期不得早於起始日。", "The end date cannot be before the start date.")
+            case .tooMany: L10n.text("這條規則涵蓋的日期或事件太多，請縮短期間後再試。", "This rule covers too many days or events. Shorten the date range and try again.")
+            case .invalidRule: L10n.text("規則的日期、時間或關聯結構無法計算。", "CalStitch could not calculate the dates, times, or linked rules.")
             case let .unsupported(message): message
             }
         }
@@ -58,7 +58,7 @@ enum RuleEngine {
     static func cutoff(for rule: Rule) throws -> Date {
         if rule.kind == .solar, let identifier = rule.solarTimeZoneIdentifier,
            TimeZone(identifier: identifier) == nil {
-            throw PlanningError.unsupported("找不到原規則的時區，請重新設定。")
+            throw PlanningError.unsupported(L10n.text("找不到原規則的時區，請重新設定。", "This rule’s time zone is unavailable. Choose another time zone."))
         }
         let calendar = civilCalendar(for: rule)
         let pinned = rule.kind == .solar && rule.solarTimeZoneIdentifier != nil
@@ -121,7 +121,7 @@ enum RuleEngine {
             guard visited.insert(rule.id).inserted, visited.count <= 128 else { throw PlanningError.invalidRule }
             defer { visited.remove(rule.id) }
             guard day >= start, day < exclusive else {
-                throw PlanningError.unsupported("「\(rule.name)」的日期超出根規則的起訖範圍。此情況目前無法套用。")
+                throw PlanningError.unsupported(L10n.text("「\(rule.name)」的日期超出根規則的起訖範圍。此情況目前無法套用。", "“\(rule.name)” falls outside the top-level rule’s date range. This rule cannot be applied."))
             }
             guard output.count < occurrenceLimit else { throw PlanningError.tooMany }
             let begin: Date
@@ -171,7 +171,7 @@ enum RuleEngine {
 
     private static func weekdayPatternDays(root: Rule, pattern: WeekdayPattern, start: Date, exclusive: Date) throws -> [Date] {
         guard root.period == .year || root.period == .month else {
-            throw PlanningError.unsupported("第幾個星期幾的規則只適用於按年或按月重複。")
+            throw PlanningError.unsupported(L10n.text("第幾個星期幾的規則只適用於按年或按月重複。", "Rules for a numbered weekday, such as the second Sunday, can repeat only yearly or monthly."))
         }
         guard (1...4).contains(pattern.ordinal), (1...7).contains(pattern.weekday),
               let startMonth = civil.dateInterval(of: .month, for: start)?.start else {
@@ -244,7 +244,7 @@ enum RuleEngine {
 
     private static func solarDays(root: Rule, start: Date, last: Date, calendar: Calendar) throws -> [Date] {
         guard root.period == .year else {
-            throw PlanningError.unsupported("節氣規則目前只支援按年重複。")
+            throw PlanningError.unsupported(L10n.text("節氣規則目前只支援按年重複。", "Solar term rules can repeat only yearly."))
         }
         guard SolarTerms.names.contains(root.date) else { throw PlanningError.invalidRule }
         let startYear = calendar.component(.year, from: start)
@@ -258,7 +258,7 @@ enum RuleEngine {
                 date = SolarTerms.instant(for: root.date, year: year).map { calendar.startOfDay(for: $0) }
             }
             guard let date else {
-                throw PlanningError.unsupported("節氣日期目前只涵蓋 \(coverage.lowerBound) 至 \(coverage.upperBound) 年；請調整規則的起訖日期。")
+                throw PlanningError.unsupported(L10n.text("節氣日期目前只涵蓋 \(coverage.lowerBound) 至 \(coverage.upperBound) 年；請調整規則的起訖日期。", "Solar term dates are available from \(coverage.lowerBound) to \(coverage.upperBound). Adjust the rule’s date range."))
             }
             return date
         }
@@ -275,56 +275,86 @@ enum RuleEngine {
     }
 
     private static func lunarDays(root: Rule, start: Date, exclusive: Date) throws -> [Date] {
-        guard root.period == .year || root.period == .month else { throw PlanningError.unsupported("農曆規則目前只支援按月或按年重複。") }
-        guard !root.lunarIsLeap else { throw PlanningError.unsupported("閏月生日的重複方式尚未決定，暫不能套用。") }
-        guard (1...12).contains(root.lunarMonth), (1...30).contains(root.lunarDay) else { throw PlanningError.invalidRule }
-        var days: [Date] = []
-        // Civil-noon enumeration avoids midnight/time-zone shifts from date conversion.
-        // Group by actual lunar months, including leap months as a separate identity.
-        var cursor = start
-        var ordinal = 0
-        var prior: LunarMonth?
-        var scheduled = false
-        var sawDate = false
-        func closeMonth() throws {
-            if scheduled && !sawDate && root.lunarDay == 30 {
-                throw PlanningError.unsupported("部分農曆月份沒有三十日，日期調整方式尚未決定，暫不能套用。")
-            }
+        guard root.period == .year || root.period == .month else {
+            throw PlanningError.unsupported(L10n.text("農曆規則目前只支援按月或按年重複。", "Lunar rules can repeat only monthly or yearly."))
         }
-        while cursor < exclusive {
-            guard let noon = civil.date(bySettingHour: 12, minute: 0, second: 0, of: cursor) else { throw PlanningError.invalidRule }
-            let parts = lunar.dateComponents([.era, .year, .month, .day, .isLeapMonth], from: noon)
-            guard let era = parts.era, let year = parts.year, let month = parts.month, let day = parts.day else {
+        guard (1...12).contains(root.lunarMonth), (1...30).contains(root.lunarDay) else {
+            throw PlanningError.invalidRule
+        }
+
+        func shift(_ date: Date, days: Int) throws -> Date {
+            civil.startOfDay(for: try adding(.day, days, to: date))
+        }
+        func lunarDay(_ date: Date) throws -> (month: LunarMonth, day: Int) {
+            // Convert at civil noon to avoid changes in historical midnight conventions.
+            guard let noon = civil.date(bySettingHour: 12, minute: 0, second: 0, of: date) else {
                 throw PlanningError.invalidRule
             }
-            let identity = LunarMonth(era: era, year: year, month: month, leap: parts.isLeapMonth == true)
-            if prior != identity {
-                if prior != nil { try closeMonth() }
-                if identity.leap && root.period == .month {
-                    throw PlanningError.unsupported("這段期間遇到農曆閏月，是否排入月週期尚未決定，暫不能套用。")
+            let parts = lunar.dateComponents([.era, .year, .month, .day, .isLeapMonth], from: noon)
+            guard let era = parts.era, let year = parts.year,
+                  let month = parts.month, let day = parts.day else {
+                throw PlanningError.invalidRule
+            }
+            return (LunarMonth(era: era, year: year, month: month, leap: parts.isLeapMonth == true), day)
+        }
+
+        let startingDay = try lunarDay(start)
+        var first = try shift(start, days: 1 - startingDay.day)
+        var candidates: [Date] = []
+        var ordinal = 0
+        while first < exclusive {
+            let current = try lunarDay(first)
+            guard current.day == 1 else { throw PlanningError.invalidRule }
+
+            // After 29 civil days, a short month has ended; a long one is on day 30.
+            let dayAfter29 = try shift(first, days: 29)
+            let probe = try lunarDay(dayAfter29)
+            let count: Int
+            let nextFirst: Date
+            let next: LunarMonth
+            if probe.month == current.month {
+                guard probe.day == 30 else { throw PlanningError.invalidRule }
+                count = 30
+                nextFirst = try shift(dayAfter29, days: 1)
+                let nextDay = try lunarDay(nextFirst)
+                guard nextDay.day == 1, nextDay.month != current.month else { throw PlanningError.invalidRule }
+                next = nextDay.month
+            } else {
+                guard probe.day == 1 else { throw PlanningError.invalidRule }
+                count = 29
+                nextFirst = dayAfter29
+                next = probe.month
+            }
+
+            let matches: Bool
+            if root.period == .month {
+                matches = !current.month.leap || (root.includeLeapMonths ?? true)
+            } else if current.month.month != root.lunarMonth {
+                matches = false
+            } else if !root.lunarIsLeap {
+                matches = !current.month.leap
+            } else if current.month.leap {
+                matches = true
+            } else {
+                // A same-name leap month immediately follows its regular month.
+                // Even if it falls beyond this rule's cutoff, don't fall back erroneously.
+                matches = !(next.era == current.month.era && next.year == current.month.year
+                            && next.month == current.month.month && next.leap)
+            }
+
+            if matches {
+                let day = try shift(first, days: min(root.lunarDay, count) - 1)
+                if day >= start && day < exclusive {
+                    if ordinal.isMultiple(of: root.interval) {
+                        candidates.append(day)
+                        guard candidates.count <= occurrenceLimit else { throw PlanningError.tooMany }
+                    }
+                    ordinal += 1
                 }
-                let candidate = !identity.leap && (root.period == .month || month == root.lunarMonth)
-                scheduled = candidate && day <= root.lunarDay && ordinal % root.interval == 0
-                if candidate && day <= root.lunarDay { ordinal += 1 }
-                sawDate = false
-                prior = identity
             }
-            if scheduled && day == root.lunarDay {
-                days.append(cursor)
-                sawDate = true
-                guard days.count <= occurrenceLimit else { throw PlanningError.tooMany }
-            }
-            // The cutoff may arrive before the lunar day; that is a normal excluded occurrence.
-            cursor = try adding(.day, 1, to: cursor)
+            first = nextFirst
         }
-        if let last = prior, scheduled && !sawDate && root.lunarDay == 30 {
-            guard let noon = civil.date(bySettingHour: 12, minute: 0, second: 0, of: cursor) else { throw PlanningError.invalidRule }
-            let parts = lunar.dateComponents([.era, .year, .month, .isLeapMonth], from: noon)
-            if last.era != parts.era || last.year != parts.year || last.month != parts.month || last.leap != (parts.isLeapMonth == true) {
-                try closeMonth()
-            }
-        }
-        return days
+        return candidates
     }
 
     private struct LunarMonth: Equatable {
@@ -350,7 +380,7 @@ enum RuleEngine {
         let candidate = try adding(.month, monthDelta, to: first, calendar: calendar)
         guard let maximum = calendar.range(of: .day, in: .month, for: candidate)?.last else { throw PlanningError.invalidRule }
         if rejectShortMonth && day > maximum {
-            throw PlanningError.unsupported("按期間換算時沒有對應的截止日，請改用指定截止日期。")
+            throw PlanningError.unsupported(L10n.text("按期間換算時沒有對應的截止日，請改用指定截止日期。", "No matching end date exists for this duration. Choose an end date instead."))
         }
         return try adding(.day, (forceMonthEnd ? maximum : min(day, maximum)) - 1, to: candidate, calendar: calendar)
     }

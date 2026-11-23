@@ -34,6 +34,24 @@ struct CalendarPreviewEvent: Identifiable {
 }
 
 
+struct CalendarRemovalEvent: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let start: Date
+    let end: Date
+    let isAllDay: Bool
+    let calendarID: String
+    let calendarTitle: String
+    let timeZoneIdentifier: String?
+    fileprivate let itemIdentifier: String
+    fileprivate let eventIdentifier: String?
+    fileprivate let notes: String?
+    fileprivate let rawTitle: String?
+    fileprivate let rawStart: Date
+    fileprivate let rawEnd: Date
+    fileprivate let lastModified: Date?
+}
+
 struct CalendarOrphanEvent: Identifiable, Equatable {
     let id: String
     let title: String
@@ -63,21 +81,22 @@ struct CalendarOrphanPreview {
 enum CalendarIntegrationError: LocalizedError {
     case denied, noLocalSource, noDestination, readOnlyDestination, conflictingDestination
     case invalidPlan, ambiguousEvent, missingEvent, excessiveRange
-    case writeFailed, orphanSelectionChanged
+    case writeFailed, orphanSelectionChanged, removalSelectionChanged
 
     var errorDescription: String? {
         switch self {
-        case .denied: return "請在設定中允許 CalStitch 完整存取行事曆，才能核對及維護事件。"
-        case .noLocalSource: return "找不到模擬器的本機行事曆來源，未寫入任何帳戶。"
-        case .noDestination: return "找不到指定的行事曆，未改動任何事件。"
-        case .readOnlyDestination: return "指定的行事曆目前唯讀，未改動任何事件。"
-        case .conflictingDestination: return "已有同名的本機日曆，但無法確認由 CalStitch 建立，未使用它。"
-        case .invalidPlan: return "遇到無法辨認的規則或事件資料；未改動行事曆。"
-        case .ambiguousEvent: return "找到重複或有衝突的事件識別，無法安全更新；未改動行事曆。"
-        case .missingEvent: return "找不到先前套用的未來事件，可能已被移動、刪除或移除識別附註；未改動行事曆。"
-        case .excessiveRange: return "日期範圍太長，無法安全核對，請縮短維護期間。"
-        case .orphanSelectionChanged: return "行事曆或規則已變動。未刪除事件，請重新掃描並確認選擇。"
-        case .writeFailed: return "行事曆未能確認儲存結果。請先檢查行事曆，再重新開啟 CalStitch。"
+        case .denied: return L10n.text("請在設定中允許 CalStitch 完整存取行事曆，才能核對及維護事件。", "Allow CalStitch full calendar access in Settings so it can verify and maintain events.")
+        case .noLocalSource: return L10n.text("找不到模擬器的本機行事曆來源，未寫入任何帳戶。", "The simulator’s local calendar source could not be found. Nothing was written to any account.")
+        case .noDestination: return L10n.text("找不到指定的行事曆，未改動任何事件。", "The selected calendar could not be found. No events were changed.")
+        case .readOnlyDestination: return L10n.text("指定的行事曆目前唯讀，未改動任何事件。", "The selected calendar is read-only. No events were changed.")
+        case .conflictingDestination: return L10n.text("已有同名的本機日曆，但無法確認由 CalStitch 建立，未使用它。", "A local calendar already has this name, but CalStitch could not confirm it created that calendar. It was not used.")
+        case .invalidPlan: return L10n.text("遇到無法辨認的規則或事件資料；未改動行事曆。", "CalStitch could not verify the rule or event data. No calendar changes were made.")
+        case .ambiguousEvent: return L10n.text("找到重複或有衝突的事件識別，無法安全更新；未改動行事曆。", "Duplicate or conflicting event identifiers were found. No calendar changes were made.")
+        case .missingEvent: return L10n.text("找不到先前套用的未來事件，可能已被移動、刪除或移除識別附註；未改動行事曆。", "A previously applied future event could not be found. It may have been moved or deleted, or its identifying note may have been removed. No calendar changes were made.")
+        case .excessiveRange: return L10n.text("日期範圍太長，無法安全核對，請縮短維護期間。", "The date range is too long to verify safely. Shorten the repeat period and try again.")
+        case .orphanSelectionChanged: return L10n.text("行事曆或規則已變動。未刪除事件，請重新掃描並確認選擇。", "The calendar or rules have changed. No events were deleted. Scan again and confirm your selection.")
+        case .removalSelectionChanged: return L10n.text("待移除的事件已變動。未刪除事件，請重新檢視預覽。", "The events to remove have changed. No events were deleted. Review the preview again.")
+        case .writeFailed: return L10n.text("行事曆未能確認儲存結果。請先檢查行事曆，再重新開啟 CalStitch。", "The calendar could not confirm that the changes were saved. Check your calendar before reopening CalStitch.")
         }
     }
 }
@@ -131,11 +150,11 @@ final class CalendarIntegration: ObservableObject {
         var change: CalendarChange {
             switch self {
             case let .insert(identity, value):
-                return CalendarChange(id: identity.displayID, verb: "新增", title: value.title, date: value.start)
+                return CalendarChange(id: identity.displayID, verb: L10n.text("新增", "Add"), title: value.title, date: value.start)
             case let .update(identity, _, value):
-                return CalendarChange(id: identity.displayID, verb: "更新", title: value.title, date: value.start)
+                return CalendarChange(id: identity.displayID, verb: L10n.text("更新", "Update"), title: value.title, date: value.start)
             case let .remove(identity, value):
-                return CalendarChange(id: identity.displayID, verb: "移除", title: value.title ?? "無標題", date: value.startDate)
+                return CalendarChange(id: identity.displayID, verb: L10n.text("移除", "Remove"), title: value.title ?? L10n.text("無標題", "Untitled"), date: value.startDate)
             }
         }
     }
@@ -217,9 +236,9 @@ final class CalendarIntegration: ObservableObject {
         let source = calendar.source
         let sourceTitle: String
         switch source?.sourceType {
-        case .local: sourceTitle = "本機"
-        case .birthdays: sourceTitle = "生日"
-        case .subscribed: sourceTitle = source?.title ?? "訂閱"
+        case .local: sourceTitle = L10n.text("本機", "On This Device")
+        case .birthdays: sourceTitle = L10n.text("生日", "Birthdays")
+        case .subscribed: sourceTitle = source?.title ?? L10n.text("訂閱", "Subscriptions")
         default: sourceTitle = source?.title ?? ""
         }
         return .init(id: calendar.calendarIdentifier, title: calendar.title, sourceTitle: sourceTitle,
@@ -267,9 +286,44 @@ final class CalendarIntegration: ObservableObject {
         try reconcile(desired: desired, previous: previous, ruleIDs: ruleIDs, now: .now).operations.map(\.change)
     }
 
+    func previewRemoval(previous: [PlannedOccurrence], ruleIDs: Set<UUID>) throws -> [CalendarRemovalEvent] {
+        store.reset()
+        return try removalEvents(in: reconcile(desired: [], previous: previous, ruleIDs: ruleIDs, now: .now))
+    }
+
+    func applyRemoval(previous: [PlannedOccurrence], ruleIDs: Set<UUID>, matching expected: [CalendarRemovalEvent]) throws {
+        store.reset()
+        let current = try reconcile(desired: [], previous: previous, ruleIDs: ruleIDs, now: .now)
+        guard try removalEvents(in: current) == expected else {
+            throw CalendarIntegrationError.removalSelectionChanged
+        }
+        // Commit the exact objects verified in this reconciliation, not a second plan.
+        _ = try apply(current)
+    }
+
+    private func removalEvents(in reconciliation: Reconciliation) throws -> [CalendarRemovalEvent] {
+        let rows = try reconciliation.operations.map { operation -> CalendarRemovalEvent in
+            guard case let .remove(identity, event) = operation,
+                  let calendar = event.calendar, let start = event.startDate, let end = event.endDate else {
+                throw CalendarIntegrationError.invalidPlan
+            }
+            return .init(id: identity.displayID, title: event.title ?? L10n.text("無標題", "Untitled"),
+                         start: plannedDate(start, allDay: event.isAllDay),
+                         end: plannedEndDate(end, allDay: event.isAllDay), isAllDay: event.isAllDay,
+                         calendarID: calendar.calendarIdentifier, calendarTitle: Self.destination(calendar).displayTitle,
+                         timeZoneIdentifier: event.timeZone?.identifier, itemIdentifier: event.calendarItemIdentifier,
+                         eventIdentifier: event.eventIdentifier, notes: event.notes, rawTitle: event.title,
+                         rawStart: start, rawEnd: end, lastModified: event.lastModifiedDate)
+        }
+        return rows.sorted { $0.start == $1.start ? $0.id < $1.id : $0.start < $1.start }
+    }
+
     @discardableResult
     func apply(desired: [PlannedOccurrence], previous: [PlannedOccurrence], ruleIDs: Set<UUID>) throws -> [PlannedOccurrence] {
-        let reconciliation = try reconcile(desired: desired, previous: previous, ruleIDs: ruleIDs, now: .now)
+        try apply(reconcile(desired: desired, previous: previous, ruleIDs: ruleIDs, now: .now))
+    }
+
+    private func apply(_ reconciliation: Reconciliation) throws -> [PlannedOccurrence] {
         guard !reconciliation.operations.isEmpty else { return reconciliation.snapshot }
         do {
             for operation in reconciliation.operations {
@@ -401,7 +455,7 @@ final class CalendarIntegration: ObservableObject {
                     continue
                 }
                 let info = CalendarOrphanEvent(
-                    id: key, title: event.title ?? "無標題",
+                    id: key, title: event.title ?? L10n.text("無標題", "Untitled"),
                     start: plannedDate(rawStart, allDay: event.isAllDay),
                     end: plannedEndDate(rawEnd, allDay: event.isAllDay),
                     isAllDay: event.isAllDay, isPast: rawEnd <= now,
@@ -565,7 +619,7 @@ final class CalendarIntegration: ObservableObject {
         // Reconciliation already checked exact target, matching marker and applied snapshot
         // for every event in found. Never synthesize a live record from the cached snapshot.
         func existing(_ identity: Identity, _ event: EKEvent, kind: CalendarPreviewEvent.Kind) -> CalendarPreviewEvent {
-            .init(id: identity.displayID, title: event.title ?? "無標題",
+            .init(id: identity.displayID, title: event.title ?? L10n.text("無標題", "Untitled"),
                   start: plannedDate(event.startDate, allDay: event.isAllDay),
                   end: plannedEndDate(event.endDate, allDay: event.isAllDay),
                   isAllDay: event.isAllDay, isPast: event.endDate <= now, kind: kind)

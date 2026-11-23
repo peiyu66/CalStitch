@@ -4,7 +4,7 @@ import UIKit
 @main
 struct CalStitchApp: App {
     var body: some Scene {
-        WindowGroup { RulesHome() }
+        WindowGroup { RulesHome().environment(\.locale, L10n.locale) }
     }
 }
 
@@ -29,6 +29,10 @@ private func uniqueNames(_ names: [String]) -> [String] {
     return names.filter { seen.insert($0).inserted }
 }
 
+private func selectableCategories(_ existing: [String]) -> [String] {
+    uniqueNames(["生日", "節日", "祭祀"] + existing.filter { !$0.isEmpty })
+}
+
 private let ruleZone = TimeZone(identifier: "Asia/Taipei") ?? .current
 private var gregorianCalendar: Calendar {
     var cal = Calendar(identifier: .gregorian)
@@ -41,6 +45,14 @@ enum RuleKind: String, CaseIterable, Identifiable, Codable {
     case gregorian = "西元"
     var id: Self { self }
 
+    var displayLabel: String {
+        switch self {
+        case .lunar: L10n.text(rawValue, "Lunar")
+        case .solar: L10n.text(rawValue, "Solar Term")
+        case .gregorian: L10n.text(rawValue, "Gregorian")
+        }
+    }
+
     var symbol: String {
         switch self {
         case .lunar: "moon"
@@ -51,9 +63,9 @@ enum RuleKind: String, CaseIterable, Identifiable, Codable {
 
     var subtitle: String {
         switch self {
-        case .lunar: "依農曆月日選擇基準日期"
-        case .solar: "從二十四節氣選擇"
-        case .gregorian: "依西元日期設定"
+        case .lunar: L10n.text("依農曆月日選擇基準日期", "Choose a date in the lunar calendar")
+        case .solar: L10n.text("從二十四節氣選擇", "Choose one of the 24 solar terms")
+        case .gregorian: L10n.text("依西元日期設定", "Choose a date in the Gregorian calendar")
         }
     }
 
@@ -68,12 +80,22 @@ enum RuleKind: String, CaseIterable, Identifiable, Codable {
 enum PeriodUnit: String, CaseIterable, Identifiable, Codable {
     case year = "年", month = "月", week = "週", day = "日"
     var id: Self { self }
+
+    func displayLabel(count: Int = 1) -> String {
+        let english = switch self {
+        case .year: "year"
+        case .month: "month"
+        case .week: "week"
+        case .day: "day"
+        }
+        return L10n.text(rawValue, english + (count == 1 ? "" : "s"))
+    }
 }
 
 enum EndMode: String, CaseIterable, Identifiable, Codable {
     case duration = "持續期間", date = "指定截止日期"
     var id: Self { self }
-    var displayLabel: String { self == .duration ? "重複期間" : rawValue }
+    var displayLabel: String { self == .duration ? L10n.text("重複期間", "Repeat Period") : L10n.text(rawValue, "Specific End Date") }
 }
 
 enum EventTiming: String, CaseIterable, Identifiable, Codable {
@@ -84,6 +106,14 @@ enum EventTiming: String, CaseIterable, Identifiable, Codable {
 enum RelativePosition: String, CaseIterable, Identifiable, Codable {
     case before = "之前", same = "同一天", after = "之後"
     var id: Self { self }
+
+    var displayLabel: String {
+        switch self {
+        case .before: L10n.text(rawValue, "Before")
+        case .same: L10n.text(rawValue, "Same Day")
+        case .after: L10n.text(rawValue, "After")
+        }
+    }
 }
 
 struct Rule: Hashable, Identifiable, Codable {
@@ -94,6 +124,7 @@ struct Rule: Hashable, Identifiable, Codable {
     var lunarMonth = 1
     var lunarDay = 1
     var lunarIsLeap = false
+    var includeLeapMonths: Bool? = nil
     var category: String
     var subcategory: String = ""
     var parent: UUID? = nil
@@ -119,19 +150,23 @@ struct Rule: Hashable, Identifiable, Codable {
     var birthdaySource: BirthdayImportSource? = nil
     var appearance: RuleAppearance? = nil
 
-    var displayName: String { name.isEmpty ? "未命名規則" : name }
+    var displayName: String { name.isEmpty ? L10n.text("未命名規則", "Untitled Rule") : name }
     var displayAppearance: RuleAppearance { appearance ?? .init() }
     var defaultSymbol: String {
         category.contains("生日") || subcategory.contains("生日") ? "birthday.cake" : kind.symbol
     }
 
+    var isMothersDayRule: Bool {
+        guard parent == nil else { return false }
+        return kind == .gregorian && period == .year && interval == 1 &&
+            weekdayPattern?.ordinal == 2 && weekdayPattern?.weekday == 1 &&
+            (weekdayPattern?.month ?? gregorianCalendar.component(.month, from: start)) == 5
+    }
+
     var suggestedTitle: String? {
         guard parent == nil else { return nil }
-        if kind == .solar { return SolarTerms.names.contains(date) ? date : nil }
-        guard kind == .gregorian, period == .year, interval == 1,
-              let pattern = weekdayPattern, pattern.ordinal == 2, pattern.weekday == 1,
-              (pattern.month ?? gregorianCalendar.component(.month, from: start)) == 5 else { return nil }
-        return "母親節"
+        if kind == .solar { return SolarTerms.names.contains(date) ? SolarTerms.displayName(date) : nil }
+        return isMothersDayRule ? L10n.text("母親節", "Mother’s Day") : nil
     }
 
     var suggestedCategory: String? {
@@ -139,11 +174,12 @@ struct Rule: Hashable, Identifiable, Codable {
         switch kind {
         case .solar: return "節氣"
         case .lunar: return "祭祀"
-        case .gregorian: return suggestedTitle == "母親節" ? "節日" : nil
+        case .gregorian: return isMothersDayRule ? "節日" : nil
         }
     }
 
     var recurrenceCaption: String {
+        if L10n.isEnglish { return englishRecurrenceCaption() }
         let count = Self.captionNumber(interval, measure: true)
         let yearly = interval == 1 ? "每年" : "每\(count)年"
         let monthly = interval == 1 ? "每月" : "每\(count)個月"
@@ -190,6 +226,75 @@ struct Rule: Hashable, Identifiable, Codable {
             }
         }
     }
+
+    var homeRecurrenceCaption: String {
+        L10n.isEnglish ? englishRecurrenceCaption(compact: true) : recurrenceCaption
+    }
+
+    private func englishRecurrenceCaption(compact: Bool = false) -> String {
+        var calendar = gregorianCalendar
+        calendar.locale = L10n.locale
+        let repeats: String
+        if compact && interval == 1 {
+            repeats = switch period {
+            case .year: "Yearly"
+            case .month: "Monthly"
+            case .week: "Weekly"
+            case .day: "Daily"
+            }
+        } else if compact && interval > 1 && period == .year {
+            repeats = "Every \(interval) yrs"
+        } else {
+            repeats = interval == 1 ? "Every \(period.displayLabel())" : "Every \(interval) \(period.displayLabel(count: interval))"
+        }
+        let startMonth = calendar.component(.month, from: start)
+        let startDay = calendar.component(.day, from: start)
+        let weekday = { (n: Int) in
+            (compact ? calendar.shortWeekdaySymbols : calendar.weekdaySymbols)[safeWeekdayIndex(n)]
+        }
+        func monthName(_ n: Int) -> String {
+            (compact ? calendar.shortMonthSymbols : calendar.monthSymbols)[max(1, min(12, n)) - 1]
+        }
+        if parent != nil {
+            let days = offsetDays == 1 ? "1 day" : "\(offsetDays) days"
+            switch position {
+            case .before: return "\(days) before the parent event"
+            case .same: return "Same day as the parent event"
+            case .after: return "\(days) after the parent event"
+            }
+        }
+        switch kind {
+        case .solar:
+            return date.isEmpty ? "\(repeats) on the selected solar term" : "\(repeats) on \(SolarTerms.displayName(date))"
+        case .lunar:
+            if period == .month { return "\(repeats) on lunar day \(lunarDay)" }
+            let month = lunarIsLeap ? "leap month \(lunarMonth)" : "lunar month \(lunarMonth)"
+            return "\(repeats) on \(month), day \(lunarDay)"
+        case .gregorian:
+            if period == .day { return repeats }
+            if period == .week {
+                let day = weekday(weeklyWeekday ?? calendar.component(.weekday, from: start))
+                return compact && interval == 2 ? "Every other \(day)" : "\(repeats) on \(day)"
+            }
+            if let pattern = weekdayPattern {
+                let ordinalDay = "\(L10n.ordinal(pattern.ordinal)) \(weekday(pattern.weekday))"
+                if period == .year {
+                    let month = monthName(pattern.month ?? startMonth)
+                    return compact && interval == 1 ? "\(ordinalDay) in \(month)" : "\(repeats) on the \(ordinalDay) in \(month)"
+                }
+                return "\(repeats) on the \(ordinalDay)"
+            }
+            let lastDay = calendar.range(of: .day, in: .month, for: start)?.count
+            let fixedToEnd = monthEnd && startDay == lastDay
+            if period == .year {
+                let month = monthName(startMonth)
+                return fixedToEnd ? "\(repeats) on the last day of \(month)" : "\(repeats) on \(month) \(startDay)"
+            }
+            return fixedToEnd ? "\(repeats) on the last day" : "\(repeats) on day \(startDay)"
+        }
+    }
+
+    private func safeWeekdayIndex(_ value: Int) -> Int { max(0, min(6, value - 1)) }
 
     private static func captionWeekday(_ value: Int) -> String {
         let weekdays = ["日", "一", "二", "三", "四", "五", "六"]
@@ -268,7 +373,7 @@ private struct GroupAppearanceKey: Codable, Hashable, Identifiable {
     let category: String
     var subcategory: String? = nil
     var id: Self { self }
-    var title: String { subcategory ?? category }
+    var title: String { subcategory ?? L10n.category(category) }
     var defaultSymbol: String {
         guard subcategory == nil else { return "folder" }
         switch category {
@@ -345,19 +450,11 @@ private struct RuleReconciliation {
 }
 
 func dateCaption(_ date: Date, calendar: Calendar = gregorianCalendar) -> String {
-    let parts = calendar.dateComponents([.year, .month, .day, .weekday], from: date)
-    let civilDate = "\(parts.year ?? 0)年\(parts.month ?? 0)月\(parts.day ?? 0)日"
-    let weekdays = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"]
-    guard let weekday = parts.weekday, (1...7).contains(weekday) else { return civilDate }
-    return "\(civilDate)（\(weekdays[weekday - 1])）"
+    L10n.date(date, timeZone: calendar.timeZone, includesWeekday: true)
 }
 
-private let taiwanClockLocale = Locale(identifier: "zh_TW@hours=h12")
 private func timeCaption(_ date: Date, calendar: Calendar = gregorianCalendar) -> String {
-    let parts = calendar.dateComponents([.hour, .minute], from: date)
-    let hour = parts.hour ?? 0
-    let hour12 = hour % 12 == 0 ? 12 : hour % 12
-    return "\(hour < 12 ? "上午" : "下午") \(String(format: "%02d:%02d", hour12, parts.minute ?? 0))"
+    L10n.time(date, timeZone: calendar.timeZone)
 }
 
 private struct RuleDateField: View {
@@ -395,16 +492,16 @@ private struct RuleDateField: View {
                 .navigationTitle(title)
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    ToolbarItem(placement: .cancellationAction) { Button("取消") { showingPicker = false } }
+                    ToolbarItem(placement: .cancellationAction) { Button(L10n.text("取消", "Cancel")) { showingPicker = false } }
                     ToolbarItem(placement: .confirmationAction) {
-                        Button("完成") {
+                        Button(L10n.text("完成", "Done")) {
                             selection = draft
                             showingPicker = false
                         }
                     }
                 }
             }
-            .environment(\.locale, taiwanClockLocale)
+            .environment(\.locale, L10n.locale)
             .environment(\.calendar, civilCalendar)
             .environment(\.timeZone, civilCalendar.timeZone)
             .presentationDetents([.medium, .large])
@@ -448,16 +545,16 @@ private struct RulesHome: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 23) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("行事曆規則")
+                        Text(L10n.text("行事曆規則", "Calendar Rules"))
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                         toolsRow
                     }
                     if loaded && showGettingStarted { intro }
                     if !loaded && !loadFailed {
-                        ProgressView("正在讀取規則…")
+                        ProgressView(L10n.text("正在讀取規則…", "Loading rules…"))
                     } else if loadFailed {
-                        Button("重新讀取規則", action: load)
+                        Button(L10n.text("重新讀取規則", "Reload Rules"), action: load)
                     } else if rootRules.isEmpty {
                         emptyState
                     }
@@ -473,14 +570,14 @@ private struct RulesHome: View {
                             Button {
                                 showingBirthdayRoutes = true
                             } label: {
-                                Label("匯入生日", systemImage: "person.crop.rectangle")
+                                Label(L10n.text("匯入生日", "Import Birthdays"), systemImage: "person.crop.rectangle")
                                     .frame(minHeight: 44)
                             }
                             .accessibilityIdentifier("open-birthday-import")
                             Button {
                                 showingOrphanCleanup = true
                             } label: {
-                                Label("清除遺留事件", systemImage: "trash")
+                                Label(L10n.text("清除遺留事件", "Clean Up Leftover Events"), systemImage: "trash")
                                     .frame(minHeight: 44)
                             }
                             .accessibilityIdentifier("open-orphan-cleanup")
@@ -501,7 +598,7 @@ private struct RulesHome: View {
                     NavigationLink(value: Route.settings) {
                         Image(systemName: "gearshape")
                     }
-                    .accessibilityLabel("設定")
+                    .accessibilityLabel(L10n.text("設定", "Settings"))
                     .accessibilityIdentifier("open-settings")
                 }
             }
@@ -566,17 +663,17 @@ private struct RulesHome: View {
                     try saveGroupAppearance(newAppearance, for: key)
                 }
             }
-            .alert("無法完成操作", isPresented: Binding(
+            .alert(L10n.text("無法完成操作", "Could Not Complete the Action"), isPresented: Binding(
                 get: { toolbarError != nil }, set: { if !$0 { toolbarError = nil } }
             )) {
-                Button("好", role: .cancel) { toolbarError = nil }
+                Button(L10n.text("好", "OK"), role: .cancel) { toolbarError = nil }
             } message: { Text(toolbarError ?? "") }
         }
         .tint(slate)
         .onChange(of: snapshot.rules) { _, _ in snapshot.pruneGroupAppearances() }
         .overlay(alignment: .bottom) {
             if appliedNotice != nil {
-                Label("已套用", systemImage: "checkmark.circle.fill")
+                Label(L10n.text("已套用", "Applied"), systemImage: "checkmark.circle.fill")
                     .font(.subheadline.weight(.semibold))
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
@@ -619,22 +716,22 @@ private struct RulesHome: View {
                     pendingBirthdayRoute = .people
                     showingBirthdayRoutes = false
                 } label: {
-                    Label("個別選人", systemImage: "person.crop.rectangle")
+                    Label(L10n.text("個別選人", "Select People"), systemImage: "person.crop.rectangle")
                 }
                 .accessibilityIdentifier("birthday-route-people")
                 Button {
                     pendingBirthdayRoute = .group
                     showingBirthdayRoutes = false
                 } label: {
-                    Label("依群組匯入", systemImage: "person.2")
+                    Label(L10n.text("依群組匯入", "Import by Group"), systemImage: "person.2")
                 }
                 .accessibilityIdentifier("birthday-route-group")
             }
-            .navigationTitle("匯入生日")
+            .navigationTitle(L10n.text("匯入生日", "Import Birthdays"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { showingBirthdayRoutes = false }
+                    Button(L10n.text("取消", "Cancel")) { showingBirthdayRoutes = false }
                 }
             }
         }
@@ -657,7 +754,7 @@ private struct RulesHome: View {
 
     private func saveGroupAppearance(_ appearance: RuleAppearance, for key: GroupAppearanceKey) throws {
         guard rootRules.contains(where: { $0.category == key.category && (key.subcategory == nil || $0.subcategory == key.subcategory) }) else {
-            throw RuleOperationError("找不到這個分類。")
+            throw RuleOperationError(L10n.text("找不到這個分類。", "This category could not be found."))
         }
         var updated = snapshot
         var entries = updated.groupAppearances ?? []
@@ -681,14 +778,14 @@ private struct RulesHome: View {
         guard !path.isEmpty else { return }
         path.removeLast()
         appliedNotice = UUID()
-        AccessibilityNotification.Announcement("已套用").post()
+        AccessibilityNotification.Announcement(L10n.text("已套用", "Applied")).post()
     }
 
     private func showAppleCalendar() {
         guard let url = URL(string: "calshow:") else { return }
         openURL(url) { accepted in
             if !accepted {
-                toolbarError = "此裝置無法開啟 Apple 行事曆。請手動開啟「行事曆」App。"
+                toolbarError = L10n.text("此裝置無法開啟 Apple 行事曆。請手動開啟「行事曆」App。", "This device could not open Apple Calendar. Please open Calendar manually.")
             }
         }
     }
@@ -702,32 +799,32 @@ private struct RulesHome: View {
         } catch {
             loaded = false
             loadFailed = true
-            toolbarError = "讀取已儲存的規則失敗。原資料沒有覆寫。請重新開啟 App 或再試一次。\n\(error.localizedDescription)"
+            toolbarError = L10n.text("讀取已儲存的規則失敗。原資料沒有覆寫。請重新開啟 App 或再試一次。\n\(error.localizedDescription)", "Could not load saved rules. Existing data was not overwritten. Reopen the app or try again.\n\(error.localizedDescription)")
         }
     }
 
     private func resolve(_ input: Rule) throws -> RuleReconciliation {
-        guard loaded else { throw RuleOperationError("規則尚未讀取，請返回列表後重試。") }
+        guard loaded else { throw RuleOperationError(L10n.text("規則尚未讀取，請返回列表後重試。", "Rules have not loaded yet. Return to the list and try again.")) }
         var rule = input
         rule.name = rule.name.trimmingCharacters(in: .whitespacesAndNewlines)
         rule.category = rule.category.trimmingCharacters(in: .whitespacesAndNewlines)
         rule.subcategory = rule.subcategory.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rule.name.isEmpty else {
-            throw RuleOperationError("事件標題為必填，請返回規則主頁填寫。")
+            throw RuleOperationError(L10n.text("事件標題為必填，請返回規則主頁填寫。", "An event title is required. Return to the rule to enter one."))
         }
         guard rule.parent != nil || !rule.category.isEmpty else {
-            throw RuleOperationError("分類為必填，請返回規則主頁填寫或選擇分類。")
+            throw RuleOperationError(L10n.text("分類為必填，請返回規則主頁填寫或選擇分類。", "A category is required. Return to the rule to enter or choose one."))
         }
         if let parent = snapshot.rules.first(where: { $0.id == rule.parent }) {
-            guard parent.hasApplied else { throw RuleOperationError("請先套用依據規則。") }
+            guard parent.hasApplied else { throw RuleOperationError(L10n.text("請先套用依據規則。", "Apply the parent rule first.")) }
             rule.target = parent.target
             rule.category = parent.category
             rule.subcategory = parent.subcategory
         }
-        guard !rule.target.isEmpty else { throw RuleOperationError("目的行事曆為必填。請返回規則主頁，先連接行事曆並選擇目的地。") }
+        guard !rule.target.isEmpty else { throw RuleOperationError(L10n.text("目的行事曆為必填。請返回規則主頁，先連接行事曆並選擇目的地。", "A destination calendar is required. Return to the rule, connect Calendar, and choose a destination.")) }
         if let saved = snapshot.rules.first(where: { $0.id == rule.id }),
            saved.hasApplied && saved.target != rule.target {
-            throw RuleOperationError("這條規則已套用，不能更換目的行事曆。")
+            throw RuleOperationError(L10n.text("這條規則已套用，不能更換目的行事曆。", "This rule has already been applied. Its destination calendar cannot be changed."))
         }
         rule.hasApplied = true
         var rules = snapshot.rules
@@ -754,7 +851,7 @@ private struct RulesHome: View {
         while let id = root.parent {
             guard ancestors.insert(id).inserted,
                   let node = rules.first(where: { $0.id == id && $0.hasApplied }) else {
-                throw RuleOperationError("找不到有效的依據規則，請返回上一層確認。")
+                throw RuleOperationError(L10n.text("找不到有效的依據規則，請返回上一層確認。", "No valid parent rule was found. Go back and check the rule."))
             }
             root = node
         }
@@ -778,7 +875,7 @@ private struct RulesHome: View {
             let existing = try calendar.existingPreviewEvents(for: rule.id, previous: previous)
             return RuleEventPreviewResult(
                 events: existing,
-                warning: "目前只能查看已確認的既有事件，無法預覽這次變更。\n\(error.localizedDescription)"
+                warning: L10n.text("目前只能查看已確認的既有事件，無法預覽這次變更。\n\(error.localizedDescription)", "Only confirmed existing events can be shown. These changes could not be previewed.\n\(error.localizedDescription)")
             )
         }
     }
@@ -793,27 +890,27 @@ private struct RulesHome: View {
             staging.occurrences += plan.desired
             try staging.preflightWrite()
         } catch {
-            throw RuleOperationError("裝置目前無法儲存規則。未變更行事曆，請確認裝置空間後再試。")
+            throw RuleOperationError(L10n.text("裝置目前無法儲存規則。未變更行事曆，請確認裝置空間後再試。", "The rule could not be saved. Calendar was not changed. Check available storage and try again."))
         }
         let committed = try calendar.apply(desired: plan.desired, previous: plan.previous, ruleIDs: plan.ruleIDs)
         updated.occurrences += committed
         do {
             try updated.write()
         } catch {
-            throw RuleOperationError("行事曆已寫入，但規則未能儲存。請先檢查裝置空間與行事曆，不要重複套用。\n\(error.localizedDescription)")
+            throw RuleOperationError(L10n.text("行事曆已寫入，但規則未能儲存。請先檢查裝置空間與行事曆，不要重複套用。\n\(error.localizedDescription)", "Calendar was updated, but the rule could not be saved. Check available storage and your calendar before applying again.\n\(error.localizedDescription)"))
         }
         snapshot = updated
         return updated.rules.first { $0.id == rule.id } ?? rule
     }
 
     private func batchPlan(_ edit: BatchEdit) throws -> (plan: RuleReconciliation, rows: [BatchDurationRule]) {
-        guard edit.classification != nil || edit.durationYears != nil else {
-            throw RuleOperationError("請指定要調整的項目。")
+        guard edit.classification != nil || edit.duration != nil else {
+            throw RuleOperationError(L10n.text("請指定要調整的項目。", "Choose what you want to change."))
         }
         let selected = rootRules.filter { edit.ruleIDs.contains($0.id) }
         let tree = try selectedTreeIDs(edit.ruleIDs)
-        if let years = edit.durationYears, !(1...999).contains(years) {
-            throw RuleOperationError("請輸入正整數年數。")
+        if let duration = edit.duration, !(1...999).contains(duration.count) || duration.unit == .week {
+            throw RuleOperationError(L10n.text("請輸入有效的重複期間。", "Enter a valid repeat period."))
         }
         var desired: [PlannedOccurrence] = []
         var previous: [PlannedOccurrence] = []
@@ -821,16 +918,16 @@ private struct RulesHome: View {
         var updates: [UUID: Rule] = [:]
         var rows: [BatchDurationRule] = []
         for var rule in selected {
-            guard let years = edit.durationYears else { break }
+            guard let duration = edit.duration else { break }
             rule.endMode = .duration
-            rule.endCount = years
-            rule.endUnit = .year
+            rule.endCount = duration.count
+            rule.endUnit = duration.unit
             do {
                 let cutoff = try RuleEngine.cutoff(for: rule)
                 if rule.hasApplied {
                     let branch = try resolve(rule)
                     guard affected.isDisjoint(with: branch.ruleIDs) else {
-                        throw RuleOperationError("選取的規則包含重疊的分支。")
+                        throw RuleOperationError(L10n.text("選取的規則包含重疊的分支。", "The selected rules include overlapping branches."))
                     }
                     desired += branch.desired
                     previous += branch.previous
@@ -843,14 +940,14 @@ private struct RulesHome: View {
                 let civilCutoff = gregorianCalendar.date(from: local.dateComponents([.year, .month, .day], from: cutoff)) ?? cutoff
                 rows.append(.init(id: rule.id, title: rule.displayName, cutoff: civilCutoff, isDraft: !rule.hasApplied))
             } catch {
-                throw RuleOperationError("「\(rule.displayName)」：\(error.localizedDescription)")
+                throw RuleOperationError(L10n.text("「\(rule.displayName)」：\(error.localizedDescription)", "\(rule.displayName): \(error.localizedDescription)"))
             }
         }
         var rules = snapshot.rules.map { updates[$0.id] ?? $0 }
         if let classification = edit.classification {
             let category = classification.category.trimmingCharacters(in: .whitespacesAndNewlines)
             let subcategory = classification.subcategory.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !category.isEmpty else { throw RuleOperationError("請指定移動後的分類。") }
+            guard !category.isEmpty else { throw RuleOperationError(L10n.text("請指定移動後的分類。", "Choose the destination category.")) }
             for index in rules.indices where tree.contains(rules[index].id) {
                 rules[index].category = category
                 rules[index].subcategory = subcategory
@@ -862,14 +959,19 @@ private struct RulesHome: View {
     private func previewBatch(_ edit: BatchEdit) throws -> BatchDurationPreview {
         let batch = try batchPlan(edit)
         let plan = batch.plan
-        let changes = plan.ruleIDs.isEmpty ? [] : try calendar.preview(
-            desired: plan.desired, previous: plan.previous, ruleIDs: plan.ruleIDs
-        )
-        return BatchDurationPreview(rules: batch.rows, changes: changes)
+        let changes = try batchCalendarChanges(plan)
+        return BatchDurationPreview(rules: batch.rows, changes: changes,
+                                    hasChanges: plan.rules != snapshot.rules || !changes.isEmpty)
+    }
+
+    private func batchCalendarChanges(_ plan: RuleReconciliation) throws -> [CalendarChange] {
+        guard !plan.ruleIDs.isEmpty else { return [] }
+        return try calendar.preview(desired: plan.desired, previous: plan.previous, ruleIDs: plan.ruleIDs)
     }
 
     private func applyBatch(_ edit: BatchEdit) throws {
         let plan = try batchPlan(edit).plan
+        if plan.rules == snapshot.rules, try batchCalendarChanges(plan).isEmpty { return }
         var updated = snapshot
         updated.rules = plan.rules
         if !plan.ruleIDs.isEmpty {
@@ -878,7 +980,7 @@ private struct RulesHome: View {
                 staging.occurrences += plan.desired
                 try staging.preflightWrite()
             } catch {
-                throw RuleOperationError("不能儲存規則，行事曆沒有變更。請確認裝置空間後再試。")
+                throw RuleOperationError(L10n.text("不能儲存規則，行事曆沒有變更。請確認裝置空間後再試。", "The rules could not be saved. Calendar was not changed. Check available storage and try again."))
             }
             let committed = try calendar.apply(desired: plan.desired, previous: plan.previous, ruleIDs: plan.ruleIDs)
             updated.occurrences.removeAll { plan.ruleIDs.contains($0.ruleID) }
@@ -888,14 +990,14 @@ private struct RulesHome: View {
             try updated.write()
         } catch {
             throw RuleOperationError(plan.ruleIDs.isEmpty
-                ? "不能儲存規則，行事曆沒有變更。請確認裝置空間後再試。"
-                : "行事曆已寫入，但規則未能儲存。請先檢查裝置空間與行事曆，不要重複套用。")
+                ? L10n.text("不能儲存規則，行事曆沒有變更。請確認裝置空間後再試。", "The rules could not be saved. Calendar was not changed. Check available storage and try again.")
+                : L10n.text("行事曆已寫入，但規則未能儲存。請先檢查裝置空間與行事曆，不要重複套用。", "Calendar was updated, but the rules could not be saved. Check available storage and your calendar before applying again."))
         }
         snapshot = updated
     }
 
     private var batchCategories: [BatchCategoryOption] {
-        uniqueNames(rootRules.map(\.category)).map { name in
+        selectableCategories(rootRules.map(\.category)).map { name in
             let children = rootRules.filter { $0.category == name && !$0.subcategory.isEmpty }
             return BatchCategoryOption(name: name, subcategories: uniqueNames(children.map(\.subcategory)))
         }
@@ -904,7 +1006,7 @@ private struct RulesHome: View {
     private func selectedTreeIDs(_ selected: Set<UUID>) throws -> Set<UUID> {
         guard loaded, !selected.isEmpty,
               selected.isSubset(of: Set(rootRules.map(\.id))) else {
-            throw RuleOperationError("請重新選擇要處理的根規則。")
+            throw RuleOperationError(L10n.text("請重新選擇要處理的根規則。", "Select the top-level rules again."))
         }
         let branches = Dictionary(grouping: snapshot.rules, by: \.parent)
         var ids = selected
@@ -920,13 +1022,22 @@ private struct RulesHome: View {
     private func previewRemoval(_ selected: Set<UUID>) throws -> BatchRemovalPreview {
         let ids = try selectedTreeIDs(selected)
         let appliedIDs = Set(snapshot.rules.filter { ids.contains($0.id) && $0.hasApplied }.map(\.id))
-        let changes = appliedIDs.isEmpty ? [] : try calendar.preview(
-            desired: [], previous: snapshot.occurrences.filter { appliedIDs.contains($0.ruleID) }, ruleIDs: appliedIDs
+        let branches = Dictionary(grouping: snapshot.rules, by: \.parent)
+        var visited = Set<UUID>()
+        func removalRows(_ rule: Rule, depth: Int) -> [BatchRemovalRule] {
+            guard visited.insert(rule.id).inserted else { return [] }
+            let row = BatchRemovalRule(id: rule.id, title: rule.displayName, depth: depth)
+            return [row] + (branches[rule.id] ?? []).flatMap { removalRows($0, depth: depth + 1) }
+        }
+        let rules = rootRules.filter { selected.contains($0.id) }.flatMap { removalRows($0, depth: 0) }
+        let events = appliedIDs.isEmpty ? [] : try calendar.previewRemoval(
+            previous: snapshot.occurrences.filter { appliedIDs.contains($0.ruleID) }, ruleIDs: appliedIDs
         )
-        return BatchRemovalPreview(ruleCount: ids.count, eventCount: changes.count)
+        return BatchRemovalPreview(rules: rules, events: events)
     }
 
-    private func removeSelected(_ selected: Set<UUID>) throws {
+    private func removeSelected(_ selected: Set<UUID>, _ expected: BatchRemovalPreview) throws {
+        guard try previewRemoval(selected) == expected else { throw CalendarIntegrationError.removalSelectionChanged }
         let ids = try selectedTreeIDs(selected)
         let appliedIDs = Set(snapshot.rules.filter { ids.contains($0.id) && $0.hasApplied }.map(\.id))
         var updated = snapshot
@@ -935,14 +1046,14 @@ private struct RulesHome: View {
         if !appliedIDs.isEmpty {
             try updated.preflightWrite()
             let previous = snapshot.occurrences.filter { appliedIDs.contains($0.ruleID) }
-            _ = try calendar.apply(desired: [], previous: previous, ruleIDs: appliedIDs)
+            try calendar.applyRemoval(previous: previous, ruleIDs: appliedIDs, matching: expected.events)
         }
         do {
             try updated.write()
         } catch {
             throw RuleOperationError(appliedIDs.isEmpty
-                ? "未能移除規則。請確認裝置空間後重試。"
-                : "已處理行事曆，但無法儲存本機規則。請保留畫面並先確認裝置空間。")
+                ? L10n.text("未能移除規則。請確認裝置空間後重試。", "The rules could not be removed. Check available storage and try again.")
+                : L10n.text("已處理行事曆，但無法儲存本機規則。請保留畫面並先確認裝置空間。", "Calendar was updated, but the local rules could not be saved. Keep this screen open and check available storage."))
         }
         snapshot = updated
     }
@@ -954,9 +1065,10 @@ private struct RulesHome: View {
         }
         if sameContact.contains(where: { $0.birthdaySource == candidate.source }) { return .imported }
         if !sameContact.isEmpty { return .changed }
-        let possibleTitles = Set([candidate.name, candidate.eventTitle])
+        let possibleTitles = candidate.duplicateTitles
         if rootRules.contains(where: { rule in
-            guard possibleTitles.contains(rule.name.trimmingCharacters(in: .whitespacesAndNewlines)),
+            guard rule.birthdaySource == nil,
+                  possibleTitles.contains(rule.name.trimmingCharacters(in: .whitespacesAndNewlines)),
                   rule.period == .year, rule.weekdayPattern == nil else { return false }
             if candidate.isLunar {
                 return rule.kind == .lunar && rule.lunarMonth == candidate.month &&
@@ -970,30 +1082,30 @@ private struct RulesHome: View {
     }
 
     private func importBirthdays(_ candidates: [BirthdayCandidate], years: Int, target: String, applyNow: Bool,
-                                 category: String, subcategory: String) throws {
+                                 category: String, subcategory: String, preferNickname: Bool) throws {
         guard loaded, (1...999).contains(years), !candidates.isEmpty else {
-            throw RuleOperationError("請選擇要匯入的生日並填寫有效的期間。")
+            throw RuleOperationError(L10n.text("請選擇要匯入的生日並填寫有效的期間。", "Select birthdays to import and enter a valid repeat period."))
         }
         let category = category.trimmingCharacters(in: .whitespacesAndNewlines)
         let subcategory = subcategory.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !category.isEmpty else { throw RuleOperationError("請輸入生日規則的分類。") }
+        guard !category.isEmpty else { throw RuleOperationError(L10n.text("請輸入生日規則的分類。", "Enter a category for the birthday rules.")) }
         guard calendar.destinations.contains(where: { $0.id == target && $0.isWritable }) else {
-            throw RuleOperationError("目的行事曆已不可用，請重新選擇。")
+            throw RuleOperationError(L10n.text("目的行事曆已不可用，請重新選擇。", "The destination calendar is no longer available. Choose another calendar."))
         }
         var updated = snapshot
         var imported: [Rule] = []
         var planned: [PlannedOccurrence] = []
         guard Set(candidates.map(\.id)).count == candidates.count else {
-            throw RuleOperationError("選取清單有重複的生日，請返回確認。")
+            throw RuleOperationError(L10n.text("選取清單有重複的生日，請返回確認。", "The selection contains duplicate birthdays. Go back and review it."))
         }
         for candidate in candidates {
             switch birthdayStatus(candidate) {
             case .imported:
-                throw RuleOperationError("「\(candidate.name)」已匯入，請重新選擇。")
+                throw RuleOperationError(L10n.text("「\(candidate.name)」已匯入，請重新選擇。", "\(candidate.name) has already been imported. Choose a different entry."))
             case .available, .possibleDuplicate, .changed:
                 break
             }
-            var rule = Rule(name: candidate.eventTitle, kind: candidate.isLunar ? .lunar : .gregorian,
+            var rule = Rule(name: candidate.eventTitle(preferNickname: preferNickname), kind: candidate.isLunar ? .lunar : .gregorian,
                             date: "", lunarMonth: candidate.month, lunarDay: candidate.day,
                             lunarIsLeap: candidate.isLeapMonth,
                             category: category, subcategory: subcategory)
@@ -1015,7 +1127,7 @@ private struct RulesHome: View {
                     year += 1
                 }
                 guard let foundDate else {
-                    throw RuleOperationError("無法判讀「\(candidate.name)」的生日日期。")
+                    throw RuleOperationError(L10n.text("無法判讀「\(candidate.name)」的生日日期。", "Could not read the birthday for \(candidate.name)."))
                 }
                 rule.start = foundDate
                 // Birthdays are fixed month/day, not the final day of every February.
@@ -1027,7 +1139,7 @@ private struct RulesHome: View {
                 do {
                     planned += try RuleEngine.plan(root: rule, rules: [rule])
                 } catch {
-                    throw RuleOperationError("「\(candidate.name)」：\(error.localizedDescription)")
+                    throw RuleOperationError(L10n.text("「\(candidate.name)」：\(error.localizedDescription)", "\(candidate.name): \(error.localizedDescription)"))
                 }
             }
             imported.append(rule)
@@ -1039,7 +1151,7 @@ private struct RulesHome: View {
                 staging.occurrences += planned
                 try staging.preflightWrite()
             } catch {
-                throw RuleOperationError("無法儲存匯入的規則，行事曆沒有變更。請確認裝置空間。")
+                throw RuleOperationError(L10n.text("無法儲存匯入的規則，行事曆沒有變更。請確認裝置空間。", "The imported rules could not be saved. Calendar was not changed. Check available storage."))
             }
             let ids = Set(imported.map(\.id))
             _ = try calendar.preview(desired: planned, previous: [], ruleIDs: ids)
@@ -1049,8 +1161,8 @@ private struct RulesHome: View {
             try updated.write()
         } catch {
             throw RuleOperationError(applyNow
-                ? "已寫入行事曆，但本機規則未能儲存。請先確認裝置空間及行事曆，不要重複匯入。"
-                : "未能儲存匯入的生日，行事曆沒有變更。請確認裝置空間後重試。")
+                ? L10n.text("已寫入行事曆，但本機規則未能儲存。請先確認裝置空間及行事曆，不要重複匯入。", "Calendar was updated, but the local rules could not be saved. Check available storage and your calendar before importing again.")
+                : L10n.text("未能儲存匯入的生日，行事曆沒有變更。請確認裝置空間後重試。", "The imported birthdays could not be saved. Calendar was not changed. Check available storage and try again."))
         }
         snapshot = updated
         if !applyNow, imported.count == 1, let only = imported.first {
@@ -1064,7 +1176,7 @@ private struct RulesHome: View {
                 isShowingBatch = true
             } label: {
                 Label {
-                    Text("批次調整")
+                    Text(L10n.text("批次調整", "Batch Edit"))
                 } icon: {
                     Image(systemName: "checklist")
                         .padding(.leading, 1) // Account for the checklist and title glyphs independently.
@@ -1075,7 +1187,7 @@ private struct RulesHome: View {
             .accessibilityIdentifier("start-batch")
             Spacer(minLength: 8)
             Button(action: showAppleCalendar) {
-                Label("行事曆", systemImage: "calendar")
+                Label(L10n.text("行事曆", "Calendar"), systemImage: "calendar")
                     .frame(minHeight: 44)
             }
             .accessibilityIdentifier("open-apple-calendar")
@@ -1084,7 +1196,7 @@ private struct RulesHome: View {
     }
 
     private var intro: some View {
-        Label("在這裡訂規則，在原本的行事曆看結果。", systemImage: "point.3.connected.trianglepath.dotted")
+        Label(L10n.text("在這裡訂規則，在原本的行事曆看結果。", "Set up rules here and see the events in the calendar you already use."), systemImage: "point.3.connected.trianglepath.dotted")
             .font(.subheadline)
             .foregroundStyle(slate)
             .padding(16)
@@ -1096,9 +1208,9 @@ private struct RulesHome: View {
         VStack(alignment: .trailing, spacing: 0) {
             addRuleButton
             ContentUnavailableView {
-                Label("還沒有規則", systemImage: "calendar.badge.plus")
+                Label(L10n.text("還沒有規則", "No Rules Yet"), systemImage: "calendar.badge.plus")
             } description: {
-                Text("新增一條日期規則，或從通訊錄選擇生日匯入。")
+                Text(L10n.text("新增一條日期規則，或從通訊錄選擇生日匯入。", "Add a rule or import birthdays from Contacts."))
             }
             .frame(maxWidth: .infinity)
         }
@@ -1111,7 +1223,7 @@ private struct RulesHome: View {
                 .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
-        .accessibilityLabel("新增規則")
+        .accessibilityLabel(L10n.text("新增規則", "New Rule"))
         .accessibilityIdentifier("add-rule")
     }
 
@@ -1159,7 +1271,7 @@ private struct RulesHome: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("調整\(key.title)圖示與顏色")
+            .accessibilityLabel(L10n.text("調整\(key.title)圖示與顏色", "Change icon and color for \(key.title)"))
             .accessibilityIdentifier(key.subcategory == nil ? "category-appearance" : "subcategory-appearance")
             Text(key.title)
                 .font(key.subcategory == nil ? .headline : .footnote.weight(.semibold))
@@ -1179,29 +1291,34 @@ private struct RulesHome: View {
                 .accessibilityHidden(true)
             let next = snapshot.occurrences.lazy.filter { $0.ruleID == rule.id && $0.start > Date() }.min { $0.start < $1.start }
             let status = rule.hasApplied
-                ? next.map { "下次 " + dateCaption($0.start, calendar: $0.isAllDay ? gregorianCalendar : RuleEngine.civilCalendar(for: rule)) } ?? "無後續日期"
-                : "未套用"
+                ? next.map { occurrence in
+                    let civil = occurrence.isAllDay ? gregorianCalendar : RuleEngine.civilCalendar(for: rule)
+                    let day = L10n.text("下次 ", "Next: ") + dateCaption(occurrence.start, calendar: civil)
+                    return occurrence.isAllDay ? day : "\(day) \(timeCaption(occurrence.start, calendar: civil))"
+                } ?? L10n.text("無後續日期", "No Upcoming Date")
+                : L10n.text("未套用", "Not Applied")
             let layout = dynamicTypeSize.isAccessibilitySize
                 ? AnyLayout(VStackLayout(alignment: .leading, spacing: 6))
                 : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: 10))
-            layout {
-                VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 4) {
+                layout {
                     Text(rule.displayName)
                         .font(.subheadline.weight(.semibold))
                         .fixedSize(horizontal: false, vertical: true)
-                    Text(status)
-                        .font(.caption2.weight(.medium))
-                        .monospacedDigit()
+                    if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 0) }
+                    Text(rule.homeRecurrenceCaption)
+                        .accessibilityLabel(rule.recurrenceCaption)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
+                        .multilineTextAlignment(dynamicTypeSize.isAccessibilitySize ? .leading : .trailing)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 0) }
-                Text(rule.recurrenceCaption)
-                    .font(.caption)
+                Text(status)
+                    .font(.caption2.weight(.medium))
+                    .monospacedDigit()
                     .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.trailing)
                     .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: dynamicTypeSize.isAccessibilitySize ? .infinity : nil, alignment: .trailing)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             Image(systemName: "chevron.right")
@@ -1231,15 +1348,15 @@ private struct RulesHome: View {
                         path.append(.edit(rule, isNew: true))
                     } label: {
                         Label { VStack(alignment: .leading, spacing: 4) {
-                            Text(kind.rawValue).foregroundStyle(.primary)
+                            Text(kind.displayLabel).foregroundStyle(.primary)
                             Text(kind.subtitle).font(.caption).foregroundStyle(.secondary)
                         } } icon: { Image(systemName: kind.symbol) }
                     }
                 }
             }
-            .navigationTitle("新增規則")
+            .navigationTitle(L10n.text("新增規則", "New Rule"))
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { isAdding = false } } }
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button(L10n.text("取消", "Cancel")) { isAdding = false } } }
         }
         .tint(slate)
     }
@@ -1268,14 +1385,14 @@ private struct AppearanceEditSheet: View {
                 AppearancePicker(title: title, appearance: $choice, defaultSymbol: defaultSymbol, defaultColor: slate)
                     .padding(20)
             }
-            .navigationTitle("圖示與顏色")
+            .navigationTitle(L10n.text("圖示與顏色", "Icon and Color"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { dismiss() }
+                    Button(L10n.text("取消", "Cancel")) { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") {
+                    Button(L10n.text("完成", "Done")) {
                         do {
                             try onSave(choice)
                             dismiss()
@@ -1285,10 +1402,10 @@ private struct AppearanceEditSheet: View {
                     }
                 }
             }
-            .alert("無法儲存外觀", isPresented: Binding(
+            .alert(L10n.text("無法儲存外觀", "Could Not Save Appearance"), isPresented: Binding(
                 get: { failure != nil }, set: { if !$0 { failure = nil } }
             )) {
-                Button("好", role: .cancel) { failure = nil }
+                Button(L10n.text("好", "OK"), role: .cancel) { failure = nil }
             } message: { Text(failure ?? "") }
         }
     }
@@ -1297,6 +1414,7 @@ private struct AppearanceEditSheet: View {
 private struct RuleEditor: View {
     @State private var rule: Rule
     @State private var baseline: Rule?
+    @State private var emptyCutoffSchedule: Rule?
     @State private var exitBaseline: Rule
     @State private var pendingDiscard = false
     @State private var exitAction: ExitAction?
@@ -1388,15 +1506,20 @@ private struct RuleEditor: View {
         return categoryCalendarPresets(rules: allRules, destinations: calendar.destinations)[trimmedCategory] ?? ""
     }
     private var destinationID: String { parent?.target ?? (followsCategoryDestination ? suggestedDestinationID : rule.target) }
+    private var previewRule: Rule {
+        var submitted = rule
+        submitted.target = destinationID
+        return submitted
+    }
     private var hasDestination: Bool { calendar.destinations.contains { $0.id == destinationID && $0.isWritable } }
     private var canApply: Bool { hasTitle && (parent != nil || !trimmedCategory.isEmpty) && hasDestination }
     private var isDestinationLocked: Bool { parent != nil || baseline?.hasApplied == true }
     private var chosenDestination: String {
         let id = destinationID
         if let destination = calendar.destinations.first(where: { $0.id == id }) {
-            return destination.isWritable ? destination.displayTitle : "\(destination.displayTitle)（唯讀）"
+            return destination.isWritable ? destination.displayTitle : L10n.text("\(destination.displayTitle)（唯讀）", "\(destination.displayTitle) (read-only)")
         }
-        return id.isEmpty ? "尚未選擇" : "已無法使用"
+        return id.isEmpty ? L10n.text("尚未選擇", "Not Selected") : L10n.text("已無法使用", "No Longer Available")
     }
     private var availablePeriods: [PeriodUnit] {
         switch rule.kind {
@@ -1406,7 +1529,7 @@ private struct RuleEditor: View {
         }
     }
     private var categoryOptions: [String] {
-        uniqueNames(allRules.filter { $0.parent == nil }.map(\.category))
+        selectableCategories(allRules.filter { $0.parent == nil }.map(\.category))
     }
     private var subcategoryOptions: [String] {
         uniqueNames(allRules.filter {
@@ -1422,14 +1545,14 @@ private struct RuleEditor: View {
         Form {
             if let parent {
                 Section {
-                    LabeledContent("依據規則", value: parent.displayName)
-                    Picker("相對日期", selection: $rule.position) {
-                        ForEach(RelativePosition.allCases) { Text($0.rawValue).tag($0) }
+                    LabeledContent(L10n.text("依據規則", "Parent Rule"), value: parent.displayName)
+                    Picker(L10n.text("相對日期", "Relative Date"), selection: $rule.position) {
+                        ForEach(RelativePosition.allCases) { Text($0.displayLabel).tag($0) }
                     }
                     if rule.position != .same {
-                        Stepper("間隔：\(rule.offsetDays) 天", value: $rule.offsetDays, in: 1...999)
+                        Stepper(L10n.text("間隔：\(rule.offsetDays) 天", "Offset: \(rule.offsetDays) \(PeriodUnit.day.displayLabel(count: rule.offsetDays))"), value: $rule.offsetDays, in: 1...999)
                     }
-                } header: { Text("延伸日期") }
+                } header: { Text(L10n.text("延伸日期", "Follow-up Date")) }
             } else {
                 rootDate
             }
@@ -1445,37 +1568,39 @@ private struct RuleEditor: View {
                             .background(rule.displayAppearance.tint(or: slate).opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("調整規則圖示與顏色")
+                    .accessibilityLabel(L10n.text("調整規則圖示與顏色", "Change the Rule’s Icon and Color"))
                     .accessibilityIdentifier("rule-appearance")
                     VStack(alignment: .leading, spacing: 5) {
-                        Text("事件標題（必填）")
+                        Text(L10n.text("事件標題（必填）", "Event Title (required)"))
                             .font(.caption.weight(.medium))
                             .foregroundStyle(hasTitle ? Color.primary : requiredFieldTint)
                             .accessibilityHidden(true)
-                        TextField("輸入事件標題", text: Binding(
+                        TextField(L10n.text("輸入事件標題", "Enter an event title"), text: Binding(
                             get: { rule.name },
                             set: {
                                 followsSuggestedTitle = false
                                 rule.name = $0
                             }
                         ))
-                            .accessibilityLabel("事件標題（必填）")
+                            .accessibilityLabel(L10n.text("事件標題（必填）", "Event Title (required)"))
                             .accessibilityIdentifier("rule-title")
                     }
                 }
                 if parent == nil {
                     let layout = dynamicTypeSize.isAccessibilitySize
-                        ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10))
-                        : AnyLayout(HStackLayout(alignment: .top, spacing: 10))
+                        ? AnyLayout(VStackLayout(alignment: .leading, spacing: 12))
+                        : AnyLayout(HStackLayout(alignment: .top, spacing: 12))
                     layout {
-                        categoryEntry("分類", placeholder: "請輸入", selection: Binding(
+                        CategoryEntryField(selection: Binding(
                             get: { rule.category },
                             set: {
                                 followsSuggestedCategory = false
                                 rule.category = $0
                             }
-                        ), options: categoryOptions)
-                        categoryEntry("次類", placeholder: "可留空", selection: $rule.subcategory, options: subcategoryOptions, optional: true)
+                        ), options: categoryOptions, isSubcategory: false,
+                                           fieldID: "rule-category", menuID: "category-options")
+                        CategoryEntryField(selection: $rule.subcategory, options: subcategoryOptions, isSubcategory: true,
+                                           fieldID: "rule-subcategory", menuID: "subcategory-options")
                     }
                 }
                 calendarFields
@@ -1484,40 +1609,27 @@ private struct RuleEditor: View {
             if parent == nil { cutoff }
 
             Section {
-                Toggle("整日", isOn: Binding(
+                Toggle(L10n.text("整日", "All Day"), isOn: Binding(
                     get: { rule.timing == .allDay },
                     set: { rule.timing = $0 ? .allDay : .timed }
                 ))
                 .accessibilityIdentifier("all-day-toggle")
                 if rule.timing == .timed {
-                    RuleDateField(title: "開始時間", selection: $rule.startTime, kind: .time, civilCalendar: ruleCalendar)
+                    RuleDateField(title: L10n.text("開始時間", "Start Time"), selection: $rule.startTime, kind: .time, civilCalendar: ruleCalendar)
                         .id("single-event-time")
                 }
                 if rule.timing == .allDay {
-                    Stepper("持續期間：\(rule.durationDays) 日", value: $rule.durationDays, in: 1...365)
+                    Stepper(L10n.text("持續期間：\(rule.durationDays) 日", "Duration: \(rule.durationDays) \(PeriodUnit.day.displayLabel(count: rule.durationDays))"), value: $rule.durationDays, in: 1...365)
                         .accessibilityIdentifier("single-event-days")
                 } else {
-                    Stepper("持續期間：\(hoursLabel) 小時", value: $rule.durationHalfHours, in: 1...48)
+                    Stepper(L10n.text("持續期間：\(hoursLabel) 小時", "Duration: \(hoursLabel) \(rule.durationHalfHours == 2 ? "hour" : "hours")"), value: $rule.durationHalfHours, in: 1...48)
                         .accessibilityIdentifier("single-event-hours")
                 }
-            } header: { Text("單次事件") }
-
-            Section {
-                NavigationLink {
-                    EventPreview(civilCalendar: ruleCalendar) {
-                        var submitted = rule
-                        submitted.target = destinationID
-                        return try preview(submitted)
-                    }
-                } label: {
-                    Label("預覽事件", systemImage: "list.bullet.rectangle")
-                }
-                .accessibilityIdentifier("preview-events")
-            }
+            } header: { Text(L10n.text("單次事件", "Each Event")) }
 
             Section {
                 if children.isEmpty {
-                    Text("尚無子規則").foregroundStyle(.secondary)
+                    Text(L10n.text("尚無子規則", "No Child Rules Yet")).foregroundStyle(.secondary)
                 }
                 ForEach(visibleTreeRows) { row in
                     treeRow(row)
@@ -1528,11 +1640,12 @@ private struct RuleEditor: View {
                     child.target = rule.target
                     onOpenChild(child, true)
                 } label: {
-                    Label("新增子規則", systemImage: "plus")
+                    Label(L10n.text("新增子規則", "Add Child Rule"), systemImage: "plus")
                 }
                 .disabled(baseline == nil)
-            } header: { Text("子規則") }
-              footer: { Text(baseline == nil ? "先套用這條規則，才能新增它的子規則。" : "可編輯直接子規則；縮排的下游項目僅供查看。") }
+            } header: { Text(L10n.text("子規則", "Child Rules")) }
+              footer: { Text(baseline == nil ? L10n.text("先套用這條規則，才能新增它的子規則。", "Apply this rule before adding child rules.") : L10n.text("可編輯直接子規則；縮排的下游項目僅供查看。", "You can edit direct child rules here. Deeper levels are shown for reference.")) }
+            EventPreview(rule: previewRule, civilCalendar: ruleCalendar, load: preview)
         }
         .onChange(of: rule.suggestedTitle) { _, suggestion in
             if followsSuggestedTitle { rule.name = suggestion ?? "" }
@@ -1540,7 +1653,7 @@ private struct RuleEditor: View {
         .onChange(of: rule.suggestedCategory) { _, suggestion in
             if followsSuggestedCategory { rule.category = suggestion ?? "" }
         }
-        .navigationTitle(baseline == nil ? "新增規則" : "編輯規則")
+        .navigationTitle(baseline == nil ? L10n.text("新增規則", "New Rule") : L10n.text("編輯規則", "Edit Rule"))
         .sheet(isPresented: $editingAppearance) {
             AppearanceEditSheet(title: rule.displayName, initial: rule.displayAppearance,
                                 defaultSymbol: rule.defaultSymbol) { appearance in
@@ -1560,14 +1673,14 @@ private struct RuleEditor: View {
             if hasUnsavedChanges {
                 ToolbarItem(placement: .topBarLeading) {
                     Button { pendingDiscard = true } label: {
-                        Label("返回", systemImage: "chevron.left")
+                        Label(L10n.text("返回", "Back"), systemImage: "chevron.left")
                     }
                     .accessibilityIdentifier("guarded-back")
                 }
             }
             if dirty {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("套用", action: applyAndReturn)
+                    Button(L10n.text("套用", "Apply"), action: applyAndReturn)
                     .fontWeight(.semibold)
                     .disabled(!canApply)
                     .accessibilityIdentifier("apply-rule")
@@ -1577,7 +1690,7 @@ private struct RuleEditor: View {
         .sheet(isPresented: $pendingDiscard, onDismiss: handleExitAction) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("尚有變更未套用，要如何處理？")
+                    Text(L10n.text("尚有變更未套用，要如何處理？", "Apply your changes before leaving?"))
                         .font(.headline)
                         .accessibilityAddTraits(.isHeader)
                     if !canApply {
@@ -1589,7 +1702,7 @@ private struct RuleEditor: View {
                         exitAction = .apply
                         pendingDiscard = false
                     } label: {
-                        Text("套用並返回").frame(maxWidth: .infinity, minHeight: 36)
+                        Text(L10n.text("套用並返回", "Apply and Go Back")).frame(maxWidth: .infinity, minHeight: 36)
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!canApply)
@@ -1597,14 +1710,14 @@ private struct RuleEditor: View {
                         exitAction = .discard
                         pendingDiscard = false
                     } label: {
-                        Text("捨棄變更").frame(maxWidth: .infinity, minHeight: 36)
+                        Text(L10n.text("捨棄變更", "Discard Changes")).frame(maxWidth: .infinity, minHeight: 36)
                     }
                     .buttonStyle(.bordered)
                     .tint(.red)
                     Button {
                         pendingDiscard = false
                     } label: {
-                        Text("繼續編輯").frame(maxWidth: .infinity, minHeight: 36)
+                        Text(L10n.text("繼續編輯", "Keep Editing")).frame(maxWidth: .infinity, minHeight: 36)
                     }
                     .buttonStyle(.bordered)
                 }
@@ -1612,19 +1725,19 @@ private struct RuleEditor: View {
             }
             .presentationDetents([.medium, .large])
         }
-        .alert("無法完成操作", isPresented: Binding(
+        .alert(L10n.text("無法完成操作", "Could Not Complete the Action"), isPresented: Binding(
             get: { operationError != nil }, set: { if !$0 { operationError = nil } }
         )) {
-            Button("好", role: .cancel) { operationError = nil }
+            Button(L10n.text("好", "OK"), role: .cancel) { operationError = nil }
         } message: { Text(operationError ?? "") }
     }
 
     private var missingRequiredPrompt: String {
         var missing: [String] = []
-        if !hasTitle { missing.append("事件標題") }
-        if parent == nil && trimmedCategory.isEmpty { missing.append("分類") }
-        if !hasDestination { missing.append("指定行事曆") }
-        return "請繼續編輯，補齊\(missing.joined(separator: "、"))後再套用。"
+        if !hasTitle { missing.append(L10n.text("事件標題", "Event Title")) }
+        if parent == nil && trimmedCategory.isEmpty { missing.append(L10n.text("分類", "Category")) }
+        if !hasDestination { missing.append(L10n.text("指定行事曆", "Destination Calendar")) }
+        return L10n.text("請繼續編輯，補齊\(missing.joined(separator: "、"))後再套用。", "Keep editing and fill in \(missing.joined(separator: ", ")) before applying.")
     }
 
     private func handleExitAction() {
@@ -1677,9 +1790,9 @@ private struct RuleEditor: View {
                     }
                 } label: {
                     if connecting {
-                        ProgressView("正在連接行事曆…")
+                        ProgressView(L10n.text("正在連接行事曆…", "Connecting to Calendar…"))
                     } else {
-                        Label("連接行事曆", systemImage: "calendar.badge.plus")
+                        Label(L10n.text("連接行事曆", "Connect Calendar"), systemImage: "calendar.badge.plus")
                     }
                 }
                 .disabled(connecting)
@@ -1689,11 +1802,11 @@ private struct RuleEditor: View {
                 LabeledContent {
                     Text(chosenDestination)
                 } label: {
-                    Text("指定行事曆（必填）")
+                    Text(L10n.text("指定行事曆（必填）", "Destination Calendar (required)"))
                         .foregroundStyle(hasDestination ? Color.primary : requiredFieldTint)
                 }
             } else {
-                CalendarDestinationField(title: "指定行事曆（必填）", selectedTitle: chosenDestination,
+                CalendarDestinationField(title: L10n.text("指定行事曆（必填）", "Destination Calendar (required)"), selectedTitle: chosenDestination,
                                          selectedID: destinationID, isValid: hasDestination,
                                          destinations: calendar.destinations) {
                     followsCategoryDestination = false
@@ -1702,56 +1815,9 @@ private struct RuleEditor: View {
                     .accessibilityIdentifier("rule-destination")
             }
             if calendar.hasFullAccess, !calendar.destinations.contains(where: \.isWritable), !connecting {
-                Text("目前沒有可寫入的行事曆。請在 Apple 行事曆中加入可編輯的行事曆，再回來選擇。")
+                Text(L10n.text("目前沒有可寫入的行事曆。請在 Apple 行事曆中加入可編輯的行事曆，再回來選擇。", "No writable calendars are available. Add an editable calendar in Apple Calendar, then return to select it."))
                     .font(.footnote).foregroundStyle(.secondary)
             }
-    }
-
-    private func categoryEntry(_ label: String, placeholder: String, selection: Binding<String>, options: [String], optional: Bool = false) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(optional ? label : "\(label)（必填）")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(!optional && selection.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                 ? requiredFieldTint : Color.primary)
-                .accessibilityHidden(true)
-            HStack(spacing: 2) {
-                TextField(placeholder, text: selection)
-                    .lineLimit(1)
-                    .accessibilityLabel(optional ? label : "\(label)（必填）")
-                    .accessibilityIdentifier(optional ? "rule-subcategory" : "rule-category")
-                Menu {
-                    if optional {
-                        Button("不分次類") { selection.wrappedValue = "" }
-                    }
-                    ForEach(options, id: \.self) { name in
-                        Button {
-                            selection.wrappedValue = name
-                        } label: {
-                            if selection.wrappedValue == name {
-                                Label(name, systemImage: "checkmark")
-                            } else {
-                                Text(name)
-                            }
-                        }
-                    }
-                    if options.isEmpty && optional {
-                        Text("這個分類沒有既有次類")
-                    }
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .font(.caption.weight(.semibold))
-                        .frame(width: 36, height: 44)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.borderless)
-                .disabled(!optional && options.isEmpty)
-                .accessibilityLabel("選擇既有\(label)")
-                .accessibilityIdentifier(optional ? "subcategory-options" : "category-options")
-            }
-            .padding(.leading, 9)
-            .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func treeRow(_ row: TreeRow) -> some View {
@@ -1772,7 +1838,7 @@ private struct RuleEditor: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
-                .accessibilityLabel(isCollapsed ? "展開\(row.item.displayName)" : "收合\(row.item.displayName)")
+                .accessibilityLabel(isCollapsed ? L10n.text("展開\(row.item.displayName)", "Expand \(row.item.displayName)") : L10n.text("收合\(row.item.displayName)", "Collapse \(row.item.displayName)"))
             } else {
                 Image(systemName: row.depth == 0 ? "circle.fill" : "arrow.turn.down.right")
                     .font(.caption2)
@@ -1796,7 +1862,7 @@ private struct RuleEditor: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityHint("編輯這條子規則")
+                .accessibilityHint(L10n.text("編輯這條子規則", "Edit this child rule"))
             } else {
                 treeLabel(row)
                     .foregroundStyle(.secondary)
@@ -1823,8 +1889,8 @@ private struct RuleEditor: View {
 
     private var rootDate: some View {
         Section {
-            Picker("類型", selection: $rule.kind) {
-                ForEach(RuleKind.allCases) { Text($0.rawValue).tag($0) }
+            Picker(L10n.text("類型", "Type"), selection: $rule.kind) {
+                ForEach(RuleKind.allCases) { Text($0.displayLabel).tag($0) }
             }
             .onChange(of: rule.kind) { previousKind, kind in
                 rule.date = kind.dates.first ?? ""
@@ -1851,22 +1917,27 @@ private struct RuleEditor: View {
             }
             if rule.kind == .lunar {
                 if rule.period == .year {
-                    Picker("農曆月", selection: $rule.lunarMonth) {
-                        ForEach(1...12, id: \.self) { Text("\($0) 月").tag($0) }
+                    Picker(L10n.text("農曆月", "Lunar Month"), selection: $rule.lunarMonth) {
+                        ForEach(1...12, id: \.self) { Text(L10n.text("\($0) 月", "Month \($0)")).tag($0) }
                     }
                 }
-                Picker("農曆日", selection: $rule.lunarDay) {
-                    ForEach(1...30, id: \.self) { Text("\($0) 日").tag($0) }
+                Picker(L10n.text("農曆日", "Lunar Day"), selection: $rule.lunarDay) {
+                    ForEach(1...30, id: \.self) { Text(L10n.text("\($0) 日", "Day \($0)")).tag($0) }
                 }
-                if rule.lunarIsLeap {
-                    Toggle("閏月生日", isOn: $rule.lunarIsLeap)
+                if rule.period == .year {
+                    Toggle(L10n.text("優先使用閏月", "Prefer the Leap Month"), isOn: $rule.lunarIsLeap)
+                } else {
+                    Toggle(L10n.text("包含閏月", "Include Leap Months"), isOn: Binding(
+                        get: { rule.includeLeapMonths ?? true },
+                        set: { rule.includeLeapMonths = $0 ? nil : false }
+                    ))
                 }
             } else if rule.kind == .solar {
-                Picker("節氣", selection: $rule.date) {
-                    ForEach(RuleKind.solar.dates, id: \.self) { Text($0).tag($0) }
+                Picker(L10n.text("節氣", "Solar Term"), selection: $rule.date) {
+                    ForEach(RuleKind.solar.dates, id: \.self) { Text(SolarTerms.displayName($0)).tag($0) }
                 }
             }
-            RuleDateField(title: "起始日", selection: $rule.start, civilCalendar: ruleCalendar)
+            RuleDateField(title: L10n.text("起始日", "Start Date"), selection: $rule.start, civilCalendar: ruleCalendar)
                 .onChange(of: rule.start) { oldStart, _ in
                     if allowsMonthEnd { rule.monthEnd = true }
                     if rule.kind == .solar && baseline == nil && rule.endMode == .duration {
@@ -1878,8 +1949,8 @@ private struct RuleEditor: View {
                         }
                     }
                 }
-            Picker("週期", selection: $rule.period) {
-                ForEach(availablePeriods) { Text($0.rawValue).tag($0) }
+            Picker(L10n.text("週期", "Repeat Cycle"), selection: $rule.period) {
+                ForEach(availablePeriods) { Text($0.displayLabel()).tag($0) }
             }
             .onChange(of: rule.period) { previous, period in
                 if period != .year && period != .month {
@@ -1889,7 +1960,7 @@ private struct RuleEditor: View {
                 }
                 if period != .week { rule.weeklyWeekday = nil }
             }
-            Stepper("間隔：每 \(rule.interval) \(rule.period.rawValue)", value: $rule.interval, in: 1...999)
+            Stepper(L10n.text("間隔：每 \(rule.interval) \(rule.period.rawValue)", "Repeat every \(rule.interval) \(rule.period.displayLabel(count: rule.interval))"), value: $rule.interval, in: 1...999)
             if rule.kind == .gregorian {
                 if rule.period == .year || rule.period == .month {
                     weekdayCondition
@@ -1901,26 +1972,24 @@ private struct RuleEditor: View {
                 }
                 if let summary = weekdaySummary {
                     Text(summary).font(.subheadline).foregroundStyle(.secondary)
-                    LabeledContent("下次日期", value: nextWeekdayDateCaption)
+                    LabeledContent(L10n.text("下次日期", "Next Date"), value: nextWeekdayDateCaption)
                 }
             }
             if allowsMonthEnd {
-                Toggle("固定在月底", isOn: $rule.monthEnd)
+                Toggle(L10n.text("固定在月底", "Repeat on the Last Day of the Month"), isOn: $rule.monthEnd)
             }
-        } header: { Text("日期與週期") }
+        } header: { Text(L10n.text("日期與週期", "Date and Recurrence")) }
           footer: {
               if rule.kind == .solar {
-                  Text("內建資料涵蓋 \(SolarTerms.supportedYears.lowerBound)～\(SolarTerms.supportedYears.upperBound) 年，無須連網。")
-              } else if rule.kind == .lunar {
-                  Text(rule.lunarIsLeap ? "目前無法套用閏月生日規則。" : "按月重複若遇到閏月，請先縮短期間；閏月排程方式尚未確定。")
+                  Text(L10n.text("內建資料涵蓋 \(SolarTerms.supportedYears.lowerBound)～\(SolarTerms.supportedYears.upperBound) 年，無須連網。", "Available offline for \(SolarTerms.supportedYears.lowerBound)–\(SolarTerms.supportedYears.upperBound)."))
               } else if allowsMonthEnd {
-                  Text("例如 6/30 起每月重複，固定在月底時，下一筆是 7/31。")
+                  Text(L10n.text("例如 6/30 起每月重複，固定在月底時，下一筆是 7/31。", "For example, a monthly rule starting on June 30 repeats on July 31 when set to the last day of the month."))
               }
           }
     }
 
     @ViewBuilder private var weekdayCondition: some View {
-        Picker("日期條件", selection: Binding(
+        Picker(L10n.text("日期條件", "Date Pattern"), selection: Binding(
             get: { rule.weekdayPattern != nil },
             set: { selected in
                 if selected {
@@ -1936,37 +2005,43 @@ private struct RuleEditor: View {
                 }
             }
         )) {
-            Text(rule.period == .year ? "固定月日" : "固定日期").tag(false)
-            Text("固定星期幾").tag(true)
+            Text(rule.period == .year ? L10n.text("固定月日", "Fixed Month and Day") : L10n.text("固定日期", "Fixed Date")).tag(false)
+            Text(L10n.text("固定星期幾", "Fixed Weekday")).tag(true)
         }
         if let pattern = rule.weekdayPattern {
             HStack {
-                Picker("第幾個", selection: conditionValue(\.ordinal)) {
-                    ForEach(1...4, id: \.self) { Text("第 \($0) 個").tag($0) }
+                Picker(L10n.text("第幾個", "Occurrence in Month"), selection: conditionValue(\.ordinal)) {
+                    ForEach(1...4, id: \.self) { Text(L10n.text("第 \($0) 個", "\(L10n.ordinal($0))")).tag($0) }
                 }
                 .labelsHidden()
                 weekdayPicker(selection: conditionValue(\.weekday)).labelsHidden()
             }
             if rule.period == .year, let preservedMonth = pattern.month,
                preservedMonth != gregorianCalendar.component(.month, from: rule.start) {
-                Text("此規則保留原先指定的 \(preservedMonth) 月。")
+                Text(L10n.text("此規則保留原先指定的 \(preservedMonth) 月。", "This rule keeps its original month: \(preservedMonth)."))
                     .font(.footnote).foregroundStyle(.secondary)
             }
         }
     }
 
     private func weekdayPicker(selection: Binding<Int>) -> some View {
-        Picker("星期幾", selection: selection) {
+        Picker(L10n.text("星期幾", "Weekday"), selection: selection) {
             ForEach(1...7, id: \.self) { Text(weekdayName($0)).tag($0) }
         }
     }
 
     private func weekdayName(_ number: Int) -> String {
+        if L10n.isEnglish {
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.locale = L10n.locale
+            return (1...7).contains(number) ? calendar.weekdaySymbols[number - 1] : "Weekday"
+        }
         let names = ["日", "一", "二", "三", "四", "五", "六"]
         return (1...7).contains(number) ? "星期\(names[number - 1])" : "星期幾"
     }
 
     private var weekdaySummary: String? {
+        if L10n.isEnglish { return rule.period == .week || rule.weekdayPattern != nil ? rule.recurrenceCaption : nil }
         let interval = rule.interval == 1 ? "每\(rule.period.rawValue)" : "每 \(rule.interval) \(rule.period.rawValue)"
         if rule.period == .week {
             let weekday = weekdayName(rule.weeklyWeekday ?? gregorianCalendar.component(.weekday, from: rule.start))
@@ -1988,9 +2063,9 @@ private struct RuleEditor: View {
         do {
             let next = try RuleEngine.plan(root: root, rules: [root])
                 .first(where: { $0.start >= today })?.start
-            return next.map { dateCaption($0) } ?? "期間內沒有下次日期"
+            return next.map { dateCaption($0) } ?? L10n.text("期間內沒有下次日期", "No upcoming date in this period")
         } catch {
-            return "無法換算"
+            return L10n.text("無法換算", "Cannot Calculate")
         }
     }
 
@@ -2007,26 +2082,54 @@ private struct RuleEditor: View {
         }
     }
 
+    private var cutoffSchedule: Rule {
+        var input = rule
+        // Names and appearance do not affect the date result. Keep typing from recalculating it.
+        input.name = ""
+        input.category = ""
+        input.subcategory = ""
+        input.appearance = nil
+        input.target = ""
+        return input
+    }
+
     private var cutoff: some View {
         Section {
-            Picker("截止方式", selection: $rule.endMode) {
+            Picker(L10n.text("截止方式", "End Condition"), selection: $rule.endMode) {
                 ForEach(EndMode.allCases) { Text($0.displayLabel).tag($0) }
             }
             if rule.endMode == .duration {
-                Picker("重複期間單位", selection: $rule.endUnit) {
-                    ForEach(PeriodUnit.allCases.filter { $0 != .week }) { Text($0.rawValue).tag($0) }
+                Picker(L10n.text("重複期間單位", "Repeat Period Unit"), selection: $rule.endUnit) {
+                    ForEach(PeriodUnit.allCases.filter { $0 != .week }) { Text($0.displayLabel()).tag($0) }
                 }
-                Stepper("重複期間：\(rule.endCount) \(rule.endUnit.rawValue)", value: $rule.endCount, in: 1...999)
+                Stepper(L10n.text("重複期間：\(rule.endCount) \(rule.endUnit.rawValue)", "Repeat period: \(rule.endCount) \(rule.endUnit.displayLabel(count: rule.endCount))"), value: $rule.endCount, in: 1...999)
                 if let date = try? RuleEngine.cutoff(for: rule) {
-                    LabeledContent("換算截止日", value: dateCaption(date, calendar: ruleCalendar))
+                    LabeledContent(L10n.text("換算截止日", "Calculated End Date"), value: dateCaption(date, calendar: ruleCalendar))
                 } else {
-                    LabeledContent("換算截止日", value: "無法換算")
+                    LabeledContent(L10n.text("換算截止日", "Calculated End Date"), value: L10n.text("無法換算", "Cannot Calculate"))
                 }
             } else {
-                RuleDateField(title: "截止日期", selection: $rule.endDate, civilCalendar: ruleCalendar)
+                RuleDateField(title: L10n.text("截止日期", "End Date"), selection: $rule.endDate, civilCalendar: ruleCalendar)
             }
-        } header: { Text("規則截止") }
-          footer: { Text("截止包含指定日期當天。") }
+        } header: { Text(L10n.text("規則截止", "Rule End")) }
+          footer: {
+              VStack(alignment: .leading, spacing: 4) {
+                  Text(L10n.text("截止包含指定日期當天。", "The end date is included."))
+                  if emptyCutoffSchedule == cutoffSchedule {
+                      Text(L10n.text("這段期間內沒有事件，請調整起始日、週期或截止日。",
+                                     "No events fall in this period. Adjust the start date, recurrence, or end date."))
+                          .foregroundStyle(requiredFieldTint)
+                          .accessibilityIdentifier("rule-cutoff-no-events")
+                  }
+              }
+          }
+        .task(id: cutoffSchedule) {
+            let input = cutoffSchedule
+            guard !Task.isCancelled else { return }
+            let isEmpty = (try? RuleEngine.plan(root: input, rules: [input]).isEmpty) == true
+            guard !Task.isCancelled else { return }
+            emptyCutoffSchedule = isEmpty ? input : nil
+        }
     }
 
     private var hoursLabel: String {
@@ -2041,64 +2144,75 @@ struct RuleEventPreviewResult {
 }
 
 private struct EventPreview: View {
+    let rule: Rule
     let civilCalendar: Calendar
-    let load: () throws -> RuleEventPreviewResult
-    @State private var events: [CalendarPreviewEvent]?
-    @State private var warning: String?
-    @State private var failure: String?
+    let load: (Rule) throws -> RuleEventPreviewResult
+    @State private var expanded = false
+    @State private var loadedRule: Rule?
+    @State private var result: Result<RuleEventPreviewResult, Error>?
 
     var body: some View {
-        List {
-            Section {
-                if let failure {
-                    Label(failure, systemImage: "exclamationmark.circle")
-                        .foregroundStyle(.secondary)
-                    Button("重新整理", action: refresh)
-                } else if let events {
-                    if let warning {
-                        Label(warning, systemImage: "exclamationmark.circle")
-                            .font(.footnote)
+        Section {
+            DisclosureGroup(isExpanded: $expanded) {
+                if loadedRule == rule, let result {
+                    switch result {
+                    case .failure(let error):
+                        Label(error.localizedDescription, systemImage: "exclamationmark.circle")
                             .foregroundStyle(.secondary)
-                    }
-                    if events.isEmpty {
-                        Text("此規則沒有可預覽的事件")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(events) { event in eventRow(event) }
+                        Button(L10n.text("重新整理", "Refresh"), action: refresh)
+                    case .success(let preview):
+                        if let warning = preview.warning {
+                            Label(warning, systemImage: "exclamationmark.circle")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        if preview.events.isEmpty {
+                            Text(L10n.text("此規則沒有可預覽的事件", "There are no events to preview for this rule"))
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(preview.events) { event in
+                                eventRow(event)
+                            }
+                        }
                     }
                 } else {
-                    ProgressView("正在讀取事件…")
+                    ProgressView(L10n.text("正在讀取事件…", "Loading events…"))
                 }
-            } footer: {
-                Text("這裡列出本規則已寫入行事曆的事件，以及尚未套用的變更。按「套用」後才會更新行事曆。")
+            } label: {
+                Label(L10n.text("預覽事件", "Preview Events"), systemImage: "list.bullet.rectangle")
+            }
+            .accessibilityIdentifier("preview-events")
+        } footer: {
+            if expanded {
+                Text(L10n.text("這裡列出本規則已寫入行事曆的事件，以及尚未套用的變更。按「套用」後才會更新行事曆。", "This preview shows events already in your calendar and changes not yet applied. Your calendar is updated only when you tap Apply."))
             }
         }
-        .navigationTitle("預覽事件")
-        .navigationBarTitleDisplayMode(.inline)
-        .task { refresh() }
+        .onChange(of: expanded) { _, open in
+            if open, loadedRule != rule { refresh() }
+        }
+        .onChange(of: rule) { _, _ in
+            loadedRule = nil
+            result = nil
+            if expanded { refresh() }
+        }
     }
 
     private func refresh() {
-        do {
-            let result = try load()
-            events = result.events.sorted {
-                ($0.start, $0.id) < ($1.start, $1.id)
-            }
-            warning = result.warning
-            failure = nil
-        } catch {
-            events = nil
-            warning = nil
-            failure = error.localizedDescription
+        let submitted = rule
+        result = Result {
+            let preview = try load(submitted)
+            let events = preview.events.sorted { ($0.start, $0.id) < ($1.start, $1.id) }
+            return RuleEventPreviewResult(events: events, warning: preview.warning)
         }
+        loadedRule = submitted
     }
 
     private func eventRow(_ event: CalendarPreviewEvent) -> some View {
         let status: (label: String, color: Color)? = switch event.kind {
         case .unchanged: nil
-        case .insert: ("將新增", readableTint(light: 0x456B52, dark: 0x91AA98))
-        case .update: ("將修改", readableTint(light: 0x536780, dark: 0x98A9BF))
-        case .remove: ("將移除", requiredFieldTint)
+        case .insert: (L10n.text("將新增", "To Add"), readableTint(light: 0x456B52, dark: 0x91AA98))
+        case .update: (L10n.text("將修改", "To Update"), readableTint(light: 0x536780, dark: 0x98A9BF))
+        case .remove: (L10n.text("將移除", "To Remove"), requiredFieldTint)
         }
         let revisedTime: Bool
         if case .update = event.kind, let oldStart = event.previousStart {
@@ -2110,11 +2224,11 @@ private struct EventPreview: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(event.title).font(.subheadline.weight(.semibold))
                 if revisedTime, let oldStart = event.previousStart {
-                    Text("原：\(eventTime(start: oldStart, end: event.previousEnd ?? oldStart, allDay: event.previousIsAllDay ?? event.isAllDay))")
+                    Text(L10n.text("原：\(eventTime(start: oldStart, end: event.previousEnd ?? oldStart, allDay: event.previousIsAllDay ?? event.isAllDay))", "Before: \(eventTime(start: oldStart, end: event.previousEnd ?? oldStart, allDay: event.previousIsAllDay ?? event.isAllDay))"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Text("\(revisedTime ? "改為：" : "")\(eventTime(start: event.start, end: event.end, allDay: event.isAllDay))")
+                Text("\(revisedTime ? L10n.text("改為：", "After: ") : "")\(eventTime(start: event.start, end: event.end, allDay: event.isAllDay))")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -2137,12 +2251,12 @@ private struct EventPreview: View {
         let date = dateCaption(start, calendar: allDay ? gregorianCalendar : civilCalendar)
         if allDay {
             let lastDay = gregorianCalendar.date(byAdding: .day, value: -1, to: end) ?? end
-            return lastDay > start ? "\(date) 至 \(dateCaption(lastDay))" : date
+            return lastDay > start ? L10n.text("\(date) 至 \(dateCaption(lastDay))", "\(date) to \(dateCaption(lastDay))") : date
         }
         let startTime = timeCaption(start, calendar: civilCalendar)
         guard end > start else { return "\(date) \(startTime)" }
         let endDate = civilCalendar.isDate(start, inSameDayAs: end) ? "" : "\(dateCaption(end, calendar: civilCalendar)) "
-        return "\(date) \(startTime) 至 \(endDate)\(timeCaption(end, calendar: civilCalendar))"
+        return L10n.text("\(date) \(startTime) 至 \(endDate)\(timeCaption(end, calendar: civilCalendar))", "\(date) \(startTime) to \(endDate)\(timeCaption(end, calendar: civilCalendar))")
     }
 }
 
@@ -2169,7 +2283,7 @@ struct CalendarDestinationField: View {
             let writable = destinations.filter(\.isWritable)
             let readOnly = destinations.filter { !$0.isWritable }
             if !writable.isEmpty {
-                Section("可寫入") {
+                Section(L10n.text("可寫入", "Writable")) {
                     ForEach(writable) { destination in
                         Button { select(destination.id) } label: {
                             if destination.id == selectedID {
@@ -2182,7 +2296,7 @@ struct CalendarDestinationField: View {
                 }
             }
             if !readOnly.isEmpty {
-                Section("唯讀，不能選擇") {
+                Section(L10n.text("唯讀，不能選擇", "Read-Only (Unavailable)")) {
                     ForEach(readOnly) { destination in
                         Button { } label: { Text(destination.displayTitle) }
                             .disabled(true)
@@ -2214,6 +2328,12 @@ private struct CalStitchSettingsView: View {
         overrideIdentifier.isEmpty ? TimeZone.autoupdatingCurrent.identifier : overrideIdentifier
     }
 
+    private func documentationURL(_ page: String) -> URL {
+        let base = URL(string: "https://peiyu66.github.io/CalStitch/")!
+        let language = L10n.isEnglish ? base.appendingPathComponent("en", isDirectory: true) : base
+        return language.appendingPathComponent(page)
+    }
+
     var body: some View {
         Form {
             Section {
@@ -2221,12 +2341,12 @@ private struct CalStitchSettingsView: View {
                     TimeZoneOptionsView(overrideIdentifier: $overrideIdentifier)
                 } label: {
                     HStack(alignment: .firstTextBaseline, spacing: 12) {
-                        Text("預設時區")
+                        Text(L10n.text("預設時區", "Default Time Zone"))
                         Spacer(minLength: 0)
                         VStack(alignment: .trailing, spacing: 3) {
                             Text(currentIdentifier)
                             if overrideIdentifier.isEmpty {
-                                Text("使用本機時區").font(.caption).foregroundStyle(.secondary)
+                                Text(L10n.text("使用本機時區", "Use Device Time Zone")).font(.caption).foregroundStyle(.secondary)
                             }
                         }
                         .multilineTextAlignment(.trailing)
@@ -2234,25 +2354,21 @@ private struct CalStitchSettingsView: View {
                 }
                 .accessibilityIdentifier("default-time-zone")
             } footer: {
-                Text("適用於新建的節氣規則，不會變更既有規則。")
+                Text(L10n.text("適用於新建的節氣規則，不會變更既有規則。", "Applies to new solar term rules. Existing rules are not changed."))
             }
 
             Section {
-                NavigationLink("隱私權聲明") {
-                    Form {
-                        Section {
-                            Text("正式隱私權聲明尚未定稿，此頁為預留位置。")
-                        } header: {
-                            Text("草稿")
-                        }
-                    }
-                    .navigationTitle("隱私權聲明")
-                    .navigationBarTitleDisplayMode(.inline)
+                Link(destination: documentationURL("privacy.html")) {
+                    Label(L10n.text("隱私權聲明", "Privacy Policy"), systemImage: "hand.raised")
                 }
                 .accessibilityIdentifier("privacy-statement")
+                Link(destination: documentationURL("support.html")) {
+                    Label(L10n.text("支援", "Support"), systemImage: "questionmark.circle")
+                }
+                .accessibilityIdentifier("support")
             }
         }
-        .navigationTitle("設定")
+        .navigationTitle(L10n.text("設定", "Settings"))
         .navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -2301,26 +2417,113 @@ private struct TimeZoneOptionsView: View {
         }
     }
 
+    private var sections: [String: [Option]] {
+        Dictionary(grouping: options) { item in
+            String((item.area.isEmpty ? item.id : item.area).prefix(1)).uppercased()
+        }
+    }
+
     var body: some View {
-        List {
-            Section {
-                option("使用本機時區", detail: TimeZone.autoupdatingCurrent.identifier,
-                       identifier: "")
-            }
-            Section("時區") {
-                let matches = options
-                if matches.isEmpty {
-                    Text("找不到符合的時區").foregroundStyle(.secondary)
-                } else {
-                    ForEach(matches) { item in
-                        option(item.id, detail: item.region, identifier: item.id)
+        ScrollViewReader { proxy in
+            let groups = sections
+            let letters = groups.keys.sorted()
+            VStack(spacing: 0) {
+                List {
+                    Section {
+                        option(L10n.text("使用本機時區", "Use Device Time Zone"), detail: TimeZone.autoupdatingCurrent.identifier,
+                               identifier: "")
+                    }
+                    if letters.isEmpty {
+                        Text(L10n.text("找不到符合的時區", "No Matching Time Zones")).foregroundStyle(.secondary)
+                    }
+                    ForEach(letters, id: \.self) { letter in
+                        Section {
+                            ForEach(groups[letter] ?? []) { item in
+                                option(item.id, detail: item.region, identifier: item.id)
+                                    .padding(.trailing, 23)
+                                    .id(item.id)
+                            }
+                        } header: {
+                            Text(letter)
+                        }
                     }
                 }
+                .scrollDismissesKeyboard(.interactively)
+                .overlay(alignment: .trailing) {
+                    if !letters.isEmpty {
+                        ViewThatFits(in: .vertical) {
+                            indexButtons(letters, groups: groups, proxy: proxy)
+                            ScrollView(.vertical) { indexButtons(letters, groups: groups, proxy: proxy) }
+                        }
+                        .padding(.trailing, 5)
+                        .accessibilityIdentifier("time-zone-index")
+                    }
+                }
+                .clipped()
+                timeZoneSearchBar
             }
         }
-        .searchable(text: $query, prompt: "搜尋城市或時區")
-        .navigationTitle("預設時區")
+        .navigationTitle(L10n.text("預設時區", "Default Time Zone"))
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(Color(uiColor: .systemGroupedBackground), for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
+    }
+
+    private var timeZoneSearchBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.body.weight(.semibold))
+                .foregroundStyle(.primary)
+                .accessibilityHidden(true)
+            TextField(L10n.text("搜尋城市或時區", "Search cities or time zones"), text: $query)
+                .textFieldStyle(.plain)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .submitLabel(.search)
+                .accessibilityIdentifier("time-zone-search")
+            if !query.isEmpty {
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(L10n.text("清除搜尋", "Clear Search"))
+            }
+        }
+        .font(.body)
+        .padding(.leading, 15)
+        .padding(.trailing, query.isEmpty ? 15 : 4)
+        .frame(minHeight: 46)
+        .background(.regularMaterial, in: Capsule())
+        .overlay {
+            Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+                .allowsHitTesting(false)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 8)
+        .background(Color(uiColor: .systemGroupedBackground))
+    }
+
+    private func indexButtons(_ letters: [String], groups: [String: [Option]], proxy: ScrollViewProxy) -> some View {
+        VStack(spacing: 0) {
+            ForEach(letters, id: \.self) { letter in
+                Button {
+                    if let first = groups[letter]?.first { proxy.scrollTo(first.id, anchor: .top) }
+                } label: {
+                    Text(letter)
+                        .font(.caption2.weight(.semibold))
+                        .frame(width: 26, height: 23)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.accentColor)
+                .accessibilityLabel(L10n.text("跳到 \(letter)", "Jump to \(letter)"))
+            }
+        }
+        .padding(.vertical, 4)
+        .background(.thinMaterial, in: Capsule())
     }
 
     private func option(_ name: String, detail: String?, identifier: String) -> some View {
@@ -2346,6 +2549,16 @@ private struct TimeZoneOptionsView: View {
     }
 }
 
+struct SelectionMark: View {
+    let isSelected: Bool
+
+    var body: some View {
+        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+            .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+            .accessibilityHidden(true)
+    }
+}
+
 private struct OrphanCleanupView: View {
     @ObservedObject var calendar: CalendarIntegration
     let existingRuleIDs: () -> Set<UUID>
@@ -2365,15 +2578,15 @@ private struct OrphanCleanupView: View {
         NavigationStack {
             List {
                 Section {
-                    Text("只顯示有 CalStitch 標記，但在這台裝置找不到原規則的事件。若事件來自另一台裝置，請先確認不再需要。")
+                    Text(L10n.text("只顯示有 CalStitch 標記，但在這台裝置找不到原規則的事件。若事件來自另一台裝置，請先確認不再需要。", "Only events tagged by CalStitch that have no matching rule on this device are shown. If an event came from another device, make sure it is no longer needed."))
                         .font(.footnote)
                     if let preview {
-                        Text("搜尋範圍：\(dateCaption(preview.start)) 至 \(dateCaption(preview.through))")
+                        Text(L10n.text("搜尋範圍：\(dateCaption(preview.start)) 至 \(dateCaption(preview.through))", "Search range: \(dateCaption(preview.start)) to \(dateCaption(preview.through))"))
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
                     if let removedCount {
-                        Text("已刪除 \(removedCount) 筆事件")
+                        Text(L10n.text("已刪除 \(removedCount) 筆事件", "Deleted \(removedCount) \(removedCount == 1 ? "event" : "events")"))
                     }
                     if let failure {
                         Text(failure).foregroundStyle(.red)
@@ -2389,39 +2602,40 @@ private struct OrphanCleanupView: View {
                                 } catch { failure = error.localizedDescription }
                             }
                         } label: {
-                            if connecting { ProgressView("正在連接行事曆…") }
-                            else { Label("連接行事曆", systemImage: "calendar.badge.plus") }
+                            if connecting { ProgressView(L10n.text("正在連接行事曆…", "Connecting to Calendar…")) }
+                            else { Label(L10n.text("連接行事曆", "Connect Calendar"), systemImage: "calendar.badge.plus") }
                         }
                         .disabled(connecting)
-                    } else {
-                        Button("重新搜尋", action: refresh)
+                    } else if failure != nil {
+                        Button(L10n.text("重試", "Retry"), action: refresh)
                     }
                 }
                 if let preview {
-                    eventSection("已過去", events: preview.events.filter(\.isPast))
-                    eventSection("未到來", events: preview.events.filter { !$0.isPast })
+                    eventSection(L10n.text("已過去", "Past"), events: preview.events.filter(\.isPast))
+                    eventSection(L10n.text("未到來", "Upcoming"), events: preview.events.filter { !$0.isPast })
                 }
             }
-            .navigationTitle("清除遺留事件")
+            .navigationTitle(L10n.text("清除遺留事件", "Clean Up Leftover Events"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("關閉") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) { Button(L10n.text("關閉", "Close")) { dismiss() } }
                 if !selected.isEmpty {
                     ToolbarItem(placement: .confirmationAction) {
                         Button(role: .destructive) { confirmation = true } label: {
-                            Text("刪除（\(selected.count)）").foregroundStyle(.red)
+                            Text(L10n.text("刪除（\(selected.count)）", "Delete (\(selected.count))")).foregroundStyle(.red)
                         }
                         .accessibilityIdentifier("delete-orphan-events")
                     }
                 }
             }
             .task { if calendar.hasFullAccess { refresh() } }
-            .alert("刪除 \(selected.count) 筆遺留事件？", isPresented: $confirmation) {
-                Button("取消", role: .cancel) {}
-                Button("刪除", role: .destructive, action: removeSelected)
+            .refreshable { if calendar.hasFullAccess { refresh() } }
+            .alert(L10n.text("刪除 \(selected.count) 筆遺留事件？", "Delete \(selected.count) leftover \(selected.count == 1 ? "event" : "events")?"), isPresented: $confirmation) {
+                Button(L10n.text("取消", "Cancel"), role: .cancel) {}
+                Button(L10n.text("刪除", "Delete"), role: .destructive, action: removeSelected)
             } message: {
-                let names = Set(selected.map(\.calendarTitle)).sorted().joined(separator: "、")
-                Text("將從「\(names)」刪除勾選的事件，不會刪除規則。")
+                let names = Set(selected.map(\.calendarTitle)).sorted().joined(separator: L10n.text("、", ", "))
+                Text(L10n.text("將從「\(names)」刪除勾選的事件，不會刪除規則。", "The selected events will be deleted from \(names). Rules will not be deleted."))
             }
         }
     }
@@ -2431,22 +2645,28 @@ private struct OrphanCleanupView: View {
         let allSelected = !ids.isEmpty && ids.isSubset(of: selection)
         return Section {
             if events.isEmpty {
-                Text("沒有符合的事件").foregroundStyle(.secondary)
+                Text(L10n.text("沒有符合的事件", "No Matching Events")).foregroundStyle(.secondary)
             } else {
-                Button(allSelected ? "取消全選" : "全選") {
+                Button {
                     if allSelected { selection.subtract(ids) }
                     else { selection.formUnion(ids) }
+                } label: {
+                    HStack(spacing: 12) {
+                        SelectionMark(isSelected: allSelected)
+                        Text(L10n.text("全選", "Select All"))
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
                 }
-                .accessibilityLabel(allSelected ? "取消全選\(title)" : "全選\(title)")
+                .accessibilityAddTraits(allSelected ? [.isSelected] : [])
+                .accessibilityLabel(allSelected ? L10n.text("取消全選\(title)", "Deselect all in \(title)") : L10n.text("全選\(title)", "Select all in \(title)"))
                 ForEach(events) { event in
                     let checked = selection.contains(event.id)
                     Button {
                         if !selection.insert(event.id).inserted { selection.remove(event.id) }
                     } label: {
                         HStack(spacing: 12) {
-                            Image(systemName: checked ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(checked ? Color.accentColor : Color.secondary)
-                                .accessibilityHidden(true)
+                            SelectionMark(isSelected: checked)
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(event.title).foregroundStyle(.primary)
                                 Text(event.isAllDay ? dateCaption(event.start)

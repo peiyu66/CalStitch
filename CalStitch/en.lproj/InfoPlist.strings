@@ -1,0 +1,2 @@
+"NSContactsUsageDescription" = "CalStitch reads contact groups so you can choose a group and import birthdays. Selecting people individually does not require access to all contacts.";
+"NSCalendarsFullAccessUsageDescription" = "CalStitch needs to read back the events it creates so it can preview, update, or remove future events and avoid duplicates.";
