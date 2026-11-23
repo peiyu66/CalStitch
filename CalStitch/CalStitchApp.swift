@@ -1177,29 +1177,31 @@ private struct RulesHome: View {
                 .frame(width: 34, height: 34)
                 .background(rule.displayAppearance.tint(or: slate).opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 4) {
-                let title = Text(rule.name).font(.subheadline.weight(.semibold))
-                let next = snapshot.occurrences.lazy.filter { $0.ruleID == rule.id && $0.start > Date() }.min { $0.start < $1.start }
-                let status = rule.hasApplied
-                    ? next.map { "下次 " + dateCaption($0.start, calendar: $0.isAllDay ? gregorianCalendar : RuleEngine.civilCalendar(for: rule)) } ?? "無後續日期"
-                    : "未套用"
-                ViewThatFits(in: .horizontal) {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        title.fixedSize(horizontal: true, vertical: false)
-                        Spacer(minLength: 0)
-                        Text(status)
-                            .font(.caption2.weight(.medium))
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-                    title
+            let next = snapshot.occurrences.lazy.filter { $0.ruleID == rule.id && $0.start > Date() }.min { $0.start < $1.start }
+            let status = rule.hasApplied
+                ? next.map { "下次 " + dateCaption($0.start, calendar: $0.isAllDay ? gregorianCalendar : RuleEngine.civilCalendar(for: rule)) } ?? "無後續日期"
+                : "未套用"
+            let layout = dynamicTypeSize.isAccessibilitySize
+                ? AnyLayout(VStackLayout(alignment: .leading, spacing: 6))
+                : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: 10))
+            layout {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(rule.displayName)
+                        .font(.subheadline.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(status)
+                        .font(.caption2.weight(.medium))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-
+                if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 0) }
                 Text(rule.recurrenceCaption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.trailing)
                     .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: dynamicTypeSize.isAccessibilitySize ? .infinity : nil, alignment: .trailing)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             Image(systemName: "chevron.right")

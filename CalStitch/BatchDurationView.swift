@@ -23,7 +23,10 @@ struct BatchDurationReviewSections: View {
     let review: BatchDurationPreview
 
     var body: some View {
-        Section("新的截止日") {
+        Group {
+            Text("新的截止日")
+                .font(.subheadline.weight(.semibold))
+                .accessibilityAddTraits(.isHeader)
             ForEach(review.rules) { rule in
                 LabeledContent {
                     Text(dateCaption(rule.cutoff)).monospacedDigit()
@@ -36,8 +39,9 @@ struct BatchDurationReviewSections: View {
                     }
                 }
             }
-        }
-        Section("行事曆變更") {
+            Text("行事曆變更")
+                .font(.subheadline.weight(.semibold))
+                .accessibilityAddTraits(.isHeader)
             if review.changes.isEmpty {
                 Text("沒有需要變更的行程").foregroundStyle(.secondary)
             } else {

@@ -250,11 +250,7 @@ struct BirthdayImportView: View {
                 }
 
                 Section("匯入方式") {
-                    if dynamicTypeSize.isAccessibilitySize {
-                        importModePicker.pickerStyle(.menu)
-                    } else {
-                        importModePicker.pickerStyle(.segmented)
-                    }
+                    importModePicker
                     birthdayCalendarFields
                     if mode == .draft {
                         Text("會保存目的行事曆，但現在只建立草稿，不寫入事件。")
@@ -332,12 +328,48 @@ struct BirthdayImportView: View {
     }
 
     private var importModePicker: some View {
-        Picker("匯入方式", selection: $mode) {
+        let layout = dynamicTypeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(spacing: 3))
+            : AnyLayout(HStackLayout(spacing: 3))
+        return layout {
             ForEach(ImportMode.allCases, id: \.self) { option in
-                Text(option.rawValue).tag(option)
+                importModeButton(option)
             }
         }
+        .padding(3)
+        .background(Color(uiColor: .quaternarySystemFill), in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("birthday-import-mode")
+    }
+
+    private func importModeButton(_ option: ImportMode) -> some View {
+        let isSelected = mode == option
+        let shape = RoundedRectangle(cornerRadius: 9)
+        return Button {
+            mode = option
+        } label: {
+            Text(option.rawValue)
+                .font(.body.weight(isSelected ? .semibold : .regular))
+                .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .background {
+                    if isSelected {
+                        shape.fill(Color(uiColor: .systemBackground))
+                            .overlay {
+                                if option == .draft {
+                                    shape.fill(Color(red: 0.38, green: 0.50, blue: 0.64).opacity(0.18))
+                                }
+                            }
+                            .shadow(color: .black.opacity(0.12), radius: 1, y: 1)
+                    }
+                }
+                .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
     private func performImport() {
@@ -563,7 +595,7 @@ struct BirthdayGroupImportView: View {
                         case .loading:
                             ProgressView("讀取中…")
                         case .settings:
-                            Text("群組匯入需要完整的通訊錄存取權限，請到設定變更權限。")
+                            Text("群組匯入需要通訊錄的「完整取用權限」，請到「設定」變更權限。")
                             Button("開啟設定", action: openSettings)
                             if settingsOpenFailed {
                                 Text("無法開啟設定，請手動到設定變更權限。")

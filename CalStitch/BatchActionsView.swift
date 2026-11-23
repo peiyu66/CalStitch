@@ -44,13 +44,22 @@ struct BatchActionsView: View {
     @State private var changeDuration = false
     @State private var category = ""
     @State private var subcategory = ""
-    @State private var years = 1
-    @State private var review: BatchDurationPreview?
-    @State private var removal: BatchRemovalPreview?
-    @State private var removalSelection: Set<UUID> = []
+    @State private var years = 5
+    @State private var removalMode = false
+    @State private var previewExpanded = false
+    @State private var cachedReview: CachedReview?
     @State private var confirmation: Confirmation?
-    private enum Confirmation { case apply, removal }
     @State private var failure: String?
+
+    private enum Confirmation {
+        case apply(BatchEdit)
+        case removal(BatchRemovalPreview, Set<UUID>)
+    }
+
+    private struct CachedReview {
+        let edit: BatchEdit
+        let result: Result<BatchDurationPreview, Error>
+    }
 
     init(rules: [BatchRuleOption], initiallySelected: Set<UUID>, categories: [BatchCategoryOption],
          preview: @escaping (BatchEdit) throws -> BatchDurationPreview, apply: @escaping (BatchEdit) throws -> Void,
@@ -71,7 +80,7 @@ struct BatchActionsView: View {
     }
 
     private var edit: BatchEdit? {
-        guard !selection.isEmpty, changeClassification || changeDuration,
+        guard !removalMode, !selection.isEmpty, changeClassification || changeDuration,
               !changeClassification || !categoryName.isEmpty else { return nil }
         return BatchEdit(ruleIDs: selection,
                          classification: changeClassification
@@ -92,11 +101,42 @@ struct BatchActionsView: View {
         .init(get: { confirmation != nil }, set: { if !$0 { confirmation = nil } })
     }
 
+    private var currentReview: CachedReview? {
+        guard let edit, cachedReview?.edit == edit else { return nil }
+        return cachedReview
+    }
+
+    private var canApply: Bool {
+        if removalMode { return !selection.isEmpty }
+        guard let edit else { return false }
+        if edit.durationYears == nil { return true }
+        guard case .success? = currentReview?.result else { return false }
+        return true
+    }
+
+    private var removalModeBinding: Binding<Bool> {
+        .init(get: { removalMode }, set: { enabled in
+            removalMode = enabled
+            if enabled {
+                changeClassification = false
+                changeDuration = false
+                previewExpanded = false
+                cachedReview = nil
+            }
+        })
+    }
+
+    private var confirmationTitle: String {
+        if case .removal = confirmation { return "確定整批移除？" }
+        return "套用至 \(selection.count) 條規則？"
+    }
+
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     Toggle("更改分類／次類", isOn: $changeClassification)
+                        .disabled(removalMode)
                         .accessibilityIdentifier("batch-edit-classification")
                     if changeClassification {
                         let layout = textSize.isAccessibilitySize
@@ -115,6 +155,7 @@ struct BatchActionsView: View {
                 }
                 Section {
                     Toggle("更改重複期間", isOn: $changeDuration)
+                        .disabled(removalMode)
                         .accessibilityIdentifier("batch-edit-duration")
                     if changeDuration {
                         Stepper("重複期間：\(years) 年", value: $years, in: 1...100)
@@ -126,12 +167,19 @@ struct BatchActionsView: View {
                     }
                 }
                 Section {
+                    Toggle("整批移除", isOn: removalModeBinding)
+                        .accessibilityIdentifier("batch-edit-removal")
+                } footer: {
+                    if removalMode {
+                        Text("按套用後會先確認，不會立即刪除。")
+                    }
+                }
+                Section {
                     if rules.isEmpty {
                         Text("沒有可選的規則").foregroundStyle(.secondary)
                     } else {
-                        Button(selection.count == rules.count ? "取消全選" : "全選") {
-                            selection = selection.count == rules.count ? [] : Set(rules.map(\.id))
-                        }
+                        selectionControl("全選", ids: Set(rules.map(\.id)))
+                            .accessibilityIdentifier("batch-select-all")
                         ForEach(categoryNames, id: \.self) { category in
                             let grouped = rules.filter { $0.category == category }
                             if !category.isEmpty {
@@ -149,23 +197,19 @@ struct BatchActionsView: View {
                 } header: {
                     Text("選擇規則（\(selection.count) 條）")
                 }
-                if let review, changeDuration {
-                    BatchDurationReviewSections(review: review)
-                }
                 if changeDuration {
                     Section {
-                        Button("預覽變更", action: prepare)
-                            .disabled(edit == nil)
+                        DisclosureGroup("預覽變更", isExpanded: $previewExpanded) {
+                            previewContent
+                        }
+                        .accessibilityIdentifier("batch-preview-disclosure")
                     }
                 }
-                Section {
-                    Button(role: .destructive, action: prepareRemoval) {
-                        Label("整批移除", systemImage: "trash")
+                if let failure {
+                    Section {
+                        Label(failure, systemImage: "exclamationmark.circle")
                             .foregroundStyle(.red)
                     }
-                    .disabled(selection.isEmpty)
-                } footer: {
-                    Text("移除是獨立操作，不會套用上面的調整；會移除已選規則、關聯子規則，以及它們建立且尚未開始的事件。")
                 }
             }
             .navigationTitle("批次調整")
@@ -175,56 +219,64 @@ struct BatchActionsView: View {
                     Button("取消") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("套用") { confirmation = .apply }
+                    Button("套用", action: beginConfirmation)
                         .fontWeight(.semibold)
-                        .disabled(edit == nil || (changeDuration && review == nil))
+                        .disabled(!canApply)
                         .accessibilityIdentifier("batch-apply")
                 }
             }
-            .onChange(of: edit) { _, _ in review = nil }
-            .confirmationDialog(confirmation == .removal ? "確定整批移除？" : "套用至 \(selection.count) 條規則？",
-                                isPresented: showingConfirmation, titleVisibility: .visible) {
-                if confirmation == .removal, let proposed = removal {
-                    Button("移除 \(proposed.ruleCount) 條規則", role: .destructive) { confirmRemoval(proposed) }
-                } else {
-                    Button("確認套用", action: commit)
+            .onChange(of: edit) { _, _ in
+                cachedReview = nil
+                failure = nil
+                if previewExpanded { preparePreview() }
+            }
+            .onChange(of: previewExpanded) { _, expanded in
+                if expanded { preparePreview() }
+            }
+            .alert(confirmationTitle, isPresented: showingConfirmation, presenting: confirmation) { presented in
+                switch presented {
+                case let .apply(request):
+                    Button("確認套用") { commit(request) }
+                case let .removal(review, selected):
+                    Button("移除", role: .destructive) { confirmRemoval(review, selected: selected) }
                 }
                 Button("取消", role: .cancel) {}
-            } message: {
-                if confirmation == .removal, let proposed = removal {
-                    Text("將移除 \(proposed.ruleCount) 條規則（含子規則）和 \(proposed.eventCount) 筆尚未開始的事件。已開始的事件會保留。")
-                } else {
-                    Text(applySummary)
+            } message: { presented in
+                switch presented {
+                case let .apply(request):
+                    Text(applySummary(request))
+                case let .removal(review, _):
+                    Text("將移除 \(review.ruleCount) 條規則（含子規則）和 \(review.eventCount) 筆尚未開始的事件。已開始的事件會保留。")
                 }
             }
-            .alert("無法完成操作", isPresented: Binding(
-                get: { failure != nil }, set: { if !$0 { failure = nil } }
-            )) {
-                Button("好", role: .cancel) { failure = nil }
-            } message: { Text(failure ?? "") }
         }
     }
 
     private func groupSelection(_ label: String, rules: [BatchRuleOption], isSubcategory: Bool) -> some View {
-        let ids = Set(rules.map(\.id))
+        selectionControl(label, ids: Set(rules.map(\.id)), isSubcategory: isSubcategory,
+                         icon: isSubcategory ? "folder" : "folder.fill")
+            .accessibilityLabel("選擇\(isSubcategory ? "次類" : "分類")「\(label)」")
+    }
+
+    private func selectionControl(_ label: String, ids: Set<UUID>, isSubcategory: Bool = false,
+                                  icon: String? = nil) -> some View {
         let selectedCount = ids.intersection(selection).count
+        let checked = selectedCount == ids.count
         return Button {
-            if selectedCount == ids.count {
-                selection.subtract(ids)
-            } else {
-                selection.formUnion(ids)
-            }
+            if checked { selection.subtract(ids) }
+            else { selection.formUnion(ids) }
         } label: {
             HStack {
-                Image(systemName: isSubcategory ? "folder" : "folder.fill")
+                if let icon { Image(systemName: icon) }
                 Text(label).fontWeight(isSubcategory ? .regular : .semibold)
                 Spacer()
                 Text("\(selectedCount)／\(ids.count)").foregroundStyle(.secondary)
-                Image(systemName: selectedCount == ids.count ? "checkmark.square.fill" : "square")
+                Image(systemName: checked ? "checkmark.square.fill" : "square")
+                    .accessibilityHidden(true)
             }
             .padding(.leading, isSubcategory ? 16 : 0)
         }
-        .accessibilityLabel("選擇\(isSubcategory ? "次類" : "分類")「\(label)」")
+        .accessibilityAddTraits(checked ? [.isSelected] : [])
         .accessibilityValue("已選 \(selectedCount) 筆，共 \(ids.count) 筆")
     }
 
@@ -241,8 +293,7 @@ struct BatchActionsView: View {
         .accessibilityIdentifier("batch-rule-option-\(rule.id.uuidString)")
     }
 
-    private var applySummary: String {
-        guard let edit else { return "" }
+    private func applySummary(_ edit: BatchEdit) -> String {
         var lines: [String] = []
         if let classification = edit.classification {
             let path = classification.subcategory.isEmpty
@@ -261,24 +312,56 @@ struct BatchActionsView: View {
         })
     }
 
-    private func prepare() {
-        guard let edit else { return }
-        do {
-            review = try preview(edit)
-        } catch {
-            review = nil
-            failure = error.localizedDescription
+    @ViewBuilder
+    private var previewContent: some View {
+        if let review = currentReview {
+            switch review.result {
+            case let .success(prepared):
+                BatchDurationReviewSections(review: prepared)
+            case let .failure(error):
+                Label(error.localizedDescription, systemImage: "exclamationmark.circle")
+                    .foregroundStyle(.secondary)
+                Button("重試") { preparePreview(force: true) }
+            }
+        } else if edit == nil {
+            Text("請先選擇規則並填妥必要欄位。").foregroundStyle(.secondary)
+        } else {
+            Button("重試") { preparePreview(force: true) }
         }
     }
 
-    private func commit() {
-        guard let edit else { return }
+    private func preparePreview(force: Bool = false) {
+        guard let edit, edit.durationYears != nil, force || currentReview == nil else { return }
+        cachedReview = CachedReview(edit: edit, result: Result { try preview(edit) })
+    }
+
+    private func beginConfirmation() {
+        guard canApply else { return }
+        failure = nil
+        if removalMode {
+            let selected = selection
+            do {
+                confirmation = .removal(try removalPreview(selected), selected)
+            } catch {
+                failure = error.localizedDescription
+            }
+        } else if let edit {
+            confirmation = .apply(edit)
+        }
+    }
+
+    private func commit(_ request: BatchEdit) {
+        guard let edit, edit == request else {
+            failure = "調整條件已變更，請重新確認。"
+            return
+        }
         do {
             if edit.durationYears != nil {
-                guard let confirmed = review else { return }
+                guard case let .success(confirmed)? = currentReview?.result else { return }
                 let current = try preview(edit)
                 guard confirmed.matches(current) else {
-                    review = current
+                    cachedReview = CachedReview(edit: edit, result: .success(current))
+                    previewExpanded = true
                     failure = "行事曆內容已變更，請重新確認下面的預覽。"
                     return
                 }
@@ -286,30 +369,19 @@ struct BatchActionsView: View {
             try apply(edit)
             dismiss()
         } catch {
-            review = nil
+            cachedReview = nil
             failure = error.localizedDescription
         }
     }
 
-    private func prepareRemoval() {
-        let selected = selection
+    private func confirmRemoval(_ proposed: BatchRemovalPreview, selected: Set<UUID>) {
         do {
-            removal = try removalPreview(selected)
-            removalSelection = selected
-            confirmation = .removal
-        } catch {
-            failure = error.localizedDescription
-        }
-    }
-
-    private func confirmRemoval(_ proposed: BatchRemovalPreview) {
-        do {
-            guard removalSelection == selection,
-                  try removalPreview(removalSelection) == proposed else {
-                failure = "受影響的資料已變更，請重新選擇「整批移除」再確認。"
+            guard removalMode, selected == selection,
+                  try removalPreview(selected) == proposed else {
+                failure = "受影響的資料已變更，請重新按「套用」再確認。"
                 return
             }
-            try remove(removalSelection)
+            try remove(selected)
             dismiss()
         } catch {
             failure = error.localizedDescription
