@@ -20,7 +20,7 @@ CalStitch 是 iPhone 上的**行事曆規則工具**。使用者在 CalStitch �
 - 目前正式版基準為 [1.0 (15)](development/version-history.md#build-15)。與 iPhone Air 上最後核對的 [0.1 (14)](development/version-history.md#build-14) 是同一套程式，只改版號。
 - 開發與試用回饋已全數結案。已實作而未再收到回饋的項目，依使用者確認視為沒有新問題，不保留為開發待辦。
 - GitHub Pages 提供中英文產品文件，App 支援中文及英文。
-- 1.0 (15) 已上傳 App Store Connect，尚未送審或在 App Store 上架。上架行政及合規流程另見[上架文件草稿](CalStitch-上架文件草稿.md)，不列入開發待辦。
+- App Store Connect 的 1.0 草稿已選入相同功能的合規建置 [1.0 (16)](development/version-history.md#build-16)，尚未送審或在 App Store 上架。上架行政及合規流程另見[上架文件草稿](CalStitch-上架文件草稿.md)，不列入開發待辦。
 
 ## 3. 驗收結案
 

@@ -1,6 +1,6 @@
 # CalStitch 上架文件草稿
 
-上架準備紀錄。正式版基準為 1.0（15），與 0.1（14）功能相同。開發工作已結案；本文件另列 App Store 的行政及合規流程。
+上架準備紀錄。1.0（15）是正式功能基準；1.0（16）沿用相同功能，只補封存的隱私與加密合規設定。
 
 ## 一、隱私權聲明（公開頁面文案）
 
@@ -120,17 +120,17 @@ No account or sign-in is required. To test the main flow, open CalStitch, tap +,
 
 ## 四、送審前核對（內部，不發布）
 
-- App Store Connect：CalStitch，Apple ID：6838189548，iOS 1.0 為「準備提交」。已存中英文商店文字、行銷網址、主分類「生產力工具」、不需登入及審查備註；年齡分級 4+；「不收集資料」僅存草稿，尚未發布。
+- App Store Connect：CalStitch，Apple ID：6838189548，iOS 1.0 為「準備提交」。已存中英文商店文字、行銷網址、主分類「生產力工具」、不需登入及審查備註；年齡分級 4+；「不收集資料」已依使用者確認在 Connect 發布，會在 App 上架時顯示。
 - 主要語言為中文，保留英文資料。免費，已設定全部 175 個現有地區（含法國），並依 Apple 的全部地區設定涵蓋未來新增地區。
-- 中英文 GitHub Pages 隱私與支援網址已設定；審查聯絡資料僅存於 Connect，不公開。Connect 已存八張截圖，維持審核通過後自動發布。隱私標籤未發布、未送審。1.0（15）僅改版號；Xcode 確認上傳成功，Connect 顯示上傳完成；TestFlight 列出 1.0（15），狀態是「缺少出口合規資訊」。建置未選入送審草稿。
-- 中國大陸安全評估與人工智慧生成合成內容欄位都顯示缺少資訊，ICP 欄位留空；尚未判定適用性，不視為完成。DSA 帳戶顯示非交易商，App 層級狀態仍待核對。
+- 中英文 GitHub Pages 隱私與支援網址已設定；審查聯絡資料僅存於 Connect，不公開。Connect 已存八張截圖，維持審核通過後自動發布。未送審。1.0（15）是功能基準；1.0（16）已成功上傳，未顯示出口合規警示，已選入 1.0 草稿並重新載入確認。尚未點「新增以供審查」。
+- 內容版權問卷已完成。中國大陸的安全評估功能與人工智慧生成／合成服務問卷，均依實際功能填「否」並儲存。ICP 未填；Connect 供應地區目前顯示「於 App 發佈時供應」，不等於已判定法律適用性。DSA 帳戶顯示非交易商。
 
 
 - 設定頁已連至對應語言的公開隱私權聲明，網站支援頁使用公開 GitHub Issues 並提醒不要貼個人資料。正式版文件部署後核對中英文連結可開，且與 App Store Connect 一致。參考 [App Review Guidelines §5.1.1](https://developer.apple.com/app-store/review/guidelines/#data-collection-and-storage)、[App Privacy 欄位](https://developer.apple.com/help/app-store-connect/reference/app-information/app-privacy/) 和 [版本資訊欄位](https://developer.apple.com/help/app-store-connect/reference/app-information/platform-version-information)。
-- 隱私標籤目前可先以「未收集資料」作為待確認的答案，不代表 App 不讀取資料。以正式送審版重新核對是否有開發者或整合服務收到資料、以及支援流程如何運作；確認後再填寫及發布。參考 [Apple 對資料收集的定義](https://developer.apple.com/app-store/app-privacy-details/)。
-- 專案使用 UserDefaults；僅改版號的 1.0（15）封存未含隱私權資訊清單。送審前依 Apple 要求核對並補齊 `PrivacyInfo.xcprivacy`，確認自有偏好設定的適用理由（候選 `CA92.1`）與是否有其他須申報 API。這與公開隱私權聲明是不同文件。參考 [Apple Required Reason API](https://developer.apple.com/documentation/BundleResources/describing-use-of-required-reason-api)。
+- 已發布的「不收集資料」是指開發者不接收 App 內的聯絡人、日曆或規則，不代表 App 不在裝置上讀取資料。若資料處理或支援流程改變，重新核對並更新標籤。參考 [Apple 對資料收集的定義](https://developer.apple.com/app-store/app-privacy-details/)。
+- 1.0（15）缺少隱私權資訊清單；1.0（16）封存已驗證包含 `PrivacyInfo.xcprivacy`，依實際 API 用途申報 App 自用的 UserDefaults（`CA92.1`）。這與公開隱私權聲明是不同文件。參考 [Apple Required Reason API](https://developer.apple.com/documentation/BundleResources/describing-use-of-required-reason-api)。
 - 封存已核對版本號與 iPhone 裝置類型；處理完成後，在 Connect 核對該版狀態、加密問卷及其他必要欄位。發布隱私標籤與提交審查均不是上傳建置的一部分。
 
 ### 加密與法國供應
 
-已核對 0.1（14）Release 的程式碼、Xcode 套件及執行檔連結；1.0（15）僅改版號，沒有自帶加密實作或第三方加密函式庫。聯絡人與行事曆使用 Apple 系統框架；若使用者已開啟 iCloud 或 Google 行事曆同步，由 iPhone 的既有帳號處理。依 [Apple 的加密出口文件要求](https://developer.apple.com/help/app-store-connect/reference/app-information/export-compliance-documentation-for-encryption/)，不需要因加密排除法國。實際送審建置仍須再次核對，並可在確認後設定 `ITSAppUsesNonExemptEncryption` 為 `NO`，或依 Connect 建置版本的實際問卷回答。
+已核對 0.1（14）Release 的程式碼、Xcode 套件及執行檔連結；1.0（15）僅改版號，沒有自帶加密實作或第三方加密函式庫。聯絡人與行事曆使用 Apple 系統框架；若使用者已開啟 iCloud 或 Google 行事曆同步，由 iPhone 的既有帳號處理。依 [Apple 的加密出口文件要求](https://developer.apple.com/help/app-store-connect/reference/app-information/export-compliance-documentation-for-encryption/)，不需要因加密排除法國。1.0（16）封存已核對 `ITSAppUsesNonExemptEncryption = false`；Connect 的 1.0（16）現在沒有出口合規警示，1.0（15）的提示只屬舊建置。
