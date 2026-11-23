@@ -34,6 +34,8 @@ struct BirthdayCandidate: Identifiable, Equatable, Sendable {
         .init(contactID: contactID, isLunar: isLunar, month: month, day: day, isLeapMonth: isLeapMonth, year: year)
     }
 
+    var eventTitle: String { name + (isLunar ? "農曆生日" : "生日") }
+
     var dateLabel: String {
         if isLunar {
             return "農曆\(isLeapMonth ? "閏" : "")\(month) 月 \(day) 日"
@@ -87,6 +89,7 @@ struct BirthdayPickerSelection: Identifiable, Sendable {
 struct BirthdayImportView: View {
     @ObservedObject var calendar: CalendarIntegration
     let categories: [BatchCategoryOption]
+    let presetCalendarIDs: () -> [String: String]
     let status: (BirthdayCandidate) -> BirthdayDuplicateStatus
     let onImport: ([BirthdayCandidate], Int, String, Bool, String, String) throws -> Void
     private let cameFromGroup: Bool
@@ -97,7 +100,7 @@ struct BirthdayImportView: View {
     }
 
     @State private var mode: ImportMode = .draft
-    @State private var targetID: String? = nil
+    @State private var explicitlySelectedCalendarID: String?
     @State private var errorMessage: String?
     @State private var calendarError: String?
     @State private var connecting = false
@@ -117,10 +120,12 @@ struct BirthdayImportView: View {
 
     init(selection: BirthdayPickerSelection,
          calendar: CalendarIntegration, categories: [BatchCategoryOption],
+         presetCalendarIDs: @escaping () -> [String: String],
          status: @escaping (BirthdayCandidate) -> BirthdayDuplicateStatus,
          onImport: @escaping ([BirthdayCandidate], Int, String, Bool, String, String) throws -> Void) {
         self.calendar = calendar
         self.categories = categories
+        self.presetCalendarIDs = presetCalendarIDs
         self.status = status
         self.onImport = onImport
         cameFromGroup = selection.groupName != nil
@@ -136,6 +141,12 @@ struct BirthdayImportView: View {
 
     private var importable: [BirthdayCandidate] {
         visible.filter { status($0) != .imported && selected.contains($0.id) }
+    }
+
+    private var targetID: String? {
+        // Until explicitly selected, follow the current primary category by stable ID.
+        // The observed CalendarIntegration validates availability as destinations load.
+        explicitlySelectedCalendarID ?? presetCalendarIDs()[categoryName]
     }
 
     private var destination: CalendarDestination? {
@@ -193,7 +204,7 @@ struct BirthdayImportView: View {
                             HStack(spacing: 12) {
                                 checkIcon(checked)
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text(candidate.name).foregroundStyle(.primary)
+                                    Text(candidate.eventTitle).foregroundStyle(.primary)
                                     Text(candidate.dateLabel).font(.subheadline).foregroundStyle(.secondary)
                                     if let note = statusText(itemStatus) {
                                         Text(note).font(.footnote)
@@ -309,7 +320,7 @@ struct BirthdayImportView: View {
                     ?? (targetID == nil ? "請選擇" : "已無法使用"),
                 selectedID: targetID ?? "", isValid: destination != nil,
                 destinations: calendar.destinations
-            ) { targetID = $0 }
+            ) { explicitlySelectedCalendarID = $0 }
         }
         if let calendarError, calendar.destinations.isEmpty {
             Text(calendarError).font(.footnote).foregroundStyle(.red)
@@ -497,6 +508,7 @@ struct ContactPickerPresenter: UIViewControllerRepresentable {
 struct BirthdayGroupImportView: View {
     @ObservedObject var calendar: CalendarIntegration
     let categories: [BatchCategoryOption]
+    let presetCalendarIDs: () -> [String: String]
     let status: (BirthdayCandidate) -> BirthdayDuplicateStatus
     let onChoosePeople: () -> Void
     let onImport: ([BirthdayCandidate], Int, String, Bool, String, String) throws -> Void
@@ -516,7 +528,7 @@ struct BirthdayGroupImportView: View {
         Group {
             if let selection {
                 BirthdayImportView(selection: selection, calendar: calendar, categories: categories,
-                                   status: status, onImport: onImport)
+                                   presetCalendarIDs: presetCalendarIDs, status: status, onImport: onImport)
             } else {
                 NavigationStack {
                     List {

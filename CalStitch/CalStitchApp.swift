@@ -224,6 +224,15 @@ struct Rule: Hashable, Identifiable, Codable {
     static let birthdays = "生日與紀念日"
 }
 
+func categoryCalendarPresets(rules: [Rule], destinations: [CalendarDestination]) -> [String: String] {
+    let writable = Set(destinations.lazy.filter(\.isWritable).map(\.id))
+    var result: [String: String] = [:]
+    for rule in rules where rule.parent == nil && !rule.category.isEmpty && writable.contains(rule.target) {
+        if result[rule.category] == nil { result[rule.category] = rule.target }
+    }
+    return result
+}
+
 private struct GroupAppearanceKey: Codable, Hashable, Identifiable {
     let category: String
     var subcategory: String? = nil
@@ -370,6 +379,7 @@ private struct RuleDateField: View {
 }
 
 private enum Route: Hashable {
+    case settings
     case edit(Rule, isNew: Bool)
 }
 
@@ -380,6 +390,7 @@ private struct RulesHome: View {
     @State private var contactPickerRequest: UUID?
     @State private var birthdaySelection: BirthdayPickerSelection?
     @State private var showingBirthdayRoutes = false
+    @State private var showingOrphanCleanup = false
     @State private var pendingBirthdayRoute: BirthdayImportRoute?
     @State private var selectingBirthdayGroup = false
     @State private var choosingPeopleAfterGroup = false
@@ -387,6 +398,7 @@ private struct RulesHome: View {
     @State private var isSelectingBatch = false
     @State private var batchSelection: Set<UUID> = []
     @State private var isShowingBatch = false
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.openURL) private var openURL
     @Environment(\.scenePhase) private var scenePhase
     @State private var showGettingStarted = false
@@ -423,15 +435,28 @@ private struct RulesHome: View {
                         category(name, rules: rootRules.filter { $0.category == name }, isFirst: name == names.first)
                     }
                     if loaded && !isSelectingBatch {
-                        Button {
-                            showingBirthdayRoutes = true
-                        } label: {
-                            Label("匯入生日", systemImage: "person.crop.rectangle")
-                                .font(.subheadline.weight(.semibold))
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                        let layout = dynamicTypeSize.isAccessibilitySize
+                            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10))
+                            : AnyLayout(HStackLayout(spacing: 20))
+                        layout {
+                            Button {
+                                showingBirthdayRoutes = true
+                            } label: {
+                                Label("匯入生日", systemImage: "person.crop.rectangle")
+                                    .frame(minHeight: 44)
+                            }
+                            .accessibilityIdentifier("open-birthday-import")
+                            Button {
+                                showingOrphanCleanup = true
+                            } label: {
+                                Label("清除遺留事件", systemImage: "trash")
+                                    .frame(minHeight: 44)
+                            }
+                            .accessibilityIdentifier("open-orphan-cleanup")
                         }
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 3)
-                        .accessibilityIdentifier("open-birthday-import")
                     }
                 }
                 .padding(.horizontal, 20)
@@ -441,6 +466,15 @@ private struct RulesHome: View {
             .background(paper)
             .navigationTitle("CalStitch")
             .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    if !isSelectingBatch {
+                        NavigationLink(value: Route.settings) {
+                            Image(systemName: "gearshape")
+                        }
+                        .accessibilityLabel("設定")
+                        .accessibilityIdentifier("open-settings")
+                    }
+                }
                 ToolbarItem(placement: .topBarLeading) {
                     if isSelectingBatch {
                         Button("取消") {
@@ -466,6 +500,8 @@ private struct RulesHome: View {
             }
             .navigationDestination(for: Route.self) { route in
                 switch route {
+                case .settings:
+                    CalStitchSettingsView()
                 case .edit(let rule, let isNew):
                     RuleEditor(initial: snapshot.rules.first { $0.id == rule.id } ?? rule, isNew: isNew,
                                parent: snapshot.rules.first { $0.id == rule.parent },
@@ -487,6 +523,7 @@ private struct RulesHome: View {
             }
             .sheet(item: $birthdaySelection) { selection in
                 BirthdayImportView(selection: selection, calendar: calendar, categories: batchCategories,
+                                   presetCalendarIDs: { categoryCalendarPresets(rules: rootRules, destinations: calendar.destinations) },
                                    status: birthdayStatus, onImport: importBirthdays)
             }
             .sheet(isPresented: $showingBirthdayRoutes, onDismiss: openSelectedBirthdayRoute) {
@@ -499,10 +536,14 @@ private struct RulesHome: View {
                 }
             }) {
                 BirthdayGroupImportView(calendar: calendar, categories: batchCategories,
+                                        presetCalendarIDs: { categoryCalendarPresets(rules: rootRules, destinations: calendar.destinations) },
                                         status: birthdayStatus, onChoosePeople: {
                                             choosingPeopleAfterGroup = true
                                             selectingBirthdayGroup = false
                                         }, onImport: importBirthdays)
+            }
+            .sheet(isPresented: $showingOrphanCleanup) {
+                OrphanCleanupView(calendar: calendar, existingRuleIDs: { Set(snapshot.rules.map(\.id)) })
             }
             .sheet(isPresented: $isShowingBatch) {
                 BatchActionsView(selectedCount: batchSelection.count,
@@ -910,9 +951,9 @@ private struct RulesHome: View {
         }
         if sameContact.contains(where: { $0.birthdaySource == candidate.source }) { return .imported }
         if !sameContact.isEmpty { return .changed }
-        let name = candidate.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let possibleTitles = Set([candidate.name, candidate.eventTitle])
         if rootRules.contains(where: { rule in
-            guard rule.name.trimmingCharacters(in: .whitespacesAndNewlines) == name,
+            guard possibleTitles.contains(rule.name.trimmingCharacters(in: .whitespacesAndNewlines)),
                   rule.period == .year, rule.weekdayPattern == nil else { return false }
             if candidate.isLunar {
                 return rule.kind == .lunar && rule.lunarMonth == candidate.month &&
@@ -949,7 +990,7 @@ private struct RulesHome: View {
             case .available, .possibleDuplicate, .changed:
                 break
             }
-            var rule = Rule(name: candidate.name, kind: candidate.isLunar ? .lunar : .gregorian,
+            var rule = Rule(name: candidate.eventTitle, kind: candidate.isLunar ? .lunar : .gregorian,
                             date: "", lunarMonth: candidate.month, lunarDay: candidate.day,
                             lunarIsLeap: candidate.isLeapMonth,
                             category: category, subcategory: subcategory)
@@ -1117,6 +1158,7 @@ private struct RulesHome: View {
                     }
                 }
                 .background(card, in: RoundedRectangle(cornerRadius: 18))
+                .padding(.leading, subcategory.isEmpty ? 0 : 22)
             }
         }
     }
@@ -1306,6 +1348,7 @@ private struct RuleEditor: View {
     @State private var editingAppearance = false
     @State private var followsSuggestedTitle: Bool
     @State private var followsSuggestedCategory: Bool
+    @State private var followsCategoryDestination: Bool
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.dismiss) private var dismiss
     let parent: Rule?
@@ -1330,6 +1373,7 @@ private struct RuleEditor: View {
         if shouldSuggestCategory, let suggestion = startingRule.suggestedCategory { startingRule.category = suggestion }
         _followsSuggestedTitle = State(initialValue: shouldSuggest)
         _followsSuggestedCategory = State(initialValue: shouldSuggestCategory)
+        _followsCategoryDestination = State(initialValue: isFresh && parent == nil && initial.target.isEmpty)
         _rule = State(initialValue: startingRule)
         _baseline = State(initialValue: isNew ? nil : initial)
         _exitBaseline = State(initialValue: startingRule)
@@ -1370,7 +1414,11 @@ private struct RuleEditor: View {
     private var hasUnsavedChanges: Bool { exitBaseline != rule }
     private var hasTitle: Bool { !rule.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     private var trimmedCategory: String { rule.category.trimmingCharacters(in: .whitespacesAndNewlines) }
-    private var destinationID: String { parent?.target ?? rule.target }
+    private var suggestedDestinationID: String {
+        guard followsCategoryDestination else { return "" }
+        return categoryCalendarPresets(rules: allRules, destinations: calendar.destinations)[trimmedCategory] ?? ""
+    }
+    private var destinationID: String { parent?.target ?? (followsCategoryDestination ? suggestedDestinationID : rule.target) }
     private var hasDestination: Bool { calendar.destinations.contains { $0.id == destinationID && $0.isWritable } }
     private var canApply: Bool { hasTitle && (parent != nil || !trimmedCategory.isEmpty) && hasDestination }
     private var isDestinationLocked: Bool { parent != nil || baseline?.hasApplied == true }
@@ -1487,7 +1535,11 @@ private struct RuleEditor: View {
 
             Section {
                 NavigationLink {
-                    EventPreview { try preview(rule) }
+                    EventPreview {
+                        var submitted = rule
+                        submitted.target = destinationID
+                        return try preview(submitted)
+                    }
                 } label: {
                     Label("預覽事件", systemImage: "list.bullet.rectangle")
                 }
@@ -1621,7 +1673,9 @@ private struct RuleEditor: View {
             return
         }
         do {
-            let saved = try onApply(rule)
+            var submitted = rule
+            submitted.target = destinationID
+            let saved = try onApply(submitted)
             rule = saved
             baseline = saved
             exitBaseline = saved
@@ -1642,7 +1696,8 @@ private struct RuleEditor: View {
                             try await calendar.connectCalendars()
                             #if targetEnvironment(simulator)
                             let writable = calendar.destinations.filter(\.isWritable)
-                            if !isDestinationLocked, rule.target.isEmpty, writable.count == 1 {
+                            if !isDestinationLocked, destinationID.isEmpty, writable.count == 1 {
+                                followsCategoryDestination = false
                                 rule.target = writable[0].id
                             }
                             #endif
@@ -1670,7 +1725,10 @@ private struct RuleEditor: View {
             } else {
                 CalendarDestinationField(title: "指定行事曆（必填）", selectedTitle: chosenDestination,
                                          selectedID: destinationID, isValid: hasDestination,
-                                         destinations: calendar.destinations) { rule.target = $0 }
+                                         destinations: calendar.destinations) {
+                    followsCategoryDestination = false
+                    rule.target = $0
+                }
                     .accessibilityIdentifier("rule-destination")
             }
             if calendar.hasFullAccess, !calendar.destinations.contains(where: \.isWritable), !connecting {
@@ -1823,8 +1881,6 @@ private struct RuleEditor: View {
                 Picker("節氣", selection: $rule.date) {
                     ForEach(RuleKind.solar.dates, id: \.self) { Text($0).tag($0) }
                 }
-                Link(SolarTerms.attribution, destination: SolarTerms.sourceURL)
-                    .font(.footnote)
             }
             RuleDateField(title: "起始日", selection: $rule.start)
                 .onChange(of: rule.start) { oldStart, _ in
@@ -1870,7 +1926,7 @@ private struct RuleEditor: View {
         } header: { Text("日期與週期") }
           footer: {
               if rule.kind == .solar {
-                  Text("節氣一律以台灣日期為準。內建資料涵蓋 \(SolarTerms.supportedYears.lowerBound)～\(SolarTerms.supportedYears.upperBound) 年，無須連網。")
+                  Text("內建資料涵蓋 \(SolarTerms.supportedYears.lowerBound)～\(SolarTerms.supportedYears.upperBound) 年，無須連網。")
               } else if rule.kind == .lunar {
                   Text(rule.lunarIsLeap ? "目前無法套用閏月生日規則。" : "按月重複若遇到閏月，請先縮短期間；閏月排程方式尚未確定。")
               } else if allowsMonthEnd {
@@ -2157,5 +2213,278 @@ struct CalendarDestinationField: View {
         }
         .accessibilityLabel(title)
         .accessibilityValue(selectedTitle)
+    }
+}
+
+private struct CalStitchSettingsView: View {
+    @AppStorage("settings.defaultTimeZoneIdentifier") private var overrideIdentifier = ""
+    @Environment(\.locale) private var locale
+
+    private var currentIdentifier: String {
+        overrideIdentifier.isEmpty ? TimeZone.autoupdatingCurrent.identifier : overrideIdentifier
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                NavigationLink {
+                    TimeZoneOptionsView(overrideIdentifier: $overrideIdentifier)
+                } label: {
+                    LabeledContent {
+                        VStack(alignment: .trailing, spacing: 3) {
+                            Text(timeZoneDisplayName(currentIdentifier, locale: locale))
+                            if overrideIdentifier.isEmpty {
+                                Text("跟隨 iOS").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .multilineTextAlignment(.trailing)
+                    } label: {
+                        Text("預設時區")
+                    }
+                }
+                .accessibilityIdentifier("default-time-zone")
+            } footer: {
+                Text("目前只儲存偏好，尚未用於規則排程。")
+            }
+
+            Section {
+                NavigationLink("隱私權聲明") {
+                    Form {
+                        Section {
+                            Text("正式隱私權聲明尚未定稿，此頁為預留位置。")
+                        } header: {
+                            Text("草稿")
+                        }
+                    }
+                    .navigationTitle("隱私權聲明")
+                    .navigationBarTitleDisplayMode(.inline)
+                }
+                .accessibilityIdentifier("privacy-statement")
+            }
+        }
+        .navigationTitle("設定")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct TimeZoneOptionsView: View {
+    @Binding var overrideIdentifier: String
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.locale) private var locale
+    @State private var query = ""
+
+    private struct Option: Identifiable {
+        let id: String
+        let name: String
+    }
+
+    private var options: [Option] {
+        let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return TimeZone.knownTimeZoneIdentifiers.compactMap { identifier in
+            let name = timeZoneDisplayName(identifier, locale: locale)
+            guard search.isEmpty ||
+                    identifier.localizedStandardContains(search) ||
+                    identifier.replacingOccurrences(of: "_", with: " ").localizedStandardContains(search) ||
+                    name.localizedStandardContains(search) else { return nil }
+            return Option(id: identifier, name: name)
+        }.sorted { lhs, rhs in
+            let comparison = lhs.name.localizedStandardCompare(rhs.name)
+            return comparison == .orderedSame ? lhs.id < rhs.id : comparison == .orderedAscending
+        }
+    }
+
+    var body: some View {
+        List {
+            Section {
+                option("跟隨 iOS", detail: timeZoneDisplayName(TimeZone.autoupdatingCurrent.identifier, locale: locale),
+                       identifier: "")
+            }
+            Section("時區") {
+                let matches = options
+                if matches.isEmpty {
+                    Text("找不到符合的時區").foregroundStyle(.secondary)
+                } else {
+                    ForEach(matches) { item in
+                        option(item.name, detail: item.id, identifier: item.id)
+                    }
+                }
+            }
+        }
+        .searchable(text: $query, prompt: "搜尋城市或時區")
+        .navigationTitle("預設時區")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func option(_ name: String, detail: String, identifier: String) -> some View {
+        let selected = overrideIdentifier == identifier
+        return Button {
+            overrideIdentifier = identifier
+            dismiss()
+        } label: {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(name).foregroundStyle(.primary)
+                    if name != detail {
+                        Text(detail).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 8)
+                if selected {
+                    Image(systemName: "checkmark").accessibilityHidden(true)
+                }
+            }
+        }
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+private func timeZoneDisplayName(_ identifier: String, locale: Locale) -> String {
+    guard let zone = TimeZone(identifier: identifier) else { return identifier }
+    let city = identifier.split(separator: "/").last?.replacingOccurrences(of: "_", with: " ") ?? identifier
+    if let localized = zone.localizedName(for: .generic, locale: locale), localized != city {
+        return "\(localized) · \(city)"
+    }
+    return city
+}
+
+private struct OrphanCleanupView: View {
+    @ObservedObject var calendar: CalendarIntegration
+    let existingRuleIDs: () -> Set<UUID>
+    @Environment(\.dismiss) private var dismiss
+    @State private var preview: CalendarOrphanPreview?
+    @State private var selection: Set<String> = []
+    @State private var failure: String?
+    @State private var confirmation = false
+    @State private var connecting = false
+    @State private var removedCount: Int?
+
+    private var selected: [CalendarOrphanEvent] {
+        preview?.events.filter { selection.contains($0.id) } ?? []
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Text("只顯示有 CalStitch 標記，但在這台裝置找不到原規則的事件。若事件來自另一台裝置，請先確認不再需要。")
+                        .font(.footnote)
+                    if let preview {
+                        Text("搜尋範圍：\(dateCaption(preview.start)) 至 \(dateCaption(preview.through))")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let removedCount {
+                        Text("已刪除 \(removedCount) 筆事件")
+                    }
+                    if let failure {
+                        Text(failure).foregroundStyle(.red)
+                    }
+                    if !calendar.hasFullAccess {
+                        Button {
+                            connecting = true
+                            Task {
+                                defer { connecting = false }
+                                do {
+                                    try await calendar.connectCalendars()
+                                    refresh()
+                                } catch { failure = error.localizedDescription }
+                            }
+                        } label: {
+                            if connecting { ProgressView("正在連接行事曆…") }
+                            else { Label("連接行事曆", systemImage: "calendar.badge.plus") }
+                        }
+                        .disabled(connecting)
+                    } else {
+                        Button("重新搜尋", action: refresh)
+                    }
+                }
+                if let preview {
+                    eventSection("已過去", events: preview.events.filter(\.isPast))
+                    eventSection("未到來", events: preview.events.filter { !$0.isPast })
+                }
+            }
+            .navigationTitle("清除遺留事件")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("關閉") { dismiss() } }
+                if !selected.isEmpty {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button(role: .destructive) { confirmation = true } label: {
+                            Text("刪除（\(selected.count)）").foregroundStyle(.red)
+                        }
+                        .accessibilityIdentifier("delete-orphan-events")
+                    }
+                }
+            }
+            .task { if calendar.hasFullAccess { refresh() } }
+            .alert("刪除 \(selected.count) 筆遺留事件？", isPresented: $confirmation) {
+                Button("取消", role: .cancel) {}
+                Button("刪除", role: .destructive, action: removeSelected)
+            } message: {
+                let names = Set(selected.map(\.calendarTitle)).sorted().joined(separator: "、")
+                Text("將從「\(names)」刪除勾選的事件，不會刪除規則。")
+            }
+        }
+    }
+
+    private func eventSection(_ title: String, events: [CalendarOrphanEvent]) -> some View {
+        let ids = Set(events.map(\.id))
+        let allSelected = !ids.isEmpty && ids.isSubset(of: selection)
+        return Section {
+            if events.isEmpty {
+                Text("沒有符合的事件").foregroundStyle(.secondary)
+            } else {
+                Button(allSelected ? "取消全選" : "全選") {
+                    if allSelected { selection.subtract(ids) }
+                    else { selection.formUnion(ids) }
+                }
+                .accessibilityLabel(allSelected ? "取消全選\(title)" : "全選\(title)")
+                ForEach(events) { event in
+                    let checked = selection.contains(event.id)
+                    Button {
+                        if !selection.insert(event.id).inserted { selection.remove(event.id) }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: checked ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(checked ? Color.accentColor : Color.secondary)
+                                .accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(event.title).foregroundStyle(.primary)
+                                Text(event.isAllDay ? dateCaption(event.start)
+                                     : "\(dateCaption(event.start)) \(timeCaption(event.start))")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Text(event.calendarTitle).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .accessibilityAddTraits(checked ? .isSelected : [])
+                }
+            }
+        } header: { Text(title) }
+    }
+
+    private func refresh() {
+        selection.removeAll()
+        failure = nil
+        do {
+            preview = try calendar.previewOrphans(existingRuleIDs: existingRuleIDs())
+        } catch {
+            preview = nil
+            failure = error.localizedDescription
+        }
+    }
+
+    private func removeSelected() {
+        guard let preview, !selected.isEmpty else { return }
+        let items = selected
+        do {
+            try calendar.removeOrphans(items, from: preview, existingRuleIDs: existingRuleIDs())
+            removedCount = items.count
+            refresh()
+        } catch {
+            removedCount = nil
+            refresh()
+            failure = error.localizedDescription
+        }
     }
 }

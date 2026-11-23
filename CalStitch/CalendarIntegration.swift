@@ -34,10 +34,36 @@ struct CalendarPreviewEvent: Identifiable {
 }
 
 
+struct CalendarOrphanEvent: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let start: Date
+    let end: Date
+    let isAllDay: Bool
+    let isPast: Bool
+    let calendarID: String
+    let calendarTitle: String
+    fileprivate let eventIdentifier: String?
+    fileprivate let markerIdentity: String
+    fileprivate let notes: String
+    fileprivate let rawStart: Date
+    fileprivate let rawEnd: Date
+    fileprivate let lastModified: Date?
+}
+
+struct CalendarOrphanPreview {
+    let start: Date
+    let through: Date
+    let events: [CalendarOrphanEvent]
+    fileprivate let endExclusive: Date
+    fileprivate let existingRuleIDs: Set<UUID>
+}
+
+
 enum CalendarIntegrationError: LocalizedError {
     case denied, noLocalSource, noDestination, readOnlyDestination, conflictingDestination
     case invalidPlan, ambiguousEvent, missingEvent, excessiveRange
-    case writeFailed
+    case writeFailed, orphanSelectionChanged
 
     var errorDescription: String? {
         switch self {
@@ -50,6 +76,7 @@ enum CalendarIntegrationError: LocalizedError {
         case .ambiguousEvent: return "找到重複或有衝突的事件識別，無法安全更新；未改動行事曆。"
         case .missingEvent: return "找不到先前套用的未來事件，可能已被移動、刪除或移除識別附註；未改動行事曆。"
         case .excessiveRange: return "日期範圍太長，無法安全核對，請縮短維護期間。"
+        case .orphanSelectionChanged: return "行事曆或規則已變動。未刪除事件，請重新掃描並確認選擇。"
         case .writeFailed: return "行事曆未能確認儲存結果。請先檢查行事曆，再重新開啟 CalStitch。"
         }
     }
@@ -253,7 +280,7 @@ final class CalendarIntegration: ObservableObject {
                     }
                     let event = EKEvent(eventStore: store)
                     event.calendar = calendar
-                    event.notes = identity.marker
+                    event.notes = "\n\n----\n\n" + identity.marker
                     configure(event, with: occurrence)
                     try store.save(event, span: .thisEvent, commit: false)
                 case let .update(_, event, occurrence):
@@ -270,6 +297,125 @@ final class CalendarIntegration: ObservableObject {
             store.reset()
             throw CalendarIntegrationError.writeFailed
         }
+    }
+
+    func previewOrphans(existingRuleIDs: Set<UUID>) throws -> CalendarOrphanPreview {
+        let now = Date.now
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: now)
+        guard let start = calendar.date(byAdding: .year, value: -5, to: today),
+              let through = calendar.date(byAdding: .year, value: 10, to: today),
+              let endExclusive = calendar.date(byAdding: .day, value: 1, to: through) else {
+            throw CalendarIntegrationError.invalidPlan
+        }
+        let candidates = try scanOrphans(start: start, endExclusive: endExclusive, existingRuleIDs: existingRuleIDs, now: now)
+        let events = candidates.values.map(\.info).sorted {
+            if $0.start != $1.start { return $0.start < $1.start }
+            return $0.id < $1.id
+        }
+        return .init(start: start, through: through, events: events,
+                     endExclusive: endExclusive, existingRuleIDs: existingRuleIDs)
+    }
+
+    func removeOrphans(_ selected: [CalendarOrphanEvent], from preview: CalendarOrphanPreview,
+                       existingRuleIDs: Set<UUID>) throws {
+        guard !selected.isEmpty else { return }
+        guard preview.existingRuleIDs == existingRuleIDs,
+              Set(selected.map(\.id)).count == selected.count else {
+            throw CalendarIntegrationError.orphanSelectionChanged
+        }
+        let displayed = Dictionary(uniqueKeysWithValues: preview.events.map { ($0.id, $0) })
+        guard selected.allSatisfy({ displayed[$0.id] == $0 }) else {
+            throw CalendarIntegrationError.orphanSelectionChanged
+        }
+        let current = try scanOrphans(start: preview.start, endExclusive: preview.endExclusive,
+                                      existingRuleIDs: existingRuleIDs, now: .now)
+        // Confirm all selected rows from the same fresh scan before staging any writes.
+        let confirmed = try selected.map { item in
+            guard let found = current[item.id], found.info == item else {
+                throw CalendarIntegrationError.orphanSelectionChanged
+            }
+            return found.event
+        }
+        do {
+            for event in confirmed {
+                try store.remove(event, span: .thisEvent, commit: false)
+            }
+            try store.commit()
+        } catch {
+            store.reset()
+            throw CalendarIntegrationError.writeFailed
+        }
+    }
+
+    private struct OrphanCandidate {
+        let event: EKEvent
+        let info: CalendarOrphanEvent
+    }
+
+    private func scanOrphans(start: Date, endExclusive: Date, existingRuleIDs: Set<UUID>, now: Date) throws -> [String: OrphanCandidate] {
+        guard hasFullAccess else { throw CalendarIntegrationError.denied }
+        store.reset()
+        #if targetEnvironment(simulator)
+        let calendars = try defaults.string(forKey: Self.destinationKey).map { [try writableCalendar(id: $0)] } ?? []
+        #else
+        let calendars = store.calendars(for: .event).filter(Self.isWritable)
+        #endif
+        guard !calendars.isEmpty else { return [:] }
+        let calendarByID = Dictionary(uniqueKeysWithValues: calendars.map { ($0.calendarIdentifier, $0) })
+        let chunk: TimeInterval = 365 * 3 * 86_400
+        var cursor = start
+        var seenOccurrences: Set<String> = []
+        var candidates: [Identity: OrphanCandidate] = [:]
+        var conflicting: Set<Identity> = []
+        while cursor < endExclusive {
+            let bound = min(endExclusive, cursor.addingTimeInterval(chunk))
+            let predicate = store.predicateForEvents(withStart: cursor, end: bound, calendars: calendars)
+            for event in store.events(matching: predicate) {
+                guard let eventCalendar = event.calendar,
+                      let calendar = calendarByID[eventCalendar.calendarIdentifier],
+                      let rawStart = event.startDate, let rawEnd = event.endDate,
+                      rawStart >= start, rawStart < endExclusive,
+                      let notes = event.notes else { continue }
+                let calendarID = calendar.calendarIdentifier
+                let itemID = event.calendarItemIdentifier
+                let key = "\(calendarID.utf8.count):\(calendarID)\(itemID.utf8.count):\(itemID):\(rawStart.timeIntervalSinceReferenceDate)"
+                guard seenOccurrences.insert(key).inserted else { continue }
+                let tagLines = notes.split(whereSeparator: \.isNewline).filter {
+                    $0.trimmingCharacters(in: .whitespaces).hasPrefix("[CalStitch:")
+                }
+                let markers = tagLines.compactMap(Identity.init(line:))
+                let missing = markers.filter { !existingRuleIDs.contains($0.rule) }
+                guard !missing.isEmpty else { continue }
+
+                // A duplicate or a conflicting/malformed marker taints that identity even
+                // when one matching event is ineligible for listing for another reason.
+                guard tagLines.count == 1, let identity = missing.first,
+                      !event.hasRecurrenceRules, !event.isDetached,
+                      rawStart > now || rawEnd <= now else {
+                    conflicting.formUnion(missing)
+                    continue
+                }
+                if candidates[identity] != nil {
+                    conflicting.insert(identity)
+                    continue
+                }
+                let info = CalendarOrphanEvent(
+                    id: key, title: event.title ?? "無標題",
+                    start: plannedDate(rawStart, allDay: event.isAllDay),
+                    end: plannedEndDate(rawEnd, allDay: event.isAllDay),
+                    isAllDay: event.isAllDay, isPast: rawEnd <= now,
+                    calendarID: calendarID, calendarTitle: Self.destination(calendar).displayTitle,
+                    eventIdentifier: event.eventIdentifier, markerIdentity: identity.displayID,
+                    notes: notes, rawStart: rawStart, rawEnd: rawEnd, lastModified: event.lastModifiedDate
+                )
+                candidates[identity] = .init(event: event, info: info)
+            }
+            cursor = bound
+        }
+        return Dictionary(uniqueKeysWithValues: candidates.filter { !conflicting.contains($0.key) }.values.map {
+            ($0.info.id, $0)
+        })
     }
 
     private func writableCalendar(id: String) throws -> EKCalendar {
