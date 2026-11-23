@@ -9,6 +9,8 @@ CalStitch 是 iPhone 的行事曆規則工具。在 CalStitch 設規則，在原
 - 用分類和次類整理規則；用子規則安排準備事項與後續行程。
 - 套用前預覽事件，並可批次調整多條規則。
 
+只把想要的節日、紀念日和聯絡人生日加到自己的行事曆。不必訂閱整份節日行事曆，也不用開啟顯示所有聯絡人生日的行事曆。
+
 目前為測試版，尚未在 App Store 上架。英文文件已提供；目前測試版的介面為中文。
 
 [產品首頁](https://peiyu66.github.io/CalStitch/) · [使用說明](https://peiyu66.github.io/CalStitch/guide.html) · [隱私權聲明](https://peiyu66.github.io/CalStitch/privacy.html) · [支援](https://peiyu66.github.io/CalStitch/support.html)
