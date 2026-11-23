@@ -12,7 +12,3 @@ CalStitch is an iPhone tool for calendar rules. Set up rules in CalStitch and se
 CalStitch is currently in testing and is not available on the App Store. English documentation is available; the current test build uses a Chinese interface.
 
 [Home](https://peiyu66.github.io/CalStitch/en/) · [User Guide](https://peiyu66.github.io/CalStitch/en/guide.html) · [Privacy Policy](https://peiyu66.github.io/CalStitch/en/privacy.html) · [Support](https://peiyu66.github.io/CalStitch/en/support.html)
-
-## Development
-
-Open `CalStitch.xcodeproj` in Xcode, select the `CalStitch` scheme, and choose an iPhone simulator or development device. The website lives in `website/`. GitHub Actions deploys it to GitHub Pages when changes to that directory are pushed to `main`.

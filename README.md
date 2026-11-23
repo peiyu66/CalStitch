@@ -13,6 +13,4 @@ CalStitch 是 iPhone 的行事曆規則工具。在 CalStitch 設規則，在原
 
 [產品首頁](https://peiyu66.github.io/CalStitch/) · [使用說明](https://peiyu66.github.io/CalStitch/guide.html) · [隱私權聲明](https://peiyu66.github.io/CalStitch/privacy.html) · [支援](https://peiyu66.github.io/CalStitch/support.html)
 
-## 開發
-
-用 Xcode 開啟 `CalStitch.xcodeproj`，選擇 `CalStitch` scheme，再選 iPhone 模擬器或開發裝置。網站檔案在 `website/`；更新該目錄並推送到 `main` 後，GitHub Actions 會自動部署 GitHub Pages。
+[開發文件索引](https://peiyu66.github.io/CalStitch/development.html)
