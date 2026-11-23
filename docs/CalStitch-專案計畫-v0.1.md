@@ -1,4 +1,4 @@
-# CalStitch 專案計畫 v0.1
+# CalStitch 專案計畫
 
 [回開發文件索引](https://peiyu66.github.io/CalStitch/development.html)
 
@@ -15,29 +15,23 @@ CalStitch 是 iPhone 上的**行事曆規則工具**。使用者在 CalStitch �
 
 不列入首版：OpenAI 週重設、事件詳情瀏覽、多父且以任務完成狀態為條件的專案管理。直接串 Google API 或自建同步服務不在目前方案內。
 
-## 2. 目前進度
+## 2. 目前正式版
 
-- 已有 iPhone 功能測試版，尚未在 App Store 上架。
-- 最近一次已核對安裝的實機版本為 [0.1 (14)](development/version-history.md#build-14)。iPhone Air 上是依 App 語言顯示的 Release 候選版；未代為啟動或操作實機資料。
-- [1.0 (15)](development/version-history.md#build-15) 由同一來源只改版號封存並上傳 Connect；未送審，尚未在 App Store 上架。
-- GitHub Pages 已提供中英文產品文件，App 支援中文及英文。網站部署不會改動 App。
-- [上架文件草稿](CalStitch-上架文件草稿.md)另存；草稿不作為正式提交或發布確認。
+- 目前正式版基準為 [1.0 (15)](development/version-history.md#build-15)。與 iPhone Air 上最後核對的 [0.1 (14)](development/version-history.md#build-14) 是同一套程式，只改版號。
+- 開發與試用回饋已全數結案。已實作而未再收到回饋的項目，依使用者確認視為沒有新問題，不保留為開發待辦。
+- GitHub Pages 提供中英文產品文件，App 支援中文及英文。
+- 1.0 (15) 已上傳 App Store Connect，尚未送審或在 App Store 上架。上架行政及合規流程另見[上架文件草稿](CalStitch-上架文件草稿.md)，不列入開發待辦。
 
-## 3. 0.1 (9) 的驗收項目
+## 3. 驗收結案
 
 | 項目 | 狀態 |
 | --- | --- |
-| [農曆閏月與小月](development/rules.md#section-44) | 已實作，新增 11 項排程測試。 |
-| [群組匯入授權分流](development/calendar-contacts.md#section-45) | 已補首次提示；實機由系統設定返回仍待驗收。 |
-| [首頁規則的下次日期與開始時間](development/interface.md#section-46) | 已實作，待實機回饋。 |
-| [時區清單字母索引與搜尋列](development/rules.md#section-47) | 已實作，待實機回饋。 |
-| [遺留事件下拉更新](development/calendar-contacts.md#section-48) | 已實作，待實機回饋。 |
-| [整批移除的逐筆預覽與確認](development/interface.md#section-49) | 已實作，待實機回饋。 |
+| [農曆閏月與小月](development/rules.md#section-44) | 已結案；11 項排程測試通過。 |
+| [群組匯入授權分流](development/calendar-contacts.md#section-45) | 已結案。 |
+| [首頁規則的下次日期與開始時間](development/interface.md#section-46) | 已結案。 |
+| [時區清單字母索引與搜尋列](development/rules.md#section-47) | 已結案。 |
+| [遺留事件下拉更新](development/calendar-contacts.md#section-48) | 已結案。 |
+| [整批移除的逐筆預覽與確認](development/interface.md#section-49) | 已結案。 |
+| [英文本地化與日期格式](development/rules.md#section-11) | 已結案。 |
 
-較早的技術驗證項目及驗收方式保留在[建置與驗證](development/build-and-test.md)，實際完成範圍以版本紀錄為準。
-
-## 4. 後續工作
-
-- [英文本地化與日期格式](development/rules.md#section-11)：0.1 (9) 已加入英文；仍待實機試用回饋。
-- [跨帳號同步及日期邊界](development/build-and-test.md#section-7)：保留 iCloud／Google 事件標記往返和大量事件寫入的實機查核。日期邊界的現行行為見該節。首頁目前只開啟行事曆，不提供指定日期定位。
-- [上架前核對](CalStitch-上架文件草稿.md)：0.1 (9) 設定已加入中英文隱私權聲明與支援入口。私下支援聯絡方式、隱私權資訊清單及 App Store Connect 資料須在送審前確認。
+[建置與驗證](development/build-and-test.md)保留當時的驗收方法、已驗證範圍及未涵蓋情境，供日後回歸測試使用，不代表仍有未結案問題。
