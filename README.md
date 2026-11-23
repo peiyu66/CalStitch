@@ -1,6 +1,6 @@
 # CalStitch
 
-中文 · [English](README.en.md)
+[English](README.en.md)
 
 CalStitch 是 iPhone 的行事曆規則工具。在 CalStitch 設規則，在原本的行事曆看行程。
 
