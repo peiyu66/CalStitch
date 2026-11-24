@@ -67,34 +67,43 @@ struct CloudRuleOperation: Codable, Equatable, Identifiable {
     }
 }
 
-/// Observed by one device; its monotonic clock is only a UI threshold.
+/// The elapsed timer only governs this device's UI and local write gate.
 struct CloudPendingWait {
-    private var account: String?
     private var started: [UUID: (operation: CloudRuleOperation, time: Duration)] = [:]
-    private(set) var confirmedWaiting: [UUID: CloudRuleOperation] = [:]
+    private(set) var confirmedWaiting: [UUID: Set<UUID>]
+
+    init(confirmedWaiting: [UUID: Set<UUID>] = [:]) { self.confirmedWaiting = confirmedWaiting }
+
+    mutating func expire(elapsed: Duration) {
+        let expired = started.filter { elapsed - $0.value.time >= .seconds(120) }
+        for (id, value) in expired {
+            let operation = value.operation
+            confirmedWaiting[id] = operation.deletions.union(operation.upserts.map(\.id))
+                .union(operation.plan?.ruleIDs ?? [])
+            started[id] = nil
+        }
+    }
 
     mutating func observe(_ session: CloudRuleSession, elapsed: Duration) {
-        if account != session.accountID { self = Self(); account = session.accountID }
-        for id in session.ledger.completed.union(session.ledger.retired ?? []) {
-            started[id] = nil
-            confirmedWaiting[id] = nil
-        }
-        let currentlyPending = Set(session.ledger.pending.map(\.id))
+        // Check the local deadline before consuming this result. A completion
+        // first observed at/after expiry cannot automatically thaw this device.
+        expire(elapsed: elapsed)
+        let pending = session.ledger.pending.filter { !$0.interrupted && confirmedWaiting[$0.id] == nil }
+        let currentlyPending = Set(pending.map(\.id))
         started = started.filter { currentlyPending.contains($0.key) }
-        for op in session.ledger.pending {
-            if op.interrupted {
-                started[op.id] = nil
-                confirmedWaiting[op.id] = nil
-                continue
-            }
-            let same = started[op.id].map { $0.operation == op } ?? false
-            if !same {
-                started[op.id] = (op, elapsed)
-                // A changed owner is authoritative evidence the old wait was handled.
-                if let old = confirmedWaiting[op.id], old.owner != op.owner { confirmedWaiting[op.id] = nil }
-            } else if let first = started[op.id], elapsed - first.time >= .seconds(120) {
-                confirmedWaiting[op.id] = op
-            }
+        for op in pending where started[op.id]?.operation != op {
+            started[op.id] = (op, elapsed)
+        }
+    }
+
+    func expiredOperations(touching ruleID: UUID) -> Set<UUID> {
+        Set(confirmedWaiting.compactMap { $0.value.contains(ruleID) ? $0.key : nil })
+    }
+
+    mutating func clearManually(_ ids: Set<UUID>, for rules: Set<UUID>) {
+        for id in ids {
+            let remaining = (confirmedWaiting[id] ?? []).subtracting(rules)
+            confirmedWaiting[id] = remaining.isEmpty ? nil : remaining
         }
     }
 }
@@ -216,6 +225,7 @@ enum CloudRuleError: LocalizedError {
         var migrationOwner: String?
         var migrated: Set<String> = []
         var journals: [String: CloudRuleJournal] = [:]
+        var manualWaits: [String: [UUID: Set<UUID>]]? = nil
     }
 
     let transport: any CloudRuleTransport
@@ -263,6 +273,19 @@ enum CloudRuleError: LocalizedError {
         var draft = state
         update(&draft)
         try persist(draft)
+    }
+
+    func manualWaits(accountID: String) -> [UUID: Set<UUID>] {
+        state.manualWaits?[accountID] ?? [:]
+    }
+
+    func saveManualWaits(_ waits: [UUID: Set<UUID>], accountID: String) throws {
+        guard waits != manualWaits(accountID: accountID) else { return }
+        try changeState {
+            var all = $0.manualWaits ?? [:]
+            all[accountID] = waits.isEmpty ? nil : waits
+            $0.manualWaits = all.isEmpty ? nil : all
+        }
     }
 
     func refresh() async throws -> CloudRuleSession? {

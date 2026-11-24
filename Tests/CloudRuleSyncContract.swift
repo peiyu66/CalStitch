@@ -224,26 +224,56 @@ import Foundation
         do { _ = try await incumbent.finish(retryAttempt.id, in: freshClaim); fatalError("stale owner published") }
         catch CloudRuleError.notOwner {}
         precondition(freezeTransport.serial == serial)
-        // A duration never proves the prior writer stopped or permits writes.
+        // Real time only sets a device-local hold. No write or takeover follows.
         var wait = CloudPendingWait()
         wait.observe(freshClaim, elapsed: .seconds(0))
         wait.observe(freshClaim, elapsed: .seconds(119))
         precondition(wait.confirmedWaiting.isEmpty)
         wait.observe(freshClaim, elapsed: .seconds(120))
-        precondition(wait.confirmedWaiting[retryAttempt.id] == retryAttempt)
+        precondition(wait.expiredOperations(touching: rule.id) == [retryAttempt.id])
         var absentWithoutReceipt = freshClaim.ledger
         absentWithoutReceipt.pending = []
         wait.observe(.init(accountID: "A", version: nil, ledger: absentWithoutReceipt), elapsed: .seconds(150))
-        precondition(wait.confirmedWaiting[retryAttempt.id] == retryAttempt)
-        let otherSession = CloudRuleSession(accountID: "B", version: nil, ledger: .init())
-        wait.observe(otherSession, elapsed: .seconds(200))
-        precondition(wait.confirmedWaiting.isEmpty)
-        // Confirmed-same-operation timeout clears on authoritative late completion.
-        wait.observe(claimed, elapsed: .seconds(250))
-        wait.observe(claimed, elapsed: .seconds(370))
-        precondition(wait.confirmedWaiting[attempt.id] == attempt)
-        wait.observe(winnerAfterFreeze, elapsed: .seconds(400))
-        precondition(wait.confirmedWaiting.isEmpty)
+        precondition(wait.expiredOperations(touching: rule.id) == [retryAttempt.id])
+
+        var withinWindow = CloudPendingWait()
+        withinWindow.observe(claimed, elapsed: .seconds(0))
+        withinWindow.observe(winnerAfterFreeze, elapsed: .seconds(119))
+        withinWindow.expire(elapsed: .seconds(500))
+        precondition(withinWindow.confirmedWaiting.isEmpty)
+
+        // First observation after the deadline cannot automatically release;
+        // a relaunch reads the same local hold even when the latest ledger completed.
+        var late = CloudPendingWait()
+        late.observe(claimed, elapsed: .seconds(0))
+        late.observe(winnerAfterFreeze, elapsed: .seconds(121))
+        precondition(late.expiredOperations(touching: rule.id) == [attempt.id])
+        let waitURL = directory.appendingPathComponent("manual-wait")
+        let beforeRelaunch = RuleCloudSync(transport: freezeTransport, stateURL: waitURL)
+        try beforeRelaunch.saveManualWaits(late.confirmedWaiting, accountID: "A")
+        let afterRelaunch = RuleCloudSync(transport: freezeTransport, stateURL: waitURL)
+        precondition(afterRelaunch.manualWaits(accountID: "B").isEmpty)
+        var restoredWait = CloudPendingWait(confirmedWaiting: afterRelaunch.manualWaits(accountID: "A"))
+        restoredWait.observe(winnerAfterFreeze, elapsed: .seconds(1))
+        precondition(restoredWait.expiredOperations(touching: rule.id) == [attempt.id])
+        var lateTombstone = winnerAfterFreeze.ledger
+        lateTombstone.rules = []
+        lateTombstone.tombstones.insert(rule.id)
+        restoredWait.observe(.init(accountID: "A", version: nil, ledger: lateTombstone), elapsed: .seconds(2))
+        precondition(restoredWait.expiredOperations(touching: rule.id) == [attempt.id])
+        restoredWait.clearManually([attempt.id], for: [UUID()])
+        precondition(restoredWait.expiredOperations(touching: rule.id) == [attempt.id])
+        restoredWait.clearManually([attempt.id], for: [rule.id])
+        try afterRelaunch.saveManualWaits(restoredWait.confirmedWaiting, accountID: "A")
+        let afterManual = RuleCloudSync(transport: freezeTransport, stateURL: waitURL)
+        precondition(afterManual.manualWaits(accountID: "A").isEmpty)
+        // The polling/relaunch path cannot reset or restart the same expired timer.
+        var timedOutWhileOffline = CloudPendingWait()
+        timedOutWhileOffline.observe(claimed, elapsed: .seconds(0))
+        timedOutWhileOffline.expire(elapsed: .seconds(120))
+        timedOutWhileOffline.observe(winnerAfterFreeze, elapsed: .seconds(123))
+        precondition(timedOutWhileOffline.expiredOperations(touching: rule.id) == [attempt.id])
+        precondition(timedOutWhileOffline.expiredOperations(touching: UUID()).isEmpty)
 
         // Unlock never publishes previous planned writes, removes effective rules,
         // or grants EventKit ownership to the reviewer.

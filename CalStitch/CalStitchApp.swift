@@ -613,6 +613,7 @@ private struct RulesHome: View {
     @State private var directFrozen: [UUID: String] = [:]
     @State private var freezeReview: Rule?
     @State private var pendingWait = CloudPendingWait()
+    @State private var pendingWaitAccount: String?
     @State private var pendingClockOrigin = ContinuousClock().now
     @AppStorage("settings.hideFrozenRules") private var hideFrozen = false
     @AppStorage(CloudRuleEnvironment.current.localKey("rules.hasCloudAccount")) private var hasCloudAccount = false
@@ -722,6 +723,9 @@ private struct RulesHome: View {
                                 L10n.text("規則已刪除", "Rule Deleted"), systemImage: "trash",
                                 description: Text(CloudRuleError.ruleDeleted.localizedDescription)
                             )
+                            if calendar.hasFullAccess && !pendingWait.expiredOperations(touching: rule.id).isEmpty {
+                                Button(L10n.text("解除凍結", "Unfreeze")) { freezeReview = rule }
+                            }
                             Button(L10n.text("返回規則列表", "Back to Rules")) { path.removeAll() }
                                 .buttonStyle(.bordered)
                         }
@@ -746,7 +750,7 @@ private struct RulesHome: View {
             .sheet(isPresented: $isAdding) { addSheet }
             .sheet(item: $freezeReview) { frozenRule in
                 FrozenRuleReview(rule: frozenRule, original: originalCalendarTitle(frozenRule.id),
-                                 inspect: { try inspectThaw(frozenRule.id) },
+                                 inspect: { try await reviewThaw(frozenRule.id) },
                                  confirm: { expected in try await confirmThaw(frozenRule.id, expected: expected) })
             }
             .background {
@@ -1041,6 +1045,7 @@ private struct RulesHome: View {
         if cloudResetPending {
             cloudResetPending = false
             pendingWait = CloudPendingWait()
+            pendingWaitAccount = nil
             snapshot = RuleSnapshot()
             cloudSession = nil
             loaded = false
@@ -1089,7 +1094,7 @@ private struct RulesHome: View {
                 }
                 guard !cloudResetPending else { throw CloudRuleError.accountChanged }
                 hasCloudAccount = true
-                pendingWait.observe(session, elapsed: pendingClockOrigin.duration(to: ContinuousClock().now))
+                try observeWait(session)
                 restoreCloud(session)
                 cloudReady = true
                 cloudReadError = nil
@@ -1099,6 +1104,7 @@ private struct RulesHome: View {
                 guard !cloudResetPending else { throw CloudRuleError.accountChanged }
                 cloudSession = nil
                 pendingWait = CloudPendingWait()
+                pendingWaitAccount = nil
                 knownDestinations = [:]
                 directFrozen = [:]
                 snapshot = try RuleSnapshot.read(localOnly: hasCloudAccount)
@@ -1110,6 +1116,10 @@ private struct RulesHome: View {
             loadFailed = false
             loaded = true
         } catch {
+            if let account = pendingWaitAccount {
+                pendingWait.expire(elapsed: pendingClockOrigin.duration(to: ContinuousClock().now))
+                try? cloud.saveManualWaits(pendingWait.confirmedWaiting, accountID: account)
+            }
             cloudReady = false
             cloudReadError = error.localizedDescription
             loadFailed = !loaded
@@ -1221,6 +1231,23 @@ private struct RulesHome: View {
         snapshot = RuleSnapshot(rules: rules, occurrences: occurrences, groupAppearances: appearances)
     }
 
+    private func observeWait(_ session: CloudRuleSession) throws {
+        if pendingWaitAccount != session.accountID {
+            pendingWaitAccount = session.accountID
+            pendingWait = CloudPendingWait(confirmedWaiting: cloud.manualWaits(accountID: session.accountID))
+        }
+        pendingWait.observe(session, elapsed: pendingClockOrigin.duration(to: ContinuousClock().now))
+        try cloud.saveManualWaits(pendingWait.confirmedWaiting, accountID: session.accountID)
+    }
+
+    private func clearWait(_ proposal: CloudThawProposal) throws {
+        guard !proposal.expired.isEmpty, pendingWaitAccount == proposal.accountID else { return }
+        var updated = pendingWait
+        updated.clearManually(proposal.expired, for: proposal.affected)
+        try cloud.saveManualWaits(updated.confirmedWaiting, accountID: proposal.accountID)
+        pendingWait = updated
+    }
+
     private func freezeReason(_ id: UUID, includingAncestors: Bool = true) -> String? {
         var cursor: UUID? = id
         var seen = Set<UUID>()
@@ -1228,7 +1255,7 @@ private struct RulesHome: View {
             if interruptedOperation(current) != nil {
                 return L10n.text("套用中斷。", "The update was interrupted.")
             }
-            if pendingWait.confirmedWaiting.values.contains(where: { operationTouches($0, ruleID: current) }) {
+            if !pendingWait.expiredOperations(touching: current).isEmpty {
                 return L10n.text("待完成時間較長，暫時凍結。", "This update is taking longer than expected. The rule is frozen for now.")
             }
             if pendingOperation(current) != nil { return nil }
@@ -1517,22 +1544,49 @@ private struct RulesHome: View {
         return destination.sourceTitle.isEmpty ? destination.title : "\(destination.title) · \(destination.sourceTitle)"
     }
 
+    private func reviewThaw(_ ruleID: UUID) async throws -> CloudThawProposal {
+        try requireCalendarMaintenance()
+        guard !cloudBusy, !cloudRefreshing, !cloudResetPending, let account = cloudSession?.accountID else {
+            throw CloudRuleError.unavailable
+        }
+        cloudBusy = true
+        defer { cloudBusy = false; if cloudResetPending { Task { await load() } } }
+        guard let latest = try await cloud.refresh(), latest.accountID == account, !cloudResetPending else {
+            throw CloudRuleError.accountChanged
+        }
+        try observeWait(latest)
+        restoreCloud(latest)
+        cloudReady = true
+        return try inspectThaw(ruleID)
+    }
+
     private func inspectThaw(_ ruleID: UUID) throws -> CloudThawProposal {
         try requireCalendarMaintenance()
         guard cloudReady, !cloudResetPending, let session = cloudSession else { throw CloudRuleError.unavailable }
+        let expired = pendingWait.expiredOperations(touching: ruleID)
+        if session.ledger.tombstones.contains(ruleID) {
+            return .init(accountID: session.accountID, operation: nil, expired: expired, affected: [ruleID],
+                         deleted: true, locations: [:], previous: [], observed: [])
+        }
         if let rule = snapshot.rules.first(where: { $0.id == ruleID }), let parent = rule.parent,
-           freezeReason(parent) != nil, interruptedOperation(ruleID) == nil {
+           freezeReason(parent) != nil, interruptedOperation(ruleID) == nil,
+           pendingWait.expiredOperations(touching: parent).isDisjoint(with: expired) {
             throw RuleOperationError(L10n.text("請先解除依據規則的凍結。", "Unfreeze the parent rule first."))
         }
+        var affected = Set([ruleID])
+        for id in expired { affected.formUnion(pendingWait.confirmedWaiting[id] ?? []) }
+        let scopeOperations = session.ledger.pending.filter { op in affected.contains { operationTouches(op, ruleID: $0) } }
         let operation = pendingOperation(ruleID)
-        if operation?.interrupted == false ||
-            (operation == nil && pendingWait.confirmedWaiting.values.contains { operationTouches($0, ruleID: ruleID) }) {
+        let concluded = session.ledger.completed.union(session.ledger.retired ?? [])
+        if scopeOperations.contains(where: { $0 != operation || !$0.interrupted }) ||
+            expired.contains(where: { $0 != operation?.id && !concluded.contains($0) }) {
             throw RuleOperationError(L10n.text("尚無法確認原裝置已停止寫入。規則保持凍結，待同步確認。", "The original writer has not been verified as stopped. The rule remains frozen until sync can confirm it."))
         }
-        let affected = (operation?.plan?.ruleIDs ?? []).union([ruleID])
+        affected.formUnion(operation?.plan?.ruleIDs ?? [])
         var locations: [UUID: String] = [:]
         var previous: [PlannedOccurrence] = []
         for id in affected {
+            if session.ledger.tombstones.contains(id) { continue }
             guard let entry = session.ledger.rules.first(where: { $0.id == id }) else {
                 // A new pending rule has no confirmed baseline to unlock.
                 throw CalendarIntegrationError.invalidPlan
@@ -1552,8 +1606,10 @@ private struct RulesHome: View {
         var attempted = (plan?.previous ?? []) + (plan?.desired ?? []) + (plan?.result ?? [])
         if let plan { attempted += plan.mutations.flatMap { [$0.old, $0.new].compactMap { $0 } } }
         let observed = try calendar.verifyOriginalForUnfreeze(previous: previous, attempted: attempted, locations: locations)
-        return CloudThawProposal(accountID: session.accountID, operation: operation,
-                                 locations: locations, previous: previous, observed: observed)
+        return CloudThawProposal(accountID: session.accountID, operation: operation, expired: expired,
+                                 affected: affected, deleted: false, locations: locations,
+                                 previous: previous.sorted { $0.ruleID == $1.ruleID ? $0.key < $1.key : $0.ruleID.uuidString < $1.ruleID.uuidString },
+                                 observed: observed)
     }
 
     private func confirmThaw(_ ruleID: UUID, expected: CloudThawProposal) async throws {
@@ -1569,20 +1625,22 @@ private struct RulesHome: View {
         guard let latest = try await cloud.refresh(), latest.accountID == expected.accountID, !cloudResetPending else {
             throw CloudRuleError.accountChanged
         }
-        pendingWait.observe(latest, elapsed: pendingClockOrigin.duration(to: ContinuousClock().now))
+        try observeWait(latest)
         restoreCloud(latest)
-        if let operation = expected.operation, latest.ledger.completed.contains(operation.id) {
-            // The original writer already completed; leave that result in effect.
-            return
-        }
+        cloudReady = true
         let current = try inspectThaw(ruleID)
         guard current == expected else { throw CalendarIntegrationError.removalSelectionChanged }
         if let operation = current.operation {
             let ended = try await cloud.retireInterruptedWithoutEventWrite(operation, in: latest)
             guard !cloudResetPending else { throw CloudRuleError.accountChanged }
-            pendingWait.observe(ended, elapsed: pendingClockOrigin.duration(to: ContinuousClock().now))
+            try observeWait(ended)
             restoreCloud(ended)
+            // A racing successful original writer may have different evidence.
+            guard ended.ledger.retired?.contains(operation.id) == true else {
+                throw CalendarIntegrationError.removalSelectionChanged
+            }
         }
+        try clearWait(current)
     }
 
     private func resolve(_ input: Rule, allowingVerifiedRebinding: Bool = false) throws -> RuleReconciliation {
@@ -3790,6 +3848,9 @@ private struct OrphanCleanupView: View {
 private struct CloudThawProposal: Equatable {
     let accountID: String
     let operation: CloudRuleOperation?
+    let expired: Set<UUID>
+    let affected: Set<UUID>
+    let deleted: Bool
     let locations: [UUID: String]
     let previous: [PlannedOccurrence]
     let observed: [PlannedOccurrence]
@@ -3798,7 +3859,7 @@ private struct CloudThawProposal: Equatable {
 private struct FrozenRuleReview: View {
     let rule: Rule
     let original: String?
-    let inspect: () throws -> CloudThawProposal
+    let inspect: () async throws -> CloudThawProposal
     let confirm: (CloudThawProposal) async throws -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var proposal: CloudThawProposal?
@@ -3816,6 +3877,9 @@ private struct FrozenRuleReview: View {
                     if let errorMessage { Text(errorMessage).foregroundStyle(.secondary) }
                 }
                 if let proposal {
+                    if proposal.deleted {
+                        Text(L10n.text("雲端已確認刪除。確認後不會恢復這條規則或事件。", "iCloud confirms the rule was deleted. Confirming will not restore it or its events."))
+                    }
                     if !proposal.observed.isEmpty {
                         Section(L10n.text("已核對的事件", "Verified Events")) {
                             ForEach(Array(proposal.observed.enumerated()), id: \.offset) { _, event in
@@ -3827,7 +3891,7 @@ private struct FrozenRuleReview: View {
                         }
                     }
                     Section {
-                        Button(L10n.text("確認接手", "Confirm Takeover")) {
+                        Button(proposal.deleted ? L10n.text("確認刪除狀態", "Acknowledge Deletion") : L10n.text("確認接手", "Confirm Takeover")) {
                             guard !processing else { return }
                             processing = true
                             Task {
@@ -3837,8 +3901,8 @@ private struct FrozenRuleReview: View {
                             }
                         }.disabled(processing)
                     } footer: {
-                        Text(L10n.text("解除凍結後，你可以在這台裝置修改或刪除規則。行事曆事件不會立即變更。",
-                                       "After unfreezing, you can edit or delete the rule on this device. Calendar events will not change immediately."))
+                        if !proposal.deleted { Text(L10n.text("解除凍結後，你可以在這台裝置修改或刪除規則。行事曆事件不會立即變更。",
+                                       "After unfreezing, you can edit or delete the rule on this device. Calendar events will not change immediately.")) }
                     }
                 }
             }
@@ -3849,7 +3913,7 @@ private struct FrozenRuleReview: View {
                 }
             }
             .task {
-                do { proposal = try inspect(); errorMessage = nil }
+                do { proposal = try await inspect(); errorMessage = nil }
                 catch { proposal = nil; errorMessage = error.localizedDescription }
             }
         }
