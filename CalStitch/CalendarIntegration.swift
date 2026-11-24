@@ -18,10 +18,11 @@ struct CalendarChange: Identifiable {
     let date: Date
 }
 
-struct CalendarPreviewEvent: Identifiable {
+struct CalendarPreviewEvent: Identifiable, Equatable {
     enum Kind: Equatable { case unchanged, insert, update, remove }
 
     let id: String
+    let ruleID: UUID
     let title: String
     let start: Date
     let end: Date
@@ -36,6 +37,7 @@ struct CalendarPreviewEvent: Identifiable {
 
 struct CalendarRemovalEvent: Identifiable, Equatable {
     let id: String
+    let ruleID: UUID
     let title: String
     let start: Date
     let end: Date
@@ -252,11 +254,9 @@ final class CalendarIntegration: ObservableObject {
         var previewEvents: [CalendarPreviewEvent] = []
     }
 
-    func previewEvents(for ruleID: UUID, desired: [PlannedOccurrence], previous: [PlannedOccurrence]) throws -> [CalendarPreviewEvent] {
-        let scope: Set<UUID> = [ruleID]
-        return try reconcile(desired: desired.filter { scope.contains($0.ruleID) },
-                             previous: previous.filter { scope.contains($0.ruleID) },
-                             ruleIDs: scope, now: .now, includingEvents: true).previewEvents
+    func previewEvents(ruleIDs: Set<UUID>, desired: [PlannedOccurrence], previous: [PlannedOccurrence]) throws -> [CalendarPreviewEvent] {
+        try reconcile(desired: desired, previous: previous, ruleIDs: ruleIDs,
+                      now: .now, includingEvents: true).previewEvents
     }
 
     func existingPreviewEvents(for ruleID: UUID, previous: [PlannedOccurrence]) throws -> [CalendarPreviewEvent] {
@@ -291,6 +291,13 @@ final class CalendarIntegration: ObservableObject {
         return try removalEvents(in: reconcile(desired: [], previous: previous, ruleIDs: ruleIDs, now: .now))
     }
 
+    func previewBranchRemoval(previous: [PlannedOccurrence], ruleIDs: Set<UUID>) throws
+        -> (removals: [CalendarRemovalEvent], retained: [CalendarPreviewEvent]) {
+        store.reset()
+        let plan = try reconcile(desired: [], previous: previous, ruleIDs: ruleIDs, now: .now, includingEvents: true)
+        return (try removalEvents(in: plan), plan.previewEvents.filter { $0.kind == .unchanged })
+    }
+
     func applyRemoval(previous: [PlannedOccurrence], ruleIDs: Set<UUID>, matching expected: [CalendarRemovalEvent]) throws {
         store.reset()
         let current = try reconcile(desired: [], previous: previous, ruleIDs: ruleIDs, now: .now)
@@ -307,7 +314,7 @@ final class CalendarIntegration: ObservableObject {
                   let calendar = event.calendar, let start = event.startDate, let end = event.endDate else {
                 throw CalendarIntegrationError.invalidPlan
             }
-            return .init(id: identity.displayID, title: event.title ?? L10n.text("無標題", "Untitled"),
+            return .init(id: identity.displayID, ruleID: identity.rule, title: event.title ?? L10n.text("無標題", "Untitled"),
                          start: plannedDate(start, allDay: event.isAllDay),
                          end: plannedEndDate(end, allDay: event.isAllDay), isAllDay: event.isAllDay,
                          calendarID: calendar.calendarIdentifier, calendarTitle: Self.destination(calendar).displayTitle,
@@ -619,7 +626,7 @@ final class CalendarIntegration: ObservableObject {
         // Reconciliation already checked exact target, matching marker and applied snapshot
         // for every event in found. Never synthesize a live record from the cached snapshot.
         func existing(_ identity: Identity, _ event: EKEvent, kind: CalendarPreviewEvent.Kind) -> CalendarPreviewEvent {
-            .init(id: identity.displayID, title: event.title ?? L10n.text("無標題", "Untitled"),
+            .init(id: identity.displayID, ruleID: identity.rule, title: event.title ?? L10n.text("無標題", "Untitled"),
                   start: plannedDate(event.startDate, allDay: event.isAllDay),
                   end: plannedEndDate(event.endDate, allDay: event.isAllDay),
                   isAllDay: event.isAllDay, isPast: event.endDate <= now, kind: kind)
@@ -632,11 +639,11 @@ final class CalendarIntegration: ObservableObject {
         for operation in operations {
             switch operation {
             case let .insert(identity, occurrence):
-                rows[identity] = .init(id: identity.displayID, title: occurrence.title, start: occurrence.start,
+                rows[identity] = .init(id: identity.displayID, ruleID: identity.rule, title: occurrence.title, start: occurrence.start,
                                        end: occurrence.end, isAllDay: occurrence.isAllDay, isPast: false, kind: .insert)
             case let .update(identity, event, occurrence):
                 let old = existing(identity, event, kind: .unchanged)
-                rows[identity] = .init(id: identity.displayID, title: occurrence.title, start: occurrence.start,
+                rows[identity] = .init(id: identity.displayID, ruleID: identity.rule, title: occurrence.title, start: occurrence.start,
                                        end: occurrence.end, isAllDay: occurrence.isAllDay, isPast: false, kind: .update,
                                        previousStart: old.start, previousEnd: old.end, previousIsAllDay: old.isAllDay)
             case let .remove(identity, event):

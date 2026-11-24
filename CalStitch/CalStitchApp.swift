@@ -611,6 +611,9 @@ private struct RulesHome: View {
                                parent: snapshot.rules.first { $0.id == rule.parent },
                                allRules: snapshot.rules, calendar: calendar,
                                preview: preview, onApply: apply, onApplied: returnAfterApply,
+                               previewDeletion: { id in try previewRemoval([id], allowChild: true) },
+                               onDelete: { id, expected in try removeSelected([id], expected, allowChild: true) },
+                               onDeleted: { if !path.isEmpty { path.removeLast() } },
                                onSaveAppearance: saveRuleAppearance) { child, isNew in
                         path.append(.edit(child, isNew: isNew))
                     }
@@ -865,16 +868,22 @@ private struct RulesHome: View {
     }
 
     private func preview(_ rule: Rule) throws -> RuleEventPreviewResult {
+        var rules = snapshot.rules.filter { $0.id != rule.id }
+        rules.append(rule)
+        let tree = ruleTreeRows(roots: [rule], rules: rules)
         do {
             let plan = try resolve(rule)
-            let rows = try calendar.previewEvents(for: rule.id, desired: plan.desired, previous: plan.previous)
-            return RuleEventPreviewResult(events: rows, warning: nil)
+            let events = try calendar.previewEvents(ruleIDs: plan.ruleIDs, desired: plan.desired, previous: plan.previous)
+            return RuleEventPreviewResult(rules: tree, events: events, warning: nil)
         } catch {
-            let previous = snapshot.occurrences.filter { $0.ruleID == rule.id }
+            let ids = Set(tree.map(\.id))
+            let previous = Dictionary(grouping: snapshot.occurrences.filter { ids.contains($0.ruleID) }, by: \.ruleID)
             guard !previous.isEmpty else { throw error }
-            let existing = try calendar.existingPreviewEvents(for: rule.id, previous: previous)
+            let existing = try tree.flatMap { row in
+                try calendar.existingPreviewEvents(for: row.id, previous: previous[row.id, default: []])
+            }
             return RuleEventPreviewResult(
-                events: existing,
+                rules: tree, events: existing,
                 warning: L10n.text("目前只能查看已確認的既有事件，無法預覽這次變更。\n\(error.localizedDescription)", "Only confirmed existing events can be shown. These changes could not be previewed.\n\(error.localizedDescription)")
             )
         }
@@ -1020,25 +1029,39 @@ private struct RulesHome: View {
     }
 
     private func previewRemoval(_ selected: Set<UUID>) throws -> BatchRemovalPreview {
-        let ids = try selectedTreeIDs(selected)
+        try previewRemoval(selected, allowChild: false)
+    }
+
+    private func previewRemoval(_ selected: Set<UUID>, allowChild: Bool) throws -> BatchRemovalPreview {
+        let rules = try removalRows(selected, allowChild: allowChild)
+        let ids = Set(rules.map(\.id))
         let appliedIDs = Set(snapshot.rules.filter { ids.contains($0.id) && $0.hasApplied }.map(\.id))
-        let branches = Dictionary(grouping: snapshot.rules, by: \.parent)
-        var visited = Set<UUID>()
-        func removalRows(_ rule: Rule, depth: Int) -> [BatchRemovalRule] {
-            guard visited.insert(rule.id).inserted else { return [] }
-            let row = BatchRemovalRule(id: rule.id, title: rule.displayName, depth: depth)
-            return [row] + (branches[rule.id] ?? []).flatMap { removalRows($0, depth: depth + 1) }
+        let previous = snapshot.occurrences.filter { appliedIDs.contains($0.ruleID) }
+        if allowChild {
+            let details = try calendar.previewBranchRemoval(previous: previous, ruleIDs: appliedIDs)
+            return BatchRemovalPreview(rules: rules, events: details.removals, retained: details.retained)
         }
-        let rules = rootRules.filter { selected.contains($0.id) }.flatMap { removalRows($0, depth: 0) }
-        let events = appliedIDs.isEmpty ? [] : try calendar.previewRemoval(
-            previous: snapshot.occurrences.filter { appliedIDs.contains($0.ruleID) }, ruleIDs: appliedIDs
-        )
+        let events = appliedIDs.isEmpty ? [] : try calendar.previewRemoval(previous: previous, ruleIDs: appliedIDs)
         return BatchRemovalPreview(rules: rules, events: events)
     }
 
+    private func removalRows(_ selected: Set<UUID>, allowChild: Bool) throws -> [BatchRemovalRule] {
+        let eligible = allowChild ? snapshot.rules : rootRules
+        let roots = eligible.filter { selected.contains($0.id) }
+        guard loaded, !selected.isEmpty, roots.count == selected.count, !allowChild || selected.count == 1 else {
+            throw RuleOperationError(L10n.text("找不到要移除的規則，請返回清單重新選擇。", "The rules to delete could not be found. Return to the list and select again."))
+        }
+        return ruleTreeRows(roots: roots, rules: snapshot.rules)
+    }
+
     private func removeSelected(_ selected: Set<UUID>, _ expected: BatchRemovalPreview) throws {
-        guard try previewRemoval(selected) == expected else { throw CalendarIntegrationError.removalSelectionChanged }
-        let ids = try selectedTreeIDs(selected)
+        try removeSelected(selected, expected, allowChild: false)
+    }
+
+    private func removeSelected(_ selected: Set<UUID>, _ expected: BatchRemovalPreview, allowChild: Bool) throws {
+        let current = try previewRemoval(selected, allowChild: allowChild)
+        guard current.rules == expected.rules, current.events == expected.events else { throw CalendarIntegrationError.removalSelectionChanged }
+        let ids = Set(expected.rules.map(\.id))
         let appliedIDs = Set(snapshot.rules.filter { ids.contains($0.id) && $0.hasApplied }.map(\.id))
         var updated = snapshot
         updated.rules.removeAll { ids.contains($0.id) }
@@ -1234,7 +1257,9 @@ private struct RulesHome: View {
                     .padding(.leading, 3)
                 if isFirst { addRuleButton }
             }
-            ForEach(uniqueNames(rules.map(\.subcategory)), id: \.self) { subcategory in
+            let subcategories = uniqueNames(rules.map(\.subcategory).filter { !$0.isEmpty })
+            let groupOrder = subcategories + (rules.contains { $0.subcategory.isEmpty } ? [""] : [])
+            ForEach(groupOrder, id: \.self) { subcategory in
                 let group = rules.filter { $0.subcategory == subcategory }
                 VStack(alignment: .leading, spacing: 0) {
                     if !subcategory.isEmpty {
@@ -1253,7 +1278,7 @@ private struct RulesHome: View {
                     }
                 }
                 .background(card, in: RoundedRectangle(cornerRadius: 18))
-                .padding(.leading, subcategory.isEmpty ? 0 : 22)
+                .padding(.leading, 22)
             }
         }
     }
@@ -1411,6 +1436,19 @@ private struct AppearanceEditSheet: View {
     }
 }
 
+private func ruleTreeRows(roots: [Rule], rules: [Rule]) -> [BatchRemovalRule] {
+    let children = Dictionary(grouping: rules, by: \.parent)
+    var pending = roots.reversed().map { (rule: $0, depth: 0) }
+    var visited = Set<UUID>()
+    var rows: [BatchRemovalRule] = []
+    while let (rule, depth) = pending.popLast() {
+        guard visited.insert(rule.id).inserted else { continue }
+        rows.append(.init(id: rule.id, title: rule.displayName, depth: depth))
+        pending.append(contentsOf: children[rule.id, default: []].reversed().map { ($0, depth + 1) })
+    }
+    return rows
+}
+
 private struct RuleEditor: View {
     @State private var rule: Rule
     @State private var baseline: Rule?
@@ -1423,6 +1461,8 @@ private struct RuleEditor: View {
     @State private var connecting = false
     @State private var collapsedBranches: Set<UUID> = []
     @State private var editingAppearance = false
+    @State private var showingDeletion = false
+    @State private var didDelete = false
     @State private var followsSuggestedTitle: Bool
     @State private var followsSuggestedCategory: Bool
     @State private var followsCategoryDestination: Bool
@@ -1435,12 +1475,18 @@ private struct RuleEditor: View {
     let preview: (Rule) throws -> RuleEventPreviewResult
     let onApply: (Rule) throws -> Rule
     let onApplied: () -> Void
+    let previewDeletion: (UUID) throws -> BatchRemovalPreview
+    let onDelete: (UUID, BatchRemovalPreview) throws -> Void
+    let onDeleted: () -> Void
     let onSaveAppearance: (UUID, RuleAppearance) throws -> Bool
     let onOpenChild: (Rule, Bool) -> Void
 
     init(initial: Rule, isNew: Bool, parent: Rule?, allRules: [Rule], calendar: CalendarIntegration,
          preview: @escaping (Rule) throws -> RuleEventPreviewResult, onApply: @escaping (Rule) throws -> Rule,
          onApplied: @escaping () -> Void,
+         previewDeletion: @escaping (UUID) throws -> BatchRemovalPreview,
+         onDelete: @escaping (UUID, BatchRemovalPreview) throws -> Void,
+         onDeleted: @escaping () -> Void,
          onSaveAppearance: @escaping (UUID, RuleAppearance) throws -> Bool,
          onOpenChild: @escaping (Rule, Bool) -> Void) {
         let isFresh = isNew && !allRules.contains { $0.id == initial.id }
@@ -1462,6 +1508,9 @@ private struct RuleEditor: View {
         self.preview = preview
         self.onApply = onApply
         self.onApplied = onApplied
+        self.previewDeletion = previewDeletion
+        self.onDelete = onDelete
+        self.onDeleted = onDeleted
         self.onSaveAppearance = onSaveAppearance
         self.onOpenChild = onOpenChild
     }
@@ -1645,7 +1694,16 @@ private struct RuleEditor: View {
                 .disabled(baseline == nil)
             } header: { Text(L10n.text("子規則", "Child Rules")) }
               footer: { Text(baseline == nil ? L10n.text("先套用這條規則，才能新增它的子規則。", "Apply this rule before adding child rules.") : L10n.text("可編輯直接子規則；縮排的下游項目僅供查看。", "You can edit direct child rules here. Deeper levels are shown for reference.")) }
-            EventPreview(rule: previewRule, civilCalendar: ruleCalendar, load: preview)
+            EventPreview(rule: previewRule, savedRules: allRules, civilCalendar: ruleCalendar, load: preview)
+            if !isFreshRule {
+                Section {
+                    Button { showingDeletion = true } label: {
+                        Label(L10n.text("刪除規則", "Delete Rule"), systemImage: "trash")
+                            .foregroundStyle(requiredFieldTint)
+                    }
+                    .accessibilityIdentifier("delete-rule")
+                }
+            }
         }
         .onChange(of: rule.suggestedTitle) { _, suggestion in
             if followsSuggestedTitle { rule.name = suggestion ?? "" }
@@ -1679,12 +1737,25 @@ private struct RuleEditor: View {
                 }
             }
             if dirty {
-                ToolbarItem(placement: .confirmationAction) {
+                ToolbarItem(placement: .topBarTrailing) {
                     Button(L10n.text("套用", "Apply"), action: applyAndReturn)
                     .fontWeight(.semibold)
                     .disabled(!canApply)
                     .accessibilityIdentifier("apply-rule")
                 }
+            }
+        }
+        .sheet(isPresented: $showingDeletion, onDismiss: {
+            if didDelete {
+                didDelete = false
+                onDeleted()
+            }
+        }) {
+            RuleDeletionPreview(civilCalendar: ruleCalendar, hasUnsavedChanges: hasUnsavedChanges,
+                                load: { try previewDeletion(rule.id) }) { expected in
+                try onDelete(rule.id, expected)
+                didDelete = true
+                showingDeletion = false
             }
         }
         .sheet(isPresented: $pendingDiscard, onDismiss: handleExitAction) {
@@ -2138,13 +2209,15 @@ private struct RuleEditor: View {
     }
 }
 
-struct RuleEventPreviewResult {
+private struct RuleEventPreviewResult {
+    let rules: [BatchRemovalRule]
     let events: [CalendarPreviewEvent]
     let warning: String?
 }
 
 private struct EventPreview: View {
     let rule: Rule
+    let savedRules: [Rule]
     let civilCalendar: Calendar
     let load: (Rule) throws -> RuleEventPreviewResult
     @State private var expanded = false
@@ -2166,12 +2239,16 @@ private struct EventPreview: View {
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                         }
-                        if preview.events.isEmpty {
-                            Text(L10n.text("此規則沒有可預覽的事件", "There are no events to preview for this rule"))
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(preview.events) { event in
-                                eventRow(event)
+                        let eventsByRule = Dictionary(grouping: preview.events, by: \.ruleID)
+                        RulePreviewTree(rows: preview.rules) { row in
+                            if let events = eventsByRule[row.id], !events.isEmpty {
+                                ForEach(events) { event in
+                                    RulePreviewEventRow(event: event, civilCalendar: civilCalendar)
+                                }
+                            } else {
+                                Text(L10n.text("沒有可預覽的事件", "No Events to Preview"))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -2184,17 +2261,20 @@ private struct EventPreview: View {
             .accessibilityIdentifier("preview-events")
         } footer: {
             if expanded {
-                Text(L10n.text("這裡列出本規則已寫入行事曆的事件，以及尚未套用的變更。按「套用」後才會更新行事曆。", "This preview shows events already in your calendar and changes not yet applied. Your calendar is updated only when you tap Apply."))
+                Text(L10n.text("這裡列出本規則及子規則已寫入行事曆的事件，以及尚未套用的變更。按「套用」後才會更新行事曆。", "This preview shows saved events and unapplied changes for this rule and its child rules. Your calendar is updated only when you tap Apply."))
             }
         }
         .onChange(of: expanded) { _, open in
             if open, loadedRule != rule { refresh() }
         }
-        .onChange(of: rule) { _, _ in
-            loadedRule = nil
-            result = nil
-            if expanded { refresh() }
-        }
+        .onChange(of: rule) { _, _ in invalidate() }
+        .onChange(of: savedRules) { _, _ in invalidate() }
+    }
+
+    private func invalidate() {
+        loadedRule = nil
+        result = nil
+        if expanded { refresh() }
     }
 
     private func refresh() {
@@ -2202,12 +2282,174 @@ private struct EventPreview: View {
         result = Result {
             let preview = try load(submitted)
             let events = preview.events.sorted { ($0.start, $0.id) < ($1.start, $1.id) }
-            return RuleEventPreviewResult(events: events, warning: preview.warning)
+            return RuleEventPreviewResult(rules: preview.rules, events: events, warning: preview.warning)
         }
         loadedRule = submitted
     }
 
-    private func eventRow(_ event: CalendarPreviewEvent) -> some View {
+}
+
+private struct RulePreviewTree<Rows: View>: View {
+    let rows: [BatchRemovalRule]
+    @ViewBuilder let content: (BatchRemovalRule) -> Rows
+    @State private var collapsed: Set<UUID> = []
+
+    private var visible: [BatchRemovalRule] {
+        var hiddenBelow: Int?
+        return rows.filter { row in
+            if let depth = hiddenBelow, row.depth > depth { return false }
+            hiddenBelow = collapsed.contains(row.id) ? row.depth : nil
+            return true
+        }
+    }
+
+    var body: some View {
+        ForEach(visible) { row in
+            let margin = CGFloat(min(row.depth, 5)) * 12
+            VStack(alignment: .leading, spacing: 8) {
+                if let index = rows.firstIndex(where: { $0.id == row.id }),
+                   index + 1 < rows.count, rows[index + 1].depth > row.depth {
+                    Button {
+                        if !collapsed.insert(row.id).inserted { collapsed.remove(row.id) }
+                    } label: {
+                        Label(row.title, systemImage: collapsed.contains(row.id) ? "chevron.right" : "chevron.down")
+                            .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(collapsed.contains(row.id)
+                        ? L10n.text("展開子規則：\(row.title)", "Expand child rules: \(row.title)")
+                        : L10n.text("收合子規則：\(row.title)", "Collapse child rules: \(row.title)"))
+                } else {
+                    Text(row.title)
+                        .accessibilityAddTraits(.isHeader)
+                }
+                content(row)
+            }
+            .font(.subheadline.weight(.semibold))
+            .padding(.leading, margin)
+            .padding(.vertical, 4)
+        }
+    }
+}
+
+private struct RuleDeletionPreview: View {
+    let civilCalendar: Calendar
+    let hasUnsavedChanges: Bool
+    let load: () throws -> BatchRemovalPreview
+    let remove: (BatchRemovalPreview) throws -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var preview: BatchRemovalPreview?
+    @State private var failure: String?
+    @State private var canReload = true
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let failure {
+                    Section {
+                        Label(failure, systemImage: "exclamationmark.circle")
+                        if canReload {
+                            Button(L10n.text("重新預覽", "Preview Again"), action: refresh)
+                        }
+                    }
+                }
+                if let preview {
+                    Section {
+                        Text(L10n.text("將刪除 \(preview.ruleCount) 條規則及 \(preview.eventCount) 筆尚未開始的事件。",
+                                       "Rules to delete: \(preview.ruleCount). Upcoming events to delete: \(preview.eventCount)."))
+                        Text(L10n.text("已開始或已過去的事件會保留。收合不影響刪除範圍。", "Events that already started or ended will be kept. Collapsing a branch does not change what will be deleted."))
+                            .foregroundStyle(.secondary)
+                        if hasUnsavedChanges {
+                            Text(L10n.text("這條規則尚未套用的修改也會捨棄。", "Unapplied edits to this rule will also be discarded."))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    let byRule = Dictionary(grouping: preview.events, by: \.ruleID)
+                    let retainedByRule = Dictionary(grouping: preview.retained, by: \.ruleID)
+                    Section {
+                        RulePreviewTree(rows: preview.rules) { row in
+                            if let kept = retainedByRule[row.id] {
+                                ForEach(kept) { event in
+                                    RulePreviewEventRow(event: event, civilCalendar: civilCalendar)
+                                }
+                            }
+                            if let events = byRule[row.id], !events.isEmpty {
+                                ForEach(events) { event in
+                                    let zone = event.timeZoneIdentifier.flatMap(TimeZone.init(identifier:))
+                                    let displayCalendar = zone.map { zone in
+                                        var calendar = civilCalendar
+                                        calendar.timeZone = zone
+                                        return calendar
+                                    } ?? civilCalendar
+                                    RulePreviewEventRow(event: .init(id: event.id, ruleID: event.ruleID, title: event.title,
+                                                                    start: event.start, end: event.end, isAllDay: event.isAllDay,
+                                                                    isPast: false, kind: .remove), civilCalendar: displayCalendar)
+                                }
+                            } else {
+                                Text(L10n.text("沒有待移除的事件", "No Events to Delete"))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                } else if failure == nil {
+                    ProgressView(L10n.text("正在讀取事件…", "Loading events…"))
+                }
+            }
+            .navigationTitle(L10n.text("刪除預覽", "Deletion Preview"))
+            .navigationBarTitleDisplayMode(.inline)
+            .safeAreaInset(edge: .bottom) {
+                HStack {
+                    Button(L10n.text("取消", "Cancel"), role: .cancel) { dismiss() }
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                    Button(L10n.text("確認刪除", "Confirm Deletion"), role: .destructive, action: confirm)
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .disabled(preview == nil)
+                        .accessibilityIdentifier("confirm-delete-rule")
+                }
+                .font(.body.weight(.semibold))
+                .padding(.horizontal)
+                .background(.regularMaterial)
+            }
+        }
+        .task { if preview == nil && failure == nil { refresh() } }
+    }
+
+    private func refresh() {
+        do {
+            preview = try load()
+            failure = nil
+        } catch {
+            preview = nil
+            failure = error.localizedDescription
+        }
+    }
+
+    private func confirm() {
+        guard let preview else { return }
+        do {
+            try remove(preview)
+        } catch {
+            self.preview = nil
+            failure = error.localizedDescription
+            if let calendarError = error as? CalendarIntegrationError {
+                switch calendarError {
+                case .writeFailed: canReload = false
+                default: canReload = true
+                }
+            } else {
+                canReload = false
+            }
+        }
+    }
+}
+
+private struct RulePreviewEventRow: View {
+    let event: CalendarPreviewEvent
+    let civilCalendar: Calendar
+
+    var body: some View {
         let status: (label: String, color: Color)? = switch event.kind {
         case .unchanged: nil
         case .insert: (L10n.text("將新增", "To Add"), readableTint(light: 0x456B52, dark: 0x91AA98))
@@ -2324,6 +2566,13 @@ struct CalendarDestinationField: View {
 private struct CalStitchSettingsView: View {
     @AppStorage("settings.defaultTimeZoneIdentifier") private var overrideIdentifier = ""
 
+    private var installedVersion: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        if let version, let build { return "\(version) (\(build))" }
+        return version ?? build ?? "—"
+    }
+
     private var currentIdentifier: String {
         overrideIdentifier.isEmpty ? TimeZone.autoupdatingCurrent.identifier : overrideIdentifier
     }
@@ -2336,6 +2585,15 @@ private struct CalStitchSettingsView: View {
 
     var body: some View {
         Form {
+            Section {
+                LabeledContent {
+                    Text(installedVersion).monospacedDigit()
+                } label: {
+                    Text(L10n.text("版本", "Version"))
+                }
+                .accessibilityIdentifier("installed-version")
+            }
+
             Section {
                 NavigationLink {
                     TimeZoneOptionsView(overrideIdentifier: $overrideIdentifier)

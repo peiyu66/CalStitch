@@ -42,6 +42,7 @@ typealias BatchRemovalEvent = CalendarRemovalEvent
 struct BatchRemovalPreview: Equatable {
     let rules: [BatchRemovalRule]
     let events: [BatchRemovalEvent]
+    var retained: [CalendarPreviewEvent] = []
     var ruleCount: Int { rules.count }
     var eventCount: Int { events.count }
 }
