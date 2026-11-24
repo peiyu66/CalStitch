@@ -5,7 +5,7 @@ import Foundation
     var serial = 0
     var accounts: [String: CloudRuleSession] = [:]
     var nextFailure: Failure = .none
-    enum Failure { case none, loseResponse, offline }
+    enum Failure { case none, loseResponse, offline, staleCAS }
     func accountID() async throws -> String? { active }
     func fetch(accountID: String) async throws -> CloudRuleSession {
         guard active == accountID else { throw CloudRuleError.accountChanged }
@@ -15,7 +15,7 @@ import Foundation
         let latest = try await fetch(accountID: session.accountID)
         guard latest.version == session.version else { throw CloudRuleError.conflict }
         let failure = nextFailure; nextFailure = .none
-        if case .offline = failure { throw CloudRuleError.unavailable }
+        if case .offline = failure { throw CloudRuleError.unavailable }; if case .staleCAS = failure { throw CloudRuleError.conflict }
         serial += 1
         let result = CloudRuleSession(accountID: latest.accountID, version: Data(String(serial).utf8), ledger: ledger)
         accounts[latest.accountID] = result
@@ -181,6 +181,49 @@ import Foundation
         precondition(prodOther.ledger.rules.isEmpty && prodTransport.serial == 1)
         precondition(CloudRuleEnvironment.development.localKey("rules.hasCloudAccount") == "rules.hasCloudAccount")
         precondition(CloudRuleEnvironment.production.localKey("rules.hasCloudAccount") != "rules.hasCloudAccount")
+        // Explicit peer freeze is not ownership transfer or an EventKit checkpoint.
+        let freezeTransport = MemoryTransport()
+        let incumbent = RuleCloudSync(transport: freezeTransport, stateURL: directory.appendingPathComponent("incumbent"))
+        let peer = RuleCloudSync(transport: freezeTransport, stateURL: directory.appendingPathComponent("peer"))
+        let initial = try await incumbent.refresh()!
+        let attempt = CloudRuleOperation(owner: incumbent.deviceID, scope: [rule.id], upserts: [envelope], deletions: [])
+        let claimed = try await incumbent.claim(attempt, localBefore: [], localAfter: [], in: initial)
+        let checked = try await incumbent.verifyOwnership(attempt.id, in: claimed)
+        freezeTransport.nextFailure = .offline
+        do { _ = try await peer.confirmInterrupted(attempt, accountID: "A"); fatalError("unacknowledged freeze succeeded") }
+        catch CloudRuleError.unavailable {}
+        let stillPending = try await peer.refresh()!
+        precondition(stillPending.ledger.pendingOperation(attempt.id) == attempt)
+        // Lost successful response is accepted only after exact interrupted readback.
+        freezeTransport.nextFailure = .loseResponse
+        let peerFrozen = try await peer.confirmInterrupted(attempt, accountID: "A")
+        precondition(peerFrozen.ledger.pendingOperation(attempt.id)?.interrupted == true)
+        precondition(peerFrozen.ledger.pendingOperation(attempt.id)?.owner == incumbent.deviceID)
+        do { _ = try await incumbent.verifyOwnership(attempt.id, in: peerFrozen); fatalError("frozen EventKit re-entry allowed") }
+        catch CloudRuleError.notOwner {}
+        do { _ = try await incumbent.finish(attempt.id, in: peerFrozen); fatalError("unchecked frozen results published") }
+        catch CloudRuleError.notOwner {}
+        // If the writer had already entered EventKit, publish only its verified,
+        // unchanged result as long as no one acquired its writing right.
+        try incumbent.recordEventKitComplete(attempt.id, in: checked)
+        let winnerAfterFreeze = try await incumbent.finish(attempt.id, in: peerFrozen)
+        precondition(winnerAfterFreeze.ledger.completed.contains(attempt.id))
+        let confirmedAlreadyComplete = try await peer.confirmInterrupted(attempt, accountID: "A")
+        precondition(confirmedAlreadyComplete.ledger.pendingOperation(attempt.id) == nil)
+        let retryAttempt = CloudRuleOperation(owner: incumbent.deviceID, scope: [rule.id], upserts: [envelope], deletions: [])
+        let freshClaim = try await incumbent.claim(retryAttempt, localBefore: [], localAfter: [], in: winnerAfterFreeze)
+        freezeTransport.nextFailure = .staleCAS
+        let retryFrozen = try await peer.confirmInterrupted(retryAttempt, accountID: "A")
+        precondition(retryFrozen.ledger.pendingOperation(retryAttempt.id)?.interrupted == true)
+        var replacement = retryAttempt
+        replacement.owner = peer.deviceID
+        _ = try await peer.takeOver(replacement, localBefore: [], localAfter: [], in: retryFrozen)
+        let serial = freezeTransport.serial
+        do { _ = try await incumbent.confirmInterrupted(retryAttempt, accountID: "A"); fatalError("stale freeze overrode takeover") }
+        catch CloudRuleError.conflict {}
+        do { _ = try await incumbent.finish(retryAttempt.id, in: freshClaim); fatalError("stale owner published") }
+        catch CloudRuleError.notOwner {}
+        precondition(freezeTransport.serial == serial)
         print("Cloud sync contract passed: migration, ID redaction, overlapping CAS, lost responses, takeover/stale owner, restart before CAS, tombstones, account isolation, and Development-to-Production migration of 36 synthetic rules")
     }
 }

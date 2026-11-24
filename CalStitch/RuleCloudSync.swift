@@ -420,9 +420,14 @@ enum CloudRuleError: LocalizedError {
                 }
                 return latest
             }
+            // A verified result already produced by this owner can finish even
+            // after a peer flagged interruption. Ownership transfer still wins
+            // via CAS if it precedes this completion; never run EventKit here.
             guard let operation = latest.ledger.pendingOperation(operationID), operation.owner == deviceID,
-                  !operation.interrupted, state.journals[account]?.operation.id == operationID,
-                  state.journals[account]?.stage == .eventKitComplete else { throw CloudRuleError.notOwner }
+                  let journal = state.journals[account], journal.stage == .eventKitComplete else { throw CloudRuleError.notOwner }
+            var verified = journal.operation
+            verified.interrupted = operation.interrupted
+            guard verified == operation else { throw CloudRuleError.notOwner }
             var next = latest.ledger
             let replacements = Dictionary(uniqueKeysWithValues: operation.upserts.map { ($0.id, $0) })
             let existed = Set(next.rules.map(\.id))
@@ -451,13 +456,43 @@ enum CloudRuleError: LocalizedError {
     /// May be called only after the application has positively established an interruption.
     /// Merely observing another device's pending record is not evidence of interruption.
     func markInterrupted(_ operationID: UUID, in session: CloudRuleSession) async throws -> CloudRuleSession {
-        guard !activeOperations.contains(operationID), let index = session.ledger.pending.firstIndex(where: { $0.id == operationID }) else {
-            throw CloudRuleError.reserved
+        guard let operation = session.ledger.pendingOperation(operationID), operation.owner == deviceID else {
+            throw CloudRuleError.notOwner
         }
-        var next = session.ledger
-        guard next.pending[index].owner == deviceID else { throw CloudRuleError.notOwner }
-        next.pending[index].interrupted = true
-        return try await save(next, from: session)
+        if operation.interrupted { return session }
+        return try await confirmInterrupted(operation, accountID: session.accountID)
+    }
+
+    /// Called only after explicit confirmation that the original writer cannot
+    /// continue, or by the owner after definitive recovery failure.
+    /// This freezes the exact attempt but does not transfer ownership or touch events.
+    func confirmInterrupted(_ expected: CloudRuleOperation, accountID: String) async throws -> CloudRuleSession {
+        var latest = try await refresh(accountID: accountID)
+        var frozen = expected
+        frozen.interrupted = true
+        for retry in 0...1 {
+            if latest.ledger.completed.contains(expected.id) || latest.ledger.pendingOperation(expected.id) == frozen {
+                return latest
+            }
+            guard !expected.interrupted, !activeOperations.contains(expected.id),
+                  let index = latest.ledger.pending.firstIndex(of: expected) else { throw CloudRuleError.conflict }
+            var next = latest.ledger
+            next.pending[index] = frozen
+            do {
+                return try await save(next, from: latest)
+            } catch {
+                let failure = error
+                latest = try await refresh(accountID: accountID)
+                if latest.ledger.completed.contains(expected.id) || latest.ledger.pendingOperation(expected.id) == frozen {
+                    return latest
+                }
+                // After an uncertain response never issue another mutation.
+                // Retry a rejected CAS only if the exact attempt is unchanged.
+                guard retry == 0, (failure as? CloudRuleError) == .conflict,
+                      latest.ledger.pendingOperation(expected.id) == expected else { throw failure }
+            }
+        }
+        throw CloudRuleError.conflict
     }
 
     /// Caller positively confirms the original device stopped, and independently previews the correct destination.

@@ -449,6 +449,17 @@ private struct RuleSnapshot: Codable {
 private struct VerifiedCalendarBinding: Codable {
     let id: String
     let descriptor: CalendarSyncDestination
+    // nil old value (without evidence) cannot override a different cloud descriptor.
+    var evidence: CloudDestinationEvidence? = nil
+}
+
+private struct CloudDestinationEvidence: Codable, Equatable {
+    let destination: CalendarSyncDestination?
+    let unresolvedOwner: UUID?
+    init(_ entry: CloudRuleEnvelope) {
+        destination = entry.destination
+        unresolvedOwner = entry.unresolvedOwner
+    }
 }
 
 private struct CloudLocalWritePlan: Codable {
@@ -601,6 +612,8 @@ private struct RulesHome: View {
     @State private var knownDestinations: [UUID: String] = [:]
     @State private var directFrozen: [UUID: String] = [:]
     @State private var freezeReview: Rule?
+    @State private var pendingFreezeAttempt: CloudRuleOperation?
+    @State private var pendingFreezeAccount: String?
     @AppStorage("settings.hideFrozenRules") private var hideFrozen = false
     @AppStorage(CloudRuleEnvironment.current.localKey("rules.hasCloudAccount")) private var hasCloudAccount = false
     @State private var awaitingLocalRecovery = false
@@ -720,7 +733,12 @@ private struct RulesHome: View {
                                    onSaveAppearance: saveRuleAppearance,
                                    frozenReason: freezeReason(rule.id) ?? pendingReason(rule.id),
                                    hiddenRuleIDs: hideFrozen ? Set(snapshot.rules.filter { freezeReason($0.id) != nil }.map(\.id)) : [],
-                                   onThaw: freezeReason(rule.id) == nil ? nil : { freezeReview = rule }) { child, isNew in
+                                   thawTitle: pendingReason(rule.id) == nil ? nil : L10n.text("核對中斷", "Review Interruption"),
+                                   onThaw: freezeReason(rule.id) == nil && pendingReason(rule.id) == nil ? nil : {
+                                       pendingFreezeAttempt = pendingOperation(rule.id).flatMap { !$0.interrupted ? $0 : nil }
+                                       pendingFreezeAccount = cloudSession?.accountID
+                                       freezeReview = rule
+                                   }) { child, isNew in
                             path.append(.edit(child, isNew: isNew))
                         }
                     }
@@ -730,6 +748,10 @@ private struct RulesHome: View {
             .sheet(item: $freezeReview) { frozenRule in
                 FrozenRuleReview(rule: frozenRule, calendar: calendar,
                                  interrupted: interruptedOperation(frozenRule.id) != nil,
+                                 pendingConfirmation: {
+                                     guard let operation = pendingFreezeAttempt, let account = pendingFreezeAccount else { return nil }
+                                     return { try await confirmPendingInterruption(operation, accountID: account) }
+                                 }(),
                                  inspect: { id in try inspectThaw(frozenRule, destinationID: id) },
                                  confirm: { id, expected in try await confirmThaw(frozenRule, destinationID: id, expected: expected) })
             }
@@ -1101,6 +1123,8 @@ private struct RulesHome: View {
             if !committed.contains(rule.id) { rule.hasApplied = false }
             rule.birthdaySource = contactOrigins[rule.id]
             if let binding = verified[rule.id],
+               (binding.evidence == CloudDestinationEvidence(entry)
+                 || (binding.evidence == nil && binding.descriptor == entry.destination)),
                (try? calendar.resolveSyncDestination(binding.descriptor, rememberedID: binding.id, deviceID: cloud.deviceID)) == binding.id {
                 rule.target = binding.id
             } else if let destination = entry.destination {
@@ -1354,7 +1378,13 @@ private struct RulesHome: View {
             }
             try cloud.clearSupersededJournal(in: reconciled)
             guard let operation = reconciled.ledger.pending.first(where: { $0.id == active.operation.id }),
-                  operation.owner == cloud.deviceID, !operation.interrupted, !cloudResetPending else { return }
+                  operation.owner == cloud.deviceID, !cloudResetPending else { return }
+            if operation.interrupted {
+                guard active.stage == .eventKitComplete else { return }
+                // Only publish an already verified result; never resume EventKit while frozen.
+                restoreCloud(try await cloud.finish(operation.id, in: reconciled))
+                return
+            }
             let latest = try await cloud.verifyOwnership(operation.id, in: reconciled)
             guard !cloudResetPending else { throw CloudRuleError.accountChanged }
             if active.stage != .eventKitComplete {
@@ -1401,12 +1431,28 @@ private struct RulesHome: View {
         return data.flatMap { try? JSONDecoder().decode([UUID: VerifiedCalendarBinding].self, from: $0) } ?? [:]
     }
 
-    private func storeVerifiedBinding(_ id: String, descriptor: CalendarSyncDestination, for rule: UUID, account: String) throws {
+    private func storeVerifiedBinding(_ id: String, descriptor: CalendarSyncDestination, for rule: UUID, session: CloudRuleSession) throws {
+        let account = session.accountID
+        guard let entry = session.ledger.rules.first(where: { $0.id == rule }) else { throw CloudRuleError.conflict }
         var values = verifiedBindings(account)
-        values[rule] = VerifiedCalendarBinding(id: id, descriptor: descriptor)
+        values[rule] = VerifiedCalendarBinding(id: id, descriptor: descriptor, evidence: CloudDestinationEvidence(entry))
         let data = try JSONEncoder().encode(values)
         UserDefaults.standard.set(data, forKey: cloudLocalKey("rules.verifiedBindings." + account))
         mergeBindings([rule: id], account: account)
+    }
+
+    private func confirmPendingInterruption(_ operation: CloudRuleOperation, accountID: String) async throws {
+        guard !cloudBusy, !cloudRefreshing, !cloudResetPending, cloudSession?.accountID == accountID else {
+            throw CloudRuleError.unavailable
+        }
+        cloudBusy = true
+        defer {
+            cloudBusy = false
+            if cloudResetPending { Task { await load() } }
+        }
+        let current = try await cloud.confirmInterrupted(operation, accountID: accountID)
+        guard !cloudResetPending else { throw CloudRuleError.accountChanged }
+        restoreCloud(current)
     }
 
     private func inspectThaw(_ rule: Rule, destinationID: String) throws -> CloudThawProposal {
@@ -1463,22 +1509,10 @@ private struct RulesHome: View {
             item.calendarID = id
             return item
         }
-        var desired = try original.desired.map(binding)
+        let desired = try original.desired.map(binding)
         let previous = try original.previous.map(binding)
-        if op.deletions.isEmpty,
-           let data = UserDefaults.standard.data(forKey: cloudLocalKey("rules.cloudDraft.\(session.accountID).\(rule.id)")),
-           var draft = try? JSONDecoder().decode(Rule.self, from: data) {
-            draft.target = destinationID
-            let res = try resolve(draft, allowingVerifiedRebinding: true)
-            guard res.ruleIDs.isSubset(of: original.ruleIDs) else { throw CloudRuleError.conflict }
-            desired.removeAll { res.ruleIDs.contains($0.ruleID) }
-            desired += try res.desired.map(binding)
-            for updated in res.rules where res.ruleIDs.contains(updated.id) {
-                guard let index = op.upserts.firstIndex(where: { $0.id == updated.id }) else { throw CloudRuleError.conflict }
-                let destination = updated.id == rule.id ? descriptor : op.upserts[index].destination
-                op.upserts[index] = portable(updated, destination: destination, prior: op.upserts[index].prior)
-            }
-        }
+        // A locally saved but unproven draft is not evidence for this attempt.
+        // Resume the confirmed cloud plan, never substitute an unrelated edit.
         let recovery = try calendar.prepareSyncPlan(desired: desired, previous: previous, ruleIDs: original.ruleIDs,
                                                     attemptID: op.id, matchingRemoval: nil, takeover: true)
         op.owner = cloud.deviceID
@@ -1504,7 +1538,7 @@ private struct RulesHome: View {
         let current = try inspectThaw(rule, destinationID: destinationID)
         guard expected == current else { throw CalendarIntegrationError.removalSelectionChanged }
         guard let operation = current.operation else {
-            try storeVerifiedBinding(destinationID, descriptor: current.descriptor, for: rule.id, account: latest.accountID)
+            try storeVerifiedBinding(destinationID, descriptor: current.descriptor, for: rule.id, session: latest)
             restoreCloud(latest)
             return
         }
@@ -1529,8 +1563,7 @@ private struct RulesHome: View {
             path.removeAll()
             return
         }
-        try storeVerifiedBinding(destinationID, descriptor: current.descriptor, for: rule.id, account: done.accountID)
-        UserDefaults.standard.removeObject(forKey: cloudLocalKey("rules.cloudDraft.\(done.accountID).\(rule.id)"))
+        try storeVerifiedBinding(destinationID, descriptor: current.descriptor, for: rule.id, session: done)
         restoreCloud(done)
     }
 
@@ -2183,6 +2216,7 @@ private struct RuleEditor: View {
     let onDeleted: () -> Void
     let onSaveAppearance: (UUID, RuleAppearance) async throws -> Bool
     let frozenReason: String?
+    let thawTitle: String?
     let hiddenRuleIDs: Set<UUID>
     let onThaw: (() -> Void)?
     @State private var applying = false
@@ -2196,7 +2230,7 @@ private struct RuleEditor: View {
          onDelete: @escaping (UUID, BatchRemovalPreview) async throws -> Void,
          onDeleted: @escaping () -> Void,
          onSaveAppearance: @escaping (UUID, RuleAppearance) async throws -> Bool,
-         frozenReason: String?, hiddenRuleIDs: Set<UUID>, onThaw: (() -> Void)?,
+         frozenReason: String?, hiddenRuleIDs: Set<UUID>, thawTitle: String?, onThaw: (() -> Void)?,
          onOpenChild: @escaping (Rule, Bool) -> Void) {
         let isFresh = isNew && !allRules.contains { $0.id == initial.id }
         self.isFreshRule = isFresh
@@ -2223,6 +2257,7 @@ private struct RuleEditor: View {
         self.onDeleted = onDeleted
         self.onSaveAppearance = onSaveAppearance
         self.frozenReason = frozenReason
+        self.thawTitle = thawTitle
         self.hiddenRuleIDs = hiddenRuleIDs
         self.onThaw = onThaw
         self.onOpenChild = onOpenChild
@@ -2437,7 +2472,7 @@ private struct RuleEditor: View {
                     Label(frozenReason, systemImage: "lock")
                     Spacer()
                     if let onThaw {
-                        Button(L10n.text("解除凍結", "Unfreeze"), action: onThaw)
+                        Button(thawTitle ?? L10n.text("解除凍結", "Unfreeze"), action: onThaw)
                     }
                 }.font(.footnote).padding().background(.regularMaterial)
             }
@@ -3733,6 +3768,7 @@ private struct FrozenRuleReview: View {
     let rule: Rule
     @ObservedObject var calendar: CalendarIntegration
     let interrupted: Bool
+    let pendingConfirmation: (() async throws -> Void)?
     let inspect: (String) throws -> CloudThawProposal
     let confirm: (String, CloudThawProposal) async throws -> Void
     @Environment(\.dismiss) private var dismiss
@@ -3747,13 +3783,30 @@ private struct FrozenRuleReview: View {
             Form {
                 Section {
                     Text(rule.displayName).font(.headline)
-                    if interrupted {
+                    if pendingConfirmation != nil {
+                        Text(L10n.text("只有確定原裝置無法繼續這次寫入時，才標記中斷。若還在同步，請等待。這一步不會改動行事曆。", "Mark an interruption only if the original device cannot resume this update. If it is still syncing, wait. This step does not change Calendar events."))
+                        Toggle(L10n.text("確認原裝置無法再寫入", "The original device cannot resume writing"), isOn: $oldDeviceStopped)
+                    } else if interrupted {
                         Text(L10n.text("確認原裝置已停止這次操作，且不會繼續寫入，再選正確的行事曆。", "Confirm the original device has stopped this operation and will not resume writing, then select the correct calendar."))
                         Toggle(L10n.text("原裝置不會再寫入", "The original device will not resume writing"), isOn: $oldDeviceStopped)
                     } else {
                         Text(L10n.text("選定可核對的原行事曆，不會搬移或新增事件。", "Choose a calendar that can be verified as the original. This does not move or add events."))
                     }
                 }
+                if let pendingConfirmation {
+                    Section {
+                        Button(L10n.text("確認中斷", "Confirm Interruption")) {
+                            guard oldDeviceStopped, !processing else { return }
+                            processing = true
+                            Task {
+                                defer { processing = false }
+                                do { try await pendingConfirmation(); dismiss() }
+                                catch { errorMessage = error.localizedDescription }
+                            }
+                        }.disabled(!oldDeviceStopped || processing)
+                        if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
+                    }
+                } else {
                 Section {
                     if !calendar.hasFullAccess {
                         Button(L10n.text("連接行事曆", "Connect Calendar")) {
@@ -3805,10 +3858,12 @@ private struct FrozenRuleReview: View {
                     }
                 }
             }
+            }
             .disabled(processing)
             .onChange(of: destination) { _, _ in proposal = nil }
             .onChange(of: oldDeviceStopped) { _, _ in proposal = nil }
-            .navigationTitle(L10n.text("解除凍結", "Unfreeze Rule"))
+            .navigationTitle(pendingConfirmation == nil ? L10n.text("解除凍結", "Unfreeze Rule")
+                                                        : L10n.text("核對中斷", "Review Interruption"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(L10n.text("取消", "Cancel")) { dismiss() }.disabled(processing)
