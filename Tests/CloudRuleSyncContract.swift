@@ -106,9 +106,32 @@ import Foundation
         precondition(reopened.deviceID == a.deviceID && reopened.recoverableJournal(in: childFinished)?.stage == .acquiring)
         let authorized = try await reopened.resolveAcquiringJournal(in: childFinished)
         precondition(reopened.recoverableJournal(in: authorized)?.stage == .authorized)
-        try reopened.recordEventKitComplete(deleting.id, in: authorized)
-        let cancelled = try await reopened.finish(deleting.id, in: authorized)
+        let interruptedDeletion = try await reopened.markInterrupted(deleting.id, in: authorized)
+        var takeoverDeletion = deleting
+        takeoverDeletion.owner = b.deviceID
+        // Dismissing the review without confirmation cannot change navigation or ownership.
+        precondition(!takeoverReturnsToRuleList(takeoverDeletion, acknowledged: nil))
+        precondition(!takeoverReturnsToRuleList(takeoverDeletion, acknowledged: interruptedDeletion))
+        precondition(interruptedDeletion.ledger.pendingOperation(deleting.id)?.owner == reopened.deviceID)
+        let acceptedDeletion = try await b.takeOver(takeoverDeletion, localBefore: [], localAfter: [], in: interruptedDeletion)
+        // Ownership alone is not a confirmed deletion (including a failed EventKit check).
+        precondition(!takeoverReturnsToRuleList(takeoverDeletion, acknowledged: acceptedDeletion))
+        do { _ = try await b.finish(deleting.id, in: acceptedDeletion); fatalError("unverified deletion completed") }
+        catch CloudRuleError.notOwner {}
+        try b.recordEventKitComplete(deleting.id, in: acceptedDeletion)
+        let cancelled = try await b.finish(deleting.id, in: acceptedDeletion)
+        precondition(takeoverReturnsToRuleList(takeoverDeletion, acknowledged: cancelled))
+        precondition(!takeoverReturnsToRuleList(nil, acknowledged: cancelled))
+        precondition(!takeoverReturnsToRuleList(winner, acknowledged: cancelled))
         precondition(cancelled.ledger.tombstones.contains(rule.id) && cancelled.ledger.rules.isEmpty)
+        try reopened.clearSupersededJournal(in: cancelled)
+        let staleApply = CloudRuleOperation(owner: reopened.deviceID, scope: [rule.id], upserts: [envelope], deletions: [])
+        let writesBefore = transport.serial
+        do { _ = try await reopened.claim(staleApply, localBefore: [], localAfter: [], in: childFinished); fatalError("unrefreshed editor recreated deleted rule") }
+        catch CloudRuleError.conflict {}
+        do { _ = try await reopened.claim(staleApply, localBefore: [], localAfter: [], in: cancelled); fatalError("tombstone failed to stop stale editor") }
+        catch CloudRuleError.ruleDeleted {}
+        precondition(transport.serial == writesBefore && reopened.recoverableJournal(in: cancelled) == nil)
         transport.active = "B"
         let independent = try await reopened.refresh()!
         precondition(independent.ledger.rules.isEmpty)

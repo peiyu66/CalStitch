@@ -132,14 +132,21 @@ struct CloudRuleJournal: Codable {
     var stage: Stage = .acquiring
 }
 
+/// Only an acknowledged manual takeover deletion navigates away from the editor.
+func takeoverReturnsToRuleList(_ operation: CloudRuleOperation?, acknowledged: CloudRuleSession?) -> Bool {
+    guard let operation, !operation.deletions.isEmpty, let ledger = acknowledged?.ledger else { return false }
+    return ledger.completed.contains(operation.id) && operation.deletions.isSubset(of: ledger.tombstones)
+}
+
 enum CloudRuleError: LocalizedError {
-    case unavailable, accountChanged, conflict, reserved, interruptedRequired, notOwner, invalidLedger, tooLarge, journalPending, legacyAccountMismatch
+    case unavailable, accountChanged, conflict, ruleDeleted, reserved, interruptedRequired, notOwner, invalidLedger, tooLarge, journalPending, legacyAccountMismatch
 
     var errorDescription: String? {
         switch self {
         case .unavailable: L10n.text("iCloud 暫時不可用，請稍後再試。", "iCloud is temporarily unavailable. Try again later.")
         case .accountChanged: L10n.text("iCloud 帳號已變更。請重新載入規則。", "The iCloud account changed. Reload the rules.")
         case .conflict: L10n.text("另一台裝置已變更規則。請重新載入並確認後再試。", "Another device changed the rules. Reload and review before trying again.")
+        case .ruleDeleted: L10n.text("這條規則已在其他裝置刪除，無法套用。", "This rule was deleted on another device and can no longer be applied.")
         case .reserved: L10n.text("這個範圍有待完成的操作。", "An operation in this scope is still pending.")
         case .interruptedRequired: L10n.text("只有因中斷而凍結的操作可以手動接手。", "Only a frozen interrupted operation can be taken over.")
         case .notOwner: L10n.text("這台裝置沒有此操作的寫入資格。", "This device no longer has write permission for this operation.")
@@ -300,7 +307,7 @@ enum CloudRuleError: LocalizedError {
         guard operation.owner == deviceID, !operation.interrupted else { throw CloudRuleError.notOwner }
         guard state.journals[session.accountID] == nil else { throw CloudRuleError.journalPending }
         guard session.ledger.pending.allSatisfy({ $0.scope.isDisjoint(with: operation.scope) }) else { throw CloudRuleError.reserved }
-        guard Set(operation.upserts.map(\.id)).isDisjoint(with: session.ledger.tombstones) else { throw CloudRuleError.conflict }
+        guard Set(operation.upserts.map(\.id)).isDisjoint(with: session.ledger.tombstones) else { throw CloudRuleError.ruleDeleted }
         var portable = operation
         portable.sanitize()
         var next = session.ledger

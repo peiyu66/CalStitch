@@ -700,18 +700,29 @@ private struct RulesHome: View {
                 case .settings:
                     CalStitchSettingsView(hideFrozen: $hideFrozen)
                 case .edit(let rule, let isNew):
-                    RuleEditor(initial: snapshot.rules.first { $0.id == rule.id } ?? rule, isNew: isNew,
-                               parent: snapshot.rules.first { $0.id == rule.parent },
-                               allRules: snapshot.rules, calendar: calendar,
-                               preview: preview, onApply: apply, onApplied: returnAfterApply,
-                               previewDeletion: { id in try previewRemoval([id], allowChild: true) },
-                               onDelete: { id, expected in try await removeSelected([id], expected, allowChild: true) },
-                               onDeleted: { if !path.isEmpty { path.removeLast() } },
-                               onSaveAppearance: saveRuleAppearance,
-                               frozenReason: freezeReason(rule.id) ?? pendingReason(rule.id),
-                               hiddenRuleIDs: hideFrozen ? Set(snapshot.rules.filter { freezeReason($0.id) != nil }.map(\.id)) : [],
-                               onThaw: freezeReason(rule.id) == nil ? nil : { freezeReview = rule }) { child, isNew in
-                        path.append(.edit(child, isNew: isNew))
+                    if isDeletedInCloud(rule.id) {
+                        VStack(spacing: 20) {
+                            ContentUnavailableView(
+                                L10n.text("規則已刪除", "Rule Deleted"), systemImage: "trash",
+                                description: Text(CloudRuleError.ruleDeleted.localizedDescription)
+                            )
+                            Button(L10n.text("返回規則列表", "Back to Rules")) { path.removeAll() }
+                                .buttonStyle(.bordered)
+                        }
+                    } else {
+                        RuleEditor(initial: snapshot.rules.first { $0.id == rule.id } ?? rule, isNew: isNew,
+                                   parent: snapshot.rules.first { $0.id == rule.parent },
+                                   allRules: snapshot.rules, calendar: calendar,
+                                   preview: preview, onApply: apply, onApplied: returnAfterApply,
+                                   previewDeletion: { id in try previewRemoval([id], allowChild: true) },
+                                   onDelete: { id, expected in try await removeSelected([id], expected, allowChild: true) },
+                                   onDeleted: { if !path.isEmpty { path.removeLast() } },
+                                   onSaveAppearance: saveRuleAppearance,
+                                   frozenReason: freezeReason(rule.id) ?? pendingReason(rule.id),
+                                   hiddenRuleIDs: hideFrozen ? Set(snapshot.rules.filter { freezeReason($0.id) != nil }.map(\.id)) : [],
+                                   onThaw: freezeReason(rule.id) == nil ? nil : { freezeReview = rule }) { child, isNew in
+                            path.append(.edit(child, isNew: isNew))
+                        }
                     }
                 }
             }
@@ -1510,6 +1521,14 @@ private struct RulesHome: View {
         }
         try cloud.recordEventKitComplete(operation.id, in: verified)
         let done = try await cloud.finish(operation.id, in: verified)
+        if takeoverReturnsToRuleList(operation, acknowledged: done) {
+            for id in operation.deletions {
+                UserDefaults.standard.removeObject(forKey: cloudLocalKey("rules.cloudDraft.\(done.accountID).\(id)"))
+            }
+            restoreCloud(done)
+            path.removeAll()
+            return
+        }
         try storeVerifiedBinding(destinationID, descriptor: current.descriptor, for: rule.id, account: done.accountID)
         UserDefaults.standard.removeObject(forKey: cloudLocalKey("rules.cloudDraft.\(done.accountID).\(rule.id)"))
         restoreCloud(done)
@@ -1601,7 +1620,12 @@ private struct RulesHome: View {
         }
     }
 
+    private func isDeletedInCloud(_ id: UUID) -> Bool {
+        cloudSession?.ledger.tombstones.contains(id) == true
+    }
+
     private func apply(_ rule: Rule, expected: Rule?) async throws -> Rule {
+        guard !isDeletedInCloud(rule.id) else { throw CloudRuleError.ruleDeleted }
         let account = cloudSession?.accountID
         do {
             guard snapshot.rules.first(where: { $0.id == rule.id }) == expected else {
@@ -1615,6 +1639,12 @@ private struct RulesHome: View {
             if let account { UserDefaults.standard.removeObject(forKey: cloudLocalKey("rules.cloudDraft.\(account).\(rule.id)")) }
             return snapshot.rules.first { $0.id == rule.id } ?? rule
         } catch {
+            // The claim can race another device's deletion. performMutation reloads
+            // the ledger on failure; never keep an obsolete draft after a tombstone.
+            if isDeletedInCloud(rule.id) {
+                if let account { UserDefaults.standard.removeObject(forKey: cloudLocalKey("rules.cloudDraft.\(account).\(rule.id)")) }
+                throw CloudRuleError.ruleDeleted
+            }
             if let account { saveDraft(rule, account: account) }
             throw error
         }
