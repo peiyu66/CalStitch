@@ -67,19 +67,53 @@ struct CloudRuleOperation: Codable, Equatable, Identifiable {
     }
 }
 
+/// Observed by one device; its monotonic clock is only a UI threshold.
+struct CloudPendingWait {
+    private var account: String?
+    private var started: [UUID: (operation: CloudRuleOperation, time: Duration)] = [:]
+    private(set) var confirmedWaiting: [UUID: CloudRuleOperation] = [:]
+
+    mutating func observe(_ session: CloudRuleSession, elapsed: Duration) {
+        if account != session.accountID { self = Self(); account = session.accountID }
+        for id in session.ledger.completed.union(session.ledger.retired ?? []) {
+            started[id] = nil
+            confirmedWaiting[id] = nil
+        }
+        let currentlyPending = Set(session.ledger.pending.map(\.id))
+        started = started.filter { currentlyPending.contains($0.key) }
+        for op in session.ledger.pending {
+            if op.interrupted {
+                started[op.id] = nil
+                confirmedWaiting[op.id] = nil
+                continue
+            }
+            let same = started[op.id].map { $0.operation == op } ?? false
+            if !same {
+                started[op.id] = (op, elapsed)
+                // A changed owner is authoritative evidence the old wait was handled.
+                if let old = confirmedWaiting[op.id], old.owner != op.owner { confirmedWaiting[op.id] = nil }
+            } else if let first = started[op.id], elapsed - first.time >= .seconds(120) {
+                confirmedWaiting[op.id] = op
+            }
+        }
+    }
+}
+
 struct CloudRuleLedger: Codable, Equatable {
     var schema = 1
     var rules: [CloudRuleEnvelope] = []
     var pending: [CloudRuleOperation] = []
     var tombstones: Set<UUID> = []
     var completed: Set<UUID> = []
+    var retired: Set<UUID>? = nil // Interrupted attempt ended without replaying or applying its edits.
 
     func pendingOperation(_ id: UUID) -> CloudRuleOperation? { pending.first { $0.id == id } }
 
     fileprivate func validate() throws {
         guard schema == 1, Set(rules.map(\.id)).count == rules.count,
               Set(pending.map(\.id)).count == pending.count,
-              Set(rules.map(\.id)).isDisjoint(with: tombstones) else {
+              Set(rules.map(\.id)).isDisjoint(with: tombstones),
+              completed.isDisjoint(with: retired ?? []) else {
             throw CloudRuleError.invalidLedger
         }
         var reserved: Set<UUID> = []
@@ -88,7 +122,7 @@ struct CloudRuleLedger: Codable, Equatable {
             guard !operation.scope.isEmpty, reserved.isDisjoint(with: operation.scope),
                   items.count == operation.upserts.count, items.isSubset(of: operation.scope),
                   operation.deletions.isSubset(of: operation.scope), items.isDisjoint(with: operation.deletions),
-                  !completed.contains(operation.id),
+                  !completed.contains(operation.id), retired?.contains(operation.id) != true,
                   operation.plan.map({ Self.validPlan($0, operation: operation) }) ?? true else {
                 throw CloudRuleError.invalidLedger
             }
@@ -364,7 +398,7 @@ enum CloudRuleError: LocalizedError {
             try changeState { $0.journals[session.accountID]?.stage = .authorized }
             return observed
         }
-        if observed.ledger.completed.contains(operation.id) {
+        if observed.ledger.completed.contains(operation.id) || observed.ledger.retired?.contains(operation.id) == true {
             try changeState { $0.journals.removeValue(forKey: session.accountID) }
             return observed
         }
@@ -517,11 +551,34 @@ enum CloudRuleError: LocalizedError {
         return try await authorize(portable, next: next, in: session)
     }
 
+    /// The caller verified all original EventKit identities without changing them.
+    /// Release only the exact confirmed-interrupted reservation, not its rule results.
+    func retireInterruptedWithoutEventWrite(_ expected: CloudRuleOperation,
+                                             in session: CloudRuleSession) async throws -> CloudRuleSession {
+        guard expected.interrupted, !activeOperations.contains(expected.id),
+              session.ledger.pendingOperation(expected.id) == expected else { throw CloudRuleError.conflict }
+        var next = session.ledger
+        next.pending.removeAll { $0.id == expected.id }
+        next.retired = (next.retired ?? []).union([expected.id])
+        do {
+            return try await save(next, from: session)
+        } catch {
+            let failure = error
+            let latest = try await refresh(accountID: session.accountID)
+            // A lost result is accepted only with an authoritative outcome. Do not
+            // retry on a different revision without another calendar proof.
+            if latest.ledger.retired?.contains(expected.id) == true || latest.ledger.completed.contains(expected.id) {
+                return latest
+            }
+            throw failure
+        }
+    }
+
     /// Explicitly discard a superseded local journal only when current cloud ownership is clear.
     func clearSupersededJournal(in session: CloudRuleSession) throws {
         guard let local = recoverableJournal(in: session) else { return }
         let id = local.operation.id
-        guard session.ledger.completed.contains(id)
+        guard session.ledger.completed.contains(id) || session.ledger.retired?.contains(id) == true
                 || (session.ledger.pendingOperation(id).map { $0.owner != deviceID } ?? false) else { return }
         try changeState { $0.journals.removeValue(forKey: session.accountID) }
     }

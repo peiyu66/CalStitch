@@ -224,6 +224,54 @@ import Foundation
         do { _ = try await incumbent.finish(retryAttempt.id, in: freshClaim); fatalError("stale owner published") }
         catch CloudRuleError.notOwner {}
         precondition(freezeTransport.serial == serial)
+        // A duration never proves the prior writer stopped or permits writes.
+        var wait = CloudPendingWait()
+        wait.observe(freshClaim, elapsed: .seconds(0))
+        wait.observe(freshClaim, elapsed: .seconds(119))
+        precondition(wait.confirmedWaiting.isEmpty)
+        wait.observe(freshClaim, elapsed: .seconds(120))
+        precondition(wait.confirmedWaiting[retryAttempt.id] == retryAttempt)
+        var absentWithoutReceipt = freshClaim.ledger
+        absentWithoutReceipt.pending = []
+        wait.observe(.init(accountID: "A", version: nil, ledger: absentWithoutReceipt), elapsed: .seconds(150))
+        precondition(wait.confirmedWaiting[retryAttempt.id] == retryAttempt)
+        let otherSession = CloudRuleSession(accountID: "B", version: nil, ledger: .init())
+        wait.observe(otherSession, elapsed: .seconds(200))
+        precondition(wait.confirmedWaiting.isEmpty)
+        // Confirmed-same-operation timeout clears on authoritative late completion.
+        wait.observe(claimed, elapsed: .seconds(250))
+        wait.observe(claimed, elapsed: .seconds(370))
+        precondition(wait.confirmedWaiting[attempt.id] == attempt)
+        wait.observe(winnerAfterFreeze, elapsed: .seconds(400))
+        precondition(wait.confirmedWaiting.isEmpty)
+
+        // Unlock never publishes previous planned writes, removes effective rules,
+        // or grants EventKit ownership to the reviewer.
+        let undoTransport = MemoryTransport()
+        let original = RuleCloudSync(transport: undoTransport, stateURL: directory.appendingPathComponent("original"))
+        let reviewer = RuleCloudSync(transport: undoTransport, stateURL: directory.appendingPathComponent("reviewer"))
+        let originalSeed = try await original.migrate([envelope], in: original.refresh()!)
+        let pendingDelete = CloudRuleOperation(owner: original.deviceID, scope: [rule.id], upserts: [], deletions: [rule.id])
+        let locked = try await original.claim(pendingDelete, localBefore: [], localAfter: [], in: originalSeed)
+        do { _ = try await reviewer.retireInterruptedWithoutEventWrite(pendingDelete, in: locked); fatalError("uninterrupted operation unlocked") }
+        catch CloudRuleError.conflict {}
+        original.endLocalExecution(pendingDelete.id)
+        let interrupted = try await original.markInterrupted(pendingDelete.id, in: locked)
+        let releaseCandidate = interrupted.ledger.pendingOperation(pendingDelete.id)!
+        undoTransport.nextFailure = .staleCAS
+        do { _ = try await reviewer.retireInterruptedWithoutEventWrite(releaseCandidate, in: interrupted); fatalError("unlocked on unverified revision") }
+        catch CloudRuleError.conflict {}
+        undoTransport.nextFailure = .loseResponse
+        let unlocked = try await reviewer.retireInterruptedWithoutEventWrite(releaseCandidate, in: interrupted)
+        precondition(unlocked.ledger.rules == originalSeed.ledger.rules && unlocked.ledger.tombstones.isEmpty)
+        precondition(unlocked.ledger.retired?.contains(pendingDelete.id) == true && !unlocked.ledger.completed.contains(pendingDelete.id))
+        do { _ = try await original.verifyOwnership(pendingDelete.id, in: unlocked); fatalError("old original replayed retired attempt") }
+        catch CloudRuleError.notOwner {}
+        try original.clearSupersededJournal(in: unlocked)
+        precondition(original.recoverableJournal(in: unlocked) == nil)
+        let ordinaryDelete = CloudRuleOperation(owner: reviewer.deviceID, scope: [rule.id], upserts: [], deletions: [rule.id])
+        let explicit = try await reviewer.claim(ordinaryDelete, localBefore: [], localAfter: [], in: unlocked)
+        precondition(explicit.ledger.pendingOperation(ordinaryDelete.id)?.owner == reviewer.deviceID)
         print("Cloud sync contract passed: migration, ID redaction, overlapping CAS, lost responses, takeover/stale owner, restart before CAS, tombstones, account isolation, and Development-to-Production migration of 36 synthetic rules")
     }
 }

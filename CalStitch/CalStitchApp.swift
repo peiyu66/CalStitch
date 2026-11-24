@@ -612,8 +612,8 @@ private struct RulesHome: View {
     @State private var knownDestinations: [UUID: String] = [:]
     @State private var directFrozen: [UUID: String] = [:]
     @State private var freezeReview: Rule?
-    @State private var pendingFreezeAttempt: CloudRuleOperation?
-    @State private var pendingFreezeAccount: String?
+    @State private var pendingWait = CloudPendingWait()
+    @State private var pendingClockOrigin = ContinuousClock().now
     @AppStorage("settings.hideFrozenRules") private var hideFrozen = false
     @AppStorage(CloudRuleEnvironment.current.localKey("rules.hasCloudAccount")) private var hasCloudAccount = false
     @State private var awaitingLocalRecovery = false
@@ -637,6 +637,7 @@ private struct RulesHome: View {
     @State private var loaded = false
     @State private var loadFailed = false
     @State private var toolbarError: String?
+    @State private var requestingCalendarAccess = false
     @State private var appliedNotice: UUID?
     @State private var snapshot = RuleSnapshot()
     @State private var appearanceGroup: GroupAppearanceKey?
@@ -651,6 +652,7 @@ private struct RulesHome: View {
                             .foregroundStyle(.secondary)
                         toolsRow
                     }
+                    if !calendar.hasFullAccess { calendarAccessNotice }
                     if let cloudReadError {
                         Label(cloudReadError, systemImage: "icloud.slash")
                             .font(.footnote).foregroundStyle(.secondary)
@@ -688,6 +690,7 @@ private struct RulesHome: View {
                             }
                             .accessibilityIdentifier("open-orphan-cleanup")
                         }
+                        .disabled(!calendar.hasFullAccess)
                         .font(.subheadline.weight(.semibold))
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 3)
@@ -731,14 +734,10 @@ private struct RulesHome: View {
                                    onDelete: { id, expected in try await removeSelected([id], expected, allowChild: true) },
                                    onDeleted: { if !path.isEmpty { path.removeLast() } },
                                    onSaveAppearance: saveRuleAppearance,
-                                   frozenReason: freezeReason(rule.id) ?? pendingReason(rule.id),
-                                   hiddenRuleIDs: hideFrozen ? Set(snapshot.rules.filter { freezeReason($0.id) != nil }.map(\.id)) : [],
-                                   thawTitle: pendingReason(rule.id) == nil ? nil : L10n.text("核對中斷", "Review Interruption"),
-                                   onThaw: freezeReason(rule.id) == nil && pendingReason(rule.id) == nil ? nil : {
-                                       pendingFreezeAttempt = pendingOperation(rule.id).flatMap { !$0.interrupted ? $0 : nil }
-                                       pendingFreezeAccount = cloudSession?.accountID
-                                       freezeReview = rule
-                                   }) { child, isNew in
+                                   frozenReason: calendar.hasFullAccess ? (freezeReason(rule.id) ?? pendingReason(rule.id)) : CalendarIntegrationError.denied.localizedDescription,
+                                   hiddenRuleIDs: calendar.hasFullAccess && hideFrozen ? Set(snapshot.rules.filter { freezeReason($0.id) != nil }.map(\.id)) : [],
+                                   thawTitle: nil,
+                                   onThaw: !calendar.hasFullAccess || freezeReason(rule.id) == nil ? nil : { freezeReview = rule }) { child, isNew in
                             path.append(.edit(child, isNew: isNew))
                         }
                     }
@@ -746,19 +745,14 @@ private struct RulesHome: View {
             }
             .sheet(isPresented: $isAdding) { addSheet }
             .sheet(item: $freezeReview) { frozenRule in
-                FrozenRuleReview(rule: frozenRule, calendar: calendar,
-                                 interrupted: interruptedOperation(frozenRule.id) != nil,
-                                 pendingConfirmation: {
-                                     guard let operation = pendingFreezeAttempt, let account = pendingFreezeAccount else { return nil }
-                                     return { try await confirmPendingInterruption(operation, accountID: account) }
-                                 }(),
-                                 inspect: { id in try inspectThaw(frozenRule, destinationID: id) },
-                                 confirm: { id, expected in try await confirmThaw(frozenRule, destinationID: id, expected: expected) })
+                FrozenRuleReview(rule: frozenRule, original: originalCalendarTitle(frozenRule.id),
+                                 inspect: { try inspectThaw(frozenRule.id) },
+                                 confirm: { expected in try await confirmThaw(frozenRule.id, expected: expected) })
             }
             .background {
                 ContactPickerPresenter(request: contactPickerRequest) { selection in
                     contactPickerRequest = nil
-                    birthdaySelection = selection
+                    if calendar.hasFullAccess { birthdaySelection = selection }
                 }
                 .frame(width: 0, height: 0)
                 .accessibilityHidden(true)
@@ -774,7 +768,7 @@ private struct RulesHome: View {
             .sheet(isPresented: $selectingBirthdayGroup, onDismiss: {
                 if choosingPeopleAfterGroup {
                     choosingPeopleAfterGroup = false
-                    contactPickerRequest = UUID()
+                    if calendar.hasFullAccess { contactPickerRequest = UUID() }
                 }
             }) {
                 BirthdayGroupImportView(calendar: calendar, categories: batchCategories,
@@ -845,16 +839,21 @@ private struct RulesHome: View {
                 Task { await load() }
             }
         }
+        .onChange(of: calendar.authorizationStatus) {
+            if calendar.hasFullAccess {
+                restoreBirthdaySettingsRouteIfAuthorized()
+            } else {
+                dismissCalendarMaintenance()
+            }
+            if let session = cloudSession, !cloudBusy { restoreCloud(session) }
+        }
         .onChange(of: calendar.destinations) { _, _ in
             if let session = cloudSession, !cloudBusy { restoreCloud(session) }
         }
         .task {
             calendar.refreshCalendars()
             if !loaded && !loadFailed { await load() }
-            if !checkedBirthdaySettingsReturn {
-                checkedBirthdaySettingsReturn = true
-                if BirthdayGroupSettingsReturn.consume() { selectingBirthdayGroup = true }
-            }
+            restoreBirthdaySettingsRouteIfAuthorized()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
@@ -869,9 +868,66 @@ private struct RulesHome: View {
         }
     }
 
+    private var calendarAccessNotice: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(L10n.text("需要完整取用行事曆", "Full Calendar Access Needed"), systemImage: "calendar.badge.exclamationmark")
+                .font(.headline)
+            Text(L10n.text("你仍可查看已同步的規則。完整取用行事曆後，才能管理規則及預覽事件。",
+                           "You can still view synced rules. Allow full Calendar access to manage rules and preview events."))
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            if calendar.canRequestFullAccess {
+                Button(L10n.text("允許完整取用", "Allow Full Access")) {
+                    guard !requestingCalendarAccess else { return }
+                    requestingCalendarAccess = true
+                    Task {
+                        defer { requestingCalendarAccess = false }
+                        do { try await calendar.requestCalendarFullAccess() }
+                        catch CalendarIntegrationError.denied { /* The entry now directs the user to Settings. */ }
+                        catch { toolbarError = error.localizedDescription }
+                    }
+                }
+                .disabled(requestingCalendarAccess)
+                .accessibilityIdentifier("request-calendar-full-access")
+            } else {
+                Button(L10n.text("前往設定", "Open Settings")) {
+                    guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                    UIApplication.shared.open(url)
+                }
+                .accessibilityIdentifier("open-calendar-access-settings")
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(slate.opacity(0.09), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func restoreBirthdaySettingsRouteIfAuthorized() {
+        guard calendar.hasFullAccess, !checkedBirthdaySettingsReturn else { return }
+        checkedBirthdaySettingsReturn = true
+        if BirthdayGroupSettingsReturn.consume() { selectingBirthdayGroup = true }
+    }
+
+    private func dismissCalendarMaintenance() {
+        isAdding = false
+        isShowingBatch = false
+        showingBirthdayRoutes = false
+        selectingBirthdayGroup = false
+        contactPickerRequest = nil
+        birthdaySelection = nil
+        pendingBirthdayRoute = nil
+        choosingPeopleAfterGroup = false
+        showingOrphanCleanup = false
+        appearanceGroup = nil
+    }
+
+    private func requireCalendarMaintenance() throws {
+        guard calendar.hasFullAccess else { throw CalendarIntegrationError.denied }
+    }
+
     private var rootRules: [Rule] { snapshot.rules.filter { $0.parent == nil } }
     private var visibleRootRules: [Rule] {
-        hideFrozen ? rootRules.filter { freezeReason($0.id) == nil } : rootRules
+        calendar.hasFullAccess && hideFrozen ? rootRules.filter { freezeReason($0.id) == nil } : rootRules
     }
 
     private var batchEligibleRoots: [Rule] {
@@ -920,6 +976,7 @@ private struct RulesHome: View {
     private func openSelectedBirthdayRoute() {
         let selected = pendingBirthdayRoute
         pendingBirthdayRoute = nil
+        guard calendar.hasFullAccess else { return }
         switch selected {
         case .people: contactPickerRequest = UUID()
         case .group: selectingBirthdayGroup = true
@@ -932,6 +989,7 @@ private struct RulesHome: View {
     }
 
     private func saveGroupAppearance(_ appearance: RuleAppearance, for key: GroupAppearanceKey) throws {
+        try requireCalendarMaintenance()
         guard rootRules.contains(where: { $0.category == key.category && (key.subcategory == nil || $0.subcategory == key.subcategory) }) else {
             throw RuleOperationError(L10n.text("找不到這個分類。", "This category could not be found."))
         }
@@ -949,6 +1007,7 @@ private struct RulesHome: View {
     }
 
     private func saveRuleAppearance(_ id: UUID, _ appearance: RuleAppearance) async throws -> Bool {
+        try requireCalendarMaintenance()
         guard let index = snapshot.rules.firstIndex(where: { $0.id == id }) else { return false }
         var updated = snapshot
         updated.rules[index].appearance = appearance.isDefault ? nil : appearance
@@ -981,6 +1040,7 @@ private struct RulesHome: View {
         }
         if cloudResetPending {
             cloudResetPending = false
+            pendingWait = CloudPendingWait()
             snapshot = RuleSnapshot()
             cloudSession = nil
             loaded = false
@@ -1029,6 +1089,7 @@ private struct RulesHome: View {
                 }
                 guard !cloudResetPending else { throw CloudRuleError.accountChanged }
                 hasCloudAccount = true
+                pendingWait.observe(session, elapsed: pendingClockOrigin.duration(to: ContinuousClock().now))
                 restoreCloud(session)
                 cloudReady = true
                 cloudReadError = nil
@@ -1037,6 +1098,7 @@ private struct RulesHome: View {
                 // An explicit no-account response is not an empty cloud ledger.
                 guard !cloudResetPending else { throw CloudRuleError.accountChanged }
                 cloudSession = nil
+                pendingWait = CloudPendingWait()
                 knownDestinations = [:]
                 directFrozen = [:]
                 snapshot = try RuleSnapshot.read(localOnly: hasCloudAccount)
@@ -1166,6 +1228,9 @@ private struct RulesHome: View {
             if interruptedOperation(current) != nil {
                 return L10n.text("套用中斷。", "The update was interrupted.")
             }
+            if pendingWait.confirmedWaiting.values.contains(where: { operationTouches($0, ruleID: current) }) {
+                return L10n.text("待完成時間較長，暫時凍結。", "This update is taking longer than expected. The rule is frozen for now.")
+            }
             if pendingOperation(current) != nil { return nil }
             if let reason = directFrozen[current] { return reason }
             cursor = includingAncestors ? snapshot.rules.first(where: { $0.id == current })?.parent : nil
@@ -1173,11 +1238,13 @@ private struct RulesHome: View {
         return nil
     }
 
+    private func operationTouches(_ operation: CloudRuleOperation, ruleID: UUID) -> Bool {
+        operation.deletions.contains(ruleID) || operation.upserts.contains(where: { $0.id == ruleID })
+            || operation.plan?.ruleIDs.contains(ruleID) == true
+    }
+
     private func pendingOperation(_ id: UUID) -> CloudRuleOperation? {
-        cloudSession?.ledger.pending.first { operation in
-            operation.deletions.contains(id) || operation.upserts.contains(where: { $0.id == id })
-                || operation.plan?.ruleIDs.contains(id) == true
-        }
+        cloudSession?.ledger.pending.first { operationTouches($0, ruleID: id) }
     }
 
     private func interruptedOperation(_ id: UUID) -> CloudRuleOperation? {
@@ -1185,6 +1252,7 @@ private struct RulesHome: View {
     }
 
     private func assertWritable(_ scope: Set<UUID>, eventRuleIDs: Set<UUID> = []) throws {
+        try requireCalendarMaintenance()
         guard loaded, cloudReady, !cloudResetPending, !awaitingLocalRecovery else {
             throw RuleOperationError(L10n.text("規則尚未與 iCloud 核對，暫未更動行事曆。", "Rules have not been verified with iCloud. No calendar events changed."))
         }
@@ -1419,6 +1487,7 @@ private struct RulesHome: View {
     }
 
     private func refreshBeforeOrphans() async throws {
+        try requireCalendarMaintenance()
         guard !cloudBusy, !cloudRefreshing else { throw CloudRuleError.reserved }
         let priorAccount = cloudSession?.accountID
         await load()
@@ -1441,130 +1510,79 @@ private struct RulesHome: View {
         mergeBindings([rule: id], account: account)
     }
 
-    private func confirmPendingInterruption(_ operation: CloudRuleOperation, accountID: String) async throws {
-        guard !cloudBusy, !cloudRefreshing, !cloudResetPending, cloudSession?.accountID == accountID else {
-            throw CloudRuleError.unavailable
-        }
-        cloudBusy = true
-        defer {
-            cloudBusy = false
-            if cloudResetPending { Task { await load() } }
-        }
-        let current = try await cloud.confirmInterrupted(operation, accountID: accountID)
-        guard !cloudResetPending else { throw CloudRuleError.accountChanged }
-        restoreCloud(current)
+    private func originalCalendarTitle(_ ruleID: UUID) -> String? {
+        let entry = cloudSession?.ledger.rules.first { $0.id == ruleID }
+            ?? pendingOperation(ruleID)?.upserts.first { $0.id == ruleID }
+        guard let destination = entry?.destination else { return nil }
+        return destination.sourceTitle.isEmpty ? destination.title : "\(destination.title) · \(destination.sourceTitle)"
     }
 
-    private func inspectThaw(_ rule: Rule, destinationID: String) throws -> CloudThawProposal {
-        guard cloudReady, !cloudResetPending,
-              let session = cloudSession,
-              let entry = (session.ledger.rules.first(where: { $0.id == rule.id })
-                           ?? pendingOperation(rule.id)?.upserts.first(where: { $0.id == rule.id })) else {
-            throw CloudRuleError.unavailable
-        }
-        guard !destinationID.isEmpty else { throw CalendarIntegrationError.noDestination }
-        if let parent = rule.parent, freezeReason(parent) != nil, interruptedOperation(rule.id) == nil {
+    private func inspectThaw(_ ruleID: UUID) throws -> CloudThawProposal {
+        try requireCalendarMaintenance()
+        guard cloudReady, !cloudResetPending, let session = cloudSession else { throw CloudRuleError.unavailable }
+        if let rule = snapshot.rules.first(where: { $0.id == ruleID }), let parent = rule.parent,
+           freezeReason(parent) != nil, interruptedOperation(ruleID) == nil {
             throw RuleOperationError(L10n.text("請先解除依據規則的凍結。", "Unfreeze the parent rule first."))
         }
-        if let owner = entry.destination?.localOwner ?? entry.unresolvedOwner, owner != cloud.deviceID {
-            throw RuleOperationError(L10n.text("請回原 iPhone 操作本機行事曆。", "Use the original iPhone for this local calendar."))
+        let operation = pendingOperation(ruleID)
+        if operation?.interrupted == false ||
+            (operation == nil && pendingWait.confirmedWaiting.values.contains { operationTouches($0, ruleID: ruleID) }) {
+            throw RuleOperationError(L10n.text("尚無法確認原裝置已停止寫入。規則保持凍結，待同步確認。", "The original writer has not been verified as stopped. The rule remains frozen until sync can confirm it."))
         }
-        let remembered = bindings(session.accountID)
-        let originallyMatched = if let descriptor = entry.destination {
-            (try? calendar.resolveSyncDestination(descriptor, rememberedID: remembered[rule.id], deviceID: cloud.deviceID)) == destinationID
-        } else {
-            entry.unresolvedOwner == cloud.deviceID && remembered[rule.id] == destinationID
-        }
-        let confirmed = originallyMatched || knownDestinations[rule.id] == destinationID
-        let descriptor: CalendarSyncDestination
-        if confirmed {
-            descriptor = try calendar.syncDestination(id: destinationID, deviceID: cloud.deviceID)
-        } else {
-            guard let previous = entry.prior, !previous.isEmpty else { throw CalendarIntegrationError.noDestination }
-            descriptor = try calendar.verifySyncRebinding(ruleID: rule.id, destinationID: destinationID,
-                                                           previous: previous, deviceID: cloud.deviceID)
-        }
-        var locations = knownDestinations
-        locations[rule.id] = destinationID
-        guard var op = interruptedOperation(rule.id) else {
-            return CloudThawProposal(descriptor: descriptor, locations: locations, operation: nil)
-        }
-        guard let original = op.plan else {
-            op.owner = cloud.deviceID
-            op.interrupted = false
-            return CloudThawProposal(descriptor: descriptor, locations: locations, operation: op)
-        }
-        // A pending addition can be missing from the active ledger. Resolve its recorded
-        // destination without substituting a default or a same-name local calendar.
-        for envelope in op.upserts where original.ruleIDs.contains(envelope.id) && locations[envelope.id] == nil {
-            if let descriptor = envelope.destination {
-                locations[envelope.id] = try calendar.resolveSyncDestination(descriptor, rememberedID: remembered[envelope.id],
-                                                                             deviceID: cloud.deviceID)
+        let affected = (operation?.plan?.ruleIDs ?? []).union([ruleID])
+        var locations: [UUID: String] = [:]
+        var previous: [PlannedOccurrence] = []
+        for id in affected {
+            guard let entry = session.ledger.rules.first(where: { $0.id == id }) else {
+                // A new pending rule has no confirmed baseline to unlock.
+                throw CalendarIntegrationError.invalidPlan
+            }
+            guard let calendarID = knownDestinations[id] else {
+                throw RuleOperationError(directFrozen[id] ?? CalendarIntegrationError.noDestination.localizedDescription)
+            }
+            guard entry.prior != nil || !entry.rule.hasApplied else { throw CalendarIntegrationError.invalidPlan }
+            locations[id] = calendarID
+            previous += (entry.prior ?? []).map { item in
+                var item = item
+                item.calendarID = calendarID
+                return item
             }
         }
-        guard original.ruleIDs.allSatisfy({ locations[$0] != nil }) else { throw CalendarIntegrationError.noDestination }
-        func binding(_ item: PlannedOccurrence) throws -> PlannedOccurrence {
-            guard let id = locations[item.ruleID] else { throw CalendarIntegrationError.noDestination }
-            var item = item
-            item.calendarID = id
-            return item
-        }
-        let desired = try original.desired.map(binding)
-        let previous = try original.previous.map(binding)
-        // A locally saved but unproven draft is not evidence for this attempt.
-        // Resume the confirmed cloud plan, never substitute an unrelated edit.
-        let recovery = try calendar.prepareSyncPlan(desired: desired, previous: previous, ruleIDs: original.ruleIDs,
-                                                    attemptID: op.id, matchingRemoval: nil, takeover: true)
-        op.owner = cloud.deviceID
-        op.plan = recovery
-        op.interrupted = false
-        for index in op.upserts.indices where recovery.ruleIDs.contains(op.upserts[index].id) {
-            if op.upserts[index].id == rule.id { op.upserts[index].destination = descriptor }
-            op.upserts[index].prior = recovery.result.filter { $0.ruleID == op.upserts[index].id }
-        }
-        return CloudThawProposal(descriptor: descriptor, locations: locations, operation: op)
+        let plan = operation?.plan
+        var attempted = (plan?.previous ?? []) + (plan?.desired ?? []) + (plan?.result ?? [])
+        if let plan { attempted += plan.mutations.flatMap { [$0.old, $0.new].compactMap { $0 } } }
+        let observed = try calendar.verifyOriginalForUnfreeze(previous: previous, attempted: attempted, locations: locations)
+        return CloudThawProposal(accountID: session.accountID, operation: operation,
+                                 locations: locations, previous: previous, observed: observed)
     }
 
-    private func confirmThaw(_ rule: Rule, destinationID: String, expected: CloudThawProposal) async throws {
-        guard !cloudBusy, !cloudRefreshing, let session = cloudSession else { throw CloudRuleError.unavailable }
+    private func confirmThaw(_ ruleID: UUID, expected: CloudThawProposal) async throws {
+        try requireCalendarMaintenance()
+        guard !cloudBusy, !cloudRefreshing, !cloudResetPending, cloudSession?.accountID == expected.accountID else {
+            throw CloudRuleError.unavailable
+        }
         cloudBusy = true
         defer {
             cloudBusy = false
             if cloudResetPending { Task { await load() } }
         }
-        let latest = try await cloud.refresh()
-        guard let latest, latest.accountID == session.accountID, !cloudResetPending else { throw CloudRuleError.accountChanged }
+        guard let latest = try await cloud.refresh(), latest.accountID == expected.accountID, !cloudResetPending else {
+            throw CloudRuleError.accountChanged
+        }
+        pendingWait.observe(latest, elapsed: pendingClockOrigin.duration(to: ContinuousClock().now))
         restoreCloud(latest)
-        let current = try inspectThaw(rule, destinationID: destinationID)
-        guard expected == current else { throw CalendarIntegrationError.removalSelectionChanged }
-        guard let operation = current.operation else {
-            try storeVerifiedBinding(destinationID, descriptor: current.descriptor, for: rule.id, session: latest)
-            restoreCloud(latest)
+        if let operation = expected.operation, latest.ledger.completed.contains(operation.id) {
+            // The original writer already completed; leave that result in effect.
             return
         }
-        defer { cloud.endLocalExecution(operation.id) }
-        let removalGuard = try operation.plan.map { try calendar.syncRemovalGuard(for: $0, destinations: current.locations) }
-        let local = CloudLocalWritePlan(destinations: current.locations.filter { operation.scope.contains($0.key) }, removalGuard: removalGuard)
-        let claimed = try await cloud.takeOver(operation, localBefore: [], localAfter: [],
-                                               localPlan: try JSONEncoder().encode(local), in: latest)
-        restoreCloud(claimed)
-        let verified = try await cloud.verifyOwnership(operation.id, in: claimed)
-        guard !cloudResetPending else { throw CloudRuleError.accountChanged }
-        if let plan = operation.plan {
-            _ = try calendar.applySyncPlan(plan, destinations: current.locations, removalGuard: removalGuard)
+        let current = try inspectThaw(ruleID)
+        guard current == expected else { throw CalendarIntegrationError.removalSelectionChanged }
+        if let operation = current.operation {
+            let ended = try await cloud.retireInterruptedWithoutEventWrite(operation, in: latest)
+            guard !cloudResetPending else { throw CloudRuleError.accountChanged }
+            pendingWait.observe(ended, elapsed: pendingClockOrigin.duration(to: ContinuousClock().now))
+            restoreCloud(ended)
         }
-        try cloud.recordEventKitComplete(operation.id, in: verified)
-        let done = try await cloud.finish(operation.id, in: verified)
-        if takeoverReturnsToRuleList(operation, acknowledged: done) {
-            for id in operation.deletions {
-                UserDefaults.standard.removeObject(forKey: cloudLocalKey("rules.cloudDraft.\(done.accountID).\(id)"))
-            }
-            restoreCloud(done)
-            path.removeAll()
-            return
-        }
-        try storeVerifiedBinding(destinationID, descriptor: current.descriptor, for: rule.id, session: done)
-        restoreCloud(done)
     }
 
     private func resolve(_ input: Rule, allowingVerifiedRebinding: Bool = false) throws -> RuleReconciliation {
@@ -1632,6 +1650,7 @@ private struct RulesHome: View {
     }
 
     private func preview(_ rule: Rule) throws -> RuleEventPreviewResult {
+        try requireCalendarMaintenance()
         var rules = snapshot.rules.filter { $0.id != rule.id }
         rules.append(rule)
         let tree = ruleTreeRows(roots: [rule], rules: rules)
@@ -1658,6 +1677,7 @@ private struct RulesHome: View {
     }
 
     private func apply(_ rule: Rule, expected: Rule?) async throws -> Rule {
+        try requireCalendarMaintenance()
         guard !isDeletedInCloud(rule.id) else { throw CloudRuleError.ruleDeleted }
         let account = cloudSession?.accountID
         do {
@@ -1737,6 +1757,7 @@ private struct RulesHome: View {
     }
 
     private func previewBatch(_ edit: BatchEdit) throws -> BatchDurationPreview {
+        try requireCalendarMaintenance()
         let batch = try batchPlan(edit)
         let plan = batch.plan
         let changes = try batchCalendarChanges(plan)
@@ -1750,6 +1771,7 @@ private struct RulesHome: View {
     }
 
     private func applyBatch(_ edit: BatchEdit) async throws {
+        try requireCalendarMaintenance()
         let scope = try selectedTreeIDs(edit.ruleIDs)
         try assertWritable(scope)
         let plan = try batchPlan(edit).plan
@@ -1788,6 +1810,7 @@ private struct RulesHome: View {
     }
 
     private func previewRemoval(_ selected: Set<UUID>, allowChild: Bool) throws -> BatchRemovalPreview {
+        try requireCalendarMaintenance()
         let rules = try removalRows(selected, allowChild: allowChild)
         let ids = Set(rules.map(\.id))
         let appliedIDs = Set(snapshot.rules.filter { ids.contains($0.id) && $0.hasApplied }.map(\.id))
@@ -1852,6 +1875,7 @@ private struct RulesHome: View {
 
     private func importBirthdays(_ candidates: [BirthdayCandidate], years: Int, target: String, applyNow: Bool,
                                  category: String, subcategory: String, preferNickname: Bool) async throws {
+        try requireCalendarMaintenance()
         guard loaded, (1...999).contains(years), !candidates.isEmpty else {
             throw RuleOperationError(L10n.text("請選擇要匯入的生日並填寫有效的期間。", "Select birthdays to import and enter a valid repeat period."))
         }
@@ -1934,7 +1958,7 @@ private struct RulesHome: View {
                 }
                 .frame(minHeight: 44)
             }
-            .disabled(!loaded || rootRules.isEmpty)
+            .disabled(!calendar.hasFullAccess || !loaded || rootRules.isEmpty)
             .accessibilityIdentifier("start-batch")
             Spacer(minLength: 8)
             Button(action: showAppleCalendar) {
@@ -1974,6 +1998,7 @@ private struct RulesHome: View {
                 .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
+        .disabled(!calendar.hasFullAccess)
         .accessibilityLabel(L10n.text("新增規則", "New Rule"))
         .accessibilityIdentifier("add-rule")
     }
@@ -2024,6 +2049,7 @@ private struct RulesHome: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .disabled(!calendar.hasFullAccess)
             .accessibilityLabel(L10n.text("調整\(key.title)圖示與顏色", "Change icon and color for \(key.title)"))
             .accessibilityIdentifier(key.subcategory == nil ? "category-appearance" : "subcategory-appearance")
             Text(key.title)
@@ -2093,6 +2119,7 @@ private struct RulesHome: View {
             List {
                 ForEach(RuleKind.allCases) { kind in
                     Button {
+                        guard calendar.hasFullAccess else { return }
                         var rule = Rule(name: "", kind: kind, date: kind.dates.first ?? "", category: "")
                         if kind == .solar {
                             rule.pinSolarTimeZone()
@@ -2448,7 +2475,9 @@ private struct RuleEditor: View {
                 .disabled(baseline == nil || frozenReason != nil)
             } header: { Text(L10n.text("子規則", "Child Rules")) }
               footer: { Text(baseline == nil ? L10n.text("先套用這條規則，才能新增它的子規則。", "Apply this rule before adding child rules.") : L10n.text("可編輯直接子規則；縮排的下游項目僅供查看。", "You can edit direct child rules here. Deeper levels are shown for reference.")) }
-            EventPreview(rule: previewRule, savedRules: allRules, civilCalendar: ruleCalendar, load: preview)
+            if calendar.hasFullAccess {
+                EventPreview(rule: previewRule, savedRules: allRules, civilCalendar: ruleCalendar, load: preview)
+            }
             if !isFreshRule && frozenReason == nil {
                 Section {
                     Button { showingDeletion = true } label: {
@@ -3284,9 +3313,9 @@ private struct RulePreviewEventRow: View {
 @MainActor
 func showCalendarConnectButton(_ calendar: CalendarIntegration) -> Bool {
     #if targetEnvironment(simulator)
-    calendar.destinations.isEmpty
+    calendar.hasFullAccess && calendar.destinations.isEmpty
     #else
-    !calendar.hasFullAccess
+    false
     #endif
 }
 
@@ -3759,22 +3788,20 @@ private struct OrphanCleanupView: View {
 }
 
 private struct CloudThawProposal: Equatable {
-    let descriptor: CalendarSyncDestination
-    let locations: [UUID: String]
+    let accountID: String
     let operation: CloudRuleOperation?
+    let locations: [UUID: String]
+    let previous: [PlannedOccurrence]
+    let observed: [PlannedOccurrence]
 }
 
 private struct FrozenRuleReview: View {
     let rule: Rule
-    @ObservedObject var calendar: CalendarIntegration
-    let interrupted: Bool
-    let pendingConfirmation: (() async throws -> Void)?
-    let inspect: (String) throws -> CloudThawProposal
-    let confirm: (String, CloudThawProposal) async throws -> Void
+    let original: String?
+    let inspect: () throws -> CloudThawProposal
+    let confirm: (CloudThawProposal) async throws -> Void
     @Environment(\.dismiss) private var dismiss
-    @State private var destination = ""
     @State private var proposal: CloudThawProposal?
-    @State private var oldDeviceStopped = false
     @State private var processing = false
     @State private var errorMessage: String?
 
@@ -3783,91 +3810,47 @@ private struct FrozenRuleReview: View {
             Form {
                 Section {
                     Text(rule.displayName).font(.headline)
-                    if pendingConfirmation != nil {
-                        Text(L10n.text("只有確定原裝置無法繼續這次寫入時，才標記中斷。若還在同步，請等待。這一步不會改動行事曆。", "Mark an interruption only if the original device cannot resume this update. If it is still syncing, wait. This step does not change Calendar events."))
-                        Toggle(L10n.text("確認原裝置無法再寫入", "The original device cannot resume writing"), isOn: $oldDeviceStopped)
-                    } else if interrupted {
-                        Text(L10n.text("確認原裝置已停止這次操作，且不會繼續寫入，再選正確的行事曆。", "Confirm the original device has stopped this operation and will not resume writing, then select the correct calendar."))
-                        Toggle(L10n.text("原裝置不會再寫入", "The original device will not resume writing"), isOn: $oldDeviceStopped)
-                    } else {
-                        Text(L10n.text("選定可核對的原行事曆，不會搬移或新增事件。", "Choose a calendar that can be verified as the original. This does not move or add events."))
+                    if let original {
+                        LabeledContent(L10n.text("原行事曆", "Original Calendar"), value: original)
                     }
-                }
-                if let pendingConfirmation {
-                    Section {
-                        Button(L10n.text("確認中斷", "Confirm Interruption")) {
-                            guard oldDeviceStopped, !processing else { return }
-                            processing = true
-                            Task {
-                                defer { processing = false }
-                                do { try await pendingConfirmation(); dismiss() }
-                                catch { errorMessage = error.localizedDescription }
-                            }
-                        }.disabled(!oldDeviceStopped || processing)
-                        if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
-                    }
-                } else {
-                Section {
-                    if !calendar.hasFullAccess {
-                        Button(L10n.text("連接行事曆", "Connect Calendar")) {
-                            Task {
-                                do { try await calendar.connectCalendars() }
-                                catch { errorMessage = error.localizedDescription }
-                            }
-                        }
-                    }
-                    Picker(L10n.text("原行事曆", "Original Calendar"), selection: $destination) {
-                        Text(L10n.text("請選擇", "Select")).tag("")
-                        ForEach(calendar.destinations.filter(\.isWritable)) { item in Text(item.displayTitle).tag(item.id) }
-                    }
-                    Button(L10n.text("核對與預覽", "Verify and Preview")) {
-                        do { proposal = try inspect(destination); errorMessage = nil }
-                        catch { proposal = nil; errorMessage = error.localizedDescription }
-                    }.disabled(destination.isEmpty || (interrupted && !oldDeviceStopped))
-                    if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
+                    if let errorMessage { Text(errorMessage).foregroundStyle(.secondary) }
                 }
                 if let proposal {
-                    Section(L10n.text("待執行", "Proposed Changes")) {
-                        if let mutations = proposal.operation?.plan?.mutations, !mutations.isEmpty {
-                            ForEach(Array(mutations.enumerated()), id: \.offset) { _, action in
-                                if let event = action.new ?? action.old {
-                                    let label = switch action.kind {
-                                    case .insert: L10n.text("新增", "Add")
-                                    case .update: L10n.text("更新", "Update")
-                                    case .remove: L10n.text("移除", "Remove")
-                                    }
-                                    VStack(alignment: .leading) {
-                                        Text(label + " " + event.title)
-                                        Text(dateCaption(event.start)).font(.caption)
-                                    }
+                    if !proposal.observed.isEmpty {
+                        Section(L10n.text("已核對的事件", "Verified Events")) {
+                            ForEach(Array(proposal.observed.enumerated()), id: \.offset) { _, event in
+                                VStack(alignment: .leading) {
+                                    Text(event.title)
+                                    Text(dateCaption(event.start)).font(.caption)
                                 }
-                            }
-                        } else {
-                            Text(L10n.text("不需寫入行事曆。", "No event changes are needed."))
-                        }
-                        Button(interrupted ? L10n.text("確認接手", "Confirm Takeover") : L10n.text("確認綁定", "Confirm Calendar")) {
-                            guard !processing, !interrupted || oldDeviceStopped else { return }
-                            processing = true
-                            let id = destination
-                            Task {
-                                defer { processing = false }
-                                do { try await confirm(id, proposal); dismiss() }
-                                catch { errorMessage = error.localizedDescription; self.proposal = nil }
                             }
                         }
                     }
+                    Section {
+                        Button(L10n.text("確認接手", "Confirm Takeover")) {
+                            guard !processing else { return }
+                            processing = true
+                            Task {
+                                defer { processing = false }
+                                do { try await confirm(proposal); dismiss() }
+                                catch { errorMessage = error.localizedDescription; self.proposal = nil }
+                            }
+                        }.disabled(processing)
+                    } footer: {
+                        Text(L10n.text("解除凍結後，你可以在這台裝置修改或刪除規則。行事曆事件不會立即變更。",
+                                       "After unfreezing, you can edit or delete the rule on this device. Calendar events will not change immediately."))
+                    }
                 }
             }
-            }
-            .disabled(processing)
-            .onChange(of: destination) { _, _ in proposal = nil }
-            .onChange(of: oldDeviceStopped) { _, _ in proposal = nil }
-            .navigationTitle(pendingConfirmation == nil ? L10n.text("解除凍結", "Unfreeze Rule")
-                                                        : L10n.text("核對中斷", "Review Interruption"))
+            .navigationTitle(L10n.text("解除凍結", "Unfreeze Rule"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(L10n.text("取消", "Cancel")) { dismiss() }.disabled(processing)
                 }
+            }
+            .task {
+                do { proposal = try inspect(); errorMessage = nil }
+                catch { proposal = nil; errorMessage = error.localizedDescription }
             }
         }
         .interactiveDismissDisabled(processing)

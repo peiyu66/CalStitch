@@ -133,7 +133,10 @@ enum CalendarIntegrationError: LocalizedError {
 @MainActor
 final class CalendarIntegration: ObservableObject {
     @Published private(set) var destinations: [CalendarDestination] = []
+    @Published private(set) var authorizationStatus = EKEventStore.authorizationStatus(for: .event)
+    // Use the live system value at the actual operation boundary.
     var hasFullAccess: Bool { EKEventStore.authorizationStatus(for: .event) == .fullAccess }
+    var canRequestFullAccess: Bool { authorizationStatus == .notDetermined }
     private let store = EKEventStore()
     private let defaults: UserDefaults
     private static let destinationKey = "CalStitch.dedicatedLocalCalendar.v1"
@@ -194,7 +197,9 @@ final class CalendarIntegration: ObservableObject {
     }
 
     func refreshCalendars() {
-        guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else {
+        let status = EKEventStore.authorizationStatus(for: .event)
+        if authorizationStatus != status { authorizationStatus = status }
+        guard status == .fullAccess else {
             destinations = []
             return
         }
@@ -220,13 +225,19 @@ final class CalendarIntegration: ObservableObject {
         try await connectCalendars()
     }
 
-    func connectCalendars() async throws {
-        if !hasFullAccess {
-            guard try await store.requestFullAccessToEvents(), hasFullAccess else {
-                destinations = []
-                throw CalendarIntegrationError.denied
-            }
+    /// Entry permission only: never provision simulator calendars here.
+    func requestCalendarFullAccess() async throws {
+        defer { refreshCalendars() }
+        let status = EKEventStore.authorizationStatus(for: .event)
+        if status == .fullAccess { return }
+        guard status == .notDetermined else { throw CalendarIntegrationError.denied }
+        guard try await store.requestFullAccessToEvents(), hasFullAccess else {
+            throw CalendarIntegrationError.denied
         }
+    }
+
+    func connectCalendars() async throws {
+        try await requestCalendarFullAccess()
 
         #if targetEnvironment(simulator)
         if let remembered = defaults.string(forKey: Self.destinationKey) {
@@ -417,6 +428,70 @@ final class CalendarIntegration: ObservableObject {
             throw CalendarIntegrationError.removalSelectionChanged
         }
         return try syncPlan(from: reconciled, desired: desired, previous: previous, ruleIDs: ruleIDs, attemptID: attemptID)
+    }
+
+    /// Verify the effective, pre-interruption occurrence identities without writing events.
+    /// The attempted ranges are for detecting partial writes, not a new source of authority.
+    func verifyOriginalForUnfreeze(previous: [PlannedOccurrence], attempted: [PlannedOccurrence],
+                                    locations: [UUID: String]) throws -> [PlannedOccurrence] {
+        guard hasFullAccess else { throw CalendarIntegrationError.denied }
+        guard (previous + attempted).allSatisfy({ locations[$0.ruleID] != nil && Identity.valid($0.key) && $0.end > $0.start }) else {
+            throw CalendarIntegrationError.invalidPlan
+        }
+        store.reset()
+        let now = Date()
+        var observed: [PlannedOccurrence] = []
+        for (ruleID, id) in locations {
+            let calendar = try writableCalendar(id: id)
+            let baseline = previous.filter { $0.ruleID == ruleID }.map { bind($0, to: id) }
+            let trial = attempted.filter { $0.ruleID == ruleID }
+            let prior = try table(baseline, calendarID: id, ruleIDs: [ruleID])
+            // A new occurrence could have been written but not be visible locally yet.
+            guard !trial.contains(where: { item in
+                storageDate(item.start, allDay: item.isAllDay) > now
+                    && prior[Identity(rule: ruleID, occurrence: item.key)] == nil
+            }) else { throw CalendarIntegrationError.ambiguousEvent }
+
+            func bounds(_ values: [PlannedOccurrence]) -> (Date, Date)? {
+                guard let first = values.map({ storageDate($0.start, allDay: $0.isAllDay) }).min(),
+                      let last = values.map({ storageDate($0.end, allDay: $0.isAllDay) }).max() else { return nil }
+                return (first, last)
+            }
+
+            // A confirmed zero with no date evidence requires only a verified writable calendar.
+            guard let unionWindow = bounds(baseline + trial) else { continue }
+            let union = try findEvents(from: unionWindow.0, through: unionWindow.1, calendar: calendar, ruleIDs: [ruleID])
+            guard union.keys.allSatisfy({ prior[$0] != nil }) else { throw CalendarIntegrationError.ambiguousEvent }
+
+            let ordinary: [Identity: EKEvent]
+            if let baselineWindow = bounds(baseline) {
+                ordinary = baselineWindow == unionWindow ? union
+                    : try findEvents(from: baselineWindow.0, through: baselineWindow.1, calendar: calendar, ruleIDs: [ruleID])
+            } else {
+                ordinary = [:]
+            }
+            for (key, item) in prior where storageDate(item.start, allDay: item.isAllDay) > now {
+                guard let combined = union[key], let baselineEvent = ordinary[key],
+                      combined.calendarItemIdentifier == baselineEvent.calendarItemIdentifier,
+                      combined.startDate == baselineEvent.startDate else { throw CalendarIntegrationError.missingEvent }
+            }
+            // Existing records can differ in content, but ordinary Apply/Delete must
+            // still reach every future record via the effective baseline window.
+            for (key, value) in union {
+                guard let baselineValue = prior[key],
+                      (value.startDate > now) == (storageDate(baselineValue.start, allDay: baselineValue.isAllDay) > now)
+                else { throw CalendarIntegrationError.ambiguousEvent }
+                if value.startDate > now {
+                    guard let baselineEvent = ordinary[key],
+                          value.calendarItemIdentifier == baselineEvent.calendarItemIdentifier,
+                          value.startDate == baselineEvent.startDate else { throw CalendarIntegrationError.ambiguousEvent }
+                }
+                observed.append(try operationState(key, event: value))
+            }
+        }
+        return observed.sorted { lhs, rhs in
+            lhs.ruleID == rhs.ruleID ? lhs.key < rhs.key : lhs.ruleID.uuidString < rhs.ruleID.uuidString
+        }
     }
 
     private func bind(_ value: PlannedOccurrence, to calendarID: String) -> PlannedOccurrence {
