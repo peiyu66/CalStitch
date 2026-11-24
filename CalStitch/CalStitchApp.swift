@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import CloudKit
 import UIKit
 
@@ -643,117 +644,66 @@ private struct RulesHome: View {
     @State private var snapshot = RuleSnapshot()
     @State private var appearanceGroup: GroupAppearanceKey?
 
+    private enum PadGroup: Hashable {
+        case all
+        case category(String)
+        case subcategory(String, String)
+
+        var title: String {
+            switch self {
+            case .all: L10n.text("所有規則", "All Rules")
+            case let .category(category): category
+            case let .subcategory(_, subcategory):
+                subcategory.isEmpty ? L10n.text("未分次類", "No Subcategory") : subcategory
+            }
+        }
+
+        var preset: (category: String, subcategory: String) {
+            switch self {
+            case .all: ("", "")
+            case let .category(category): (category, "")
+            case let .subcategory(category, subcategory): (category, subcategory)
+            }
+        }
+
+        var accessibilityID: String {
+            switch self {
+            case .all: "ipad-all-rules"
+            case let .category(category): "ipad-category-\(category)"
+            case let .subcategory(category, subcategory): "ipad-subcategory-\(category)-\(subcategory)"
+            }
+        }
+
+        func includes(_ rule: Rule) -> Bool {
+            switch self {
+            case .all: true
+            case let .category(category): rule.category == category
+            case let .subcategory(category, subcategory):
+                rule.category == category && rule.subcategory == subcategory
+            }
+        }
+    }
+
+    @State private var padGroup = PadGroup.all
+    @State private var padExitRequests = PassthroughSubject<PadExitRequest, Never>()
+    private var usesPadLayout: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+
     var body: some View {
-        NavigationStack(path: $path) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 23) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(L10n.text("行事曆規則", "Calendar Rules"))
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                        toolsRow
-                    }
-                    if !calendar.hasFullAccess { calendarAccessNotice }
-                    if let cloudReadError {
-                        Label(cloudReadError, systemImage: "icloud.slash")
-                            .font(.footnote).foregroundStyle(.secondary)
-                        Button(L10n.text("重新同步", "Retry Sync")) { Task { await load() } }
-                    }
-                    if loaded && showGettingStarted { intro }
-                    if !loaded && !loadFailed {
-                        ProgressView(L10n.text("正在讀取規則…", "Loading rules…"))
-                    } else if loadFailed {
-                        Button(L10n.text("重新讀取規則", "Reload Rules")) { Task { await load() } }
-                    } else if visibleRootRules.isEmpty {
-                        emptyState
-                    }
-                    let names = uniqueNames(visibleRootRules.map(\.category))
-                    ForEach(names, id: \.self) { name in
-                        category(name, rules: visibleRootRules.filter { $0.category == name }, isFirst: name == names.first)
-                    }
-                    if loaded {
-                        let layout = dynamicTypeSize.isAccessibilitySize
-                            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10))
-                            : AnyLayout(HStackLayout(spacing: 20))
-                        layout {
-                            Button {
-                                showingBirthdayRoutes = true
-                            } label: {
-                                Label(L10n.text("匯入生日", "Import Birthdays"), systemImage: "person.crop.rectangle")
-                                    .frame(minHeight: 44)
-                            }
-                            .accessibilityIdentifier("open-birthday-import")
-                            Button {
-                                showingOrphanCleanup = true
-                            } label: {
-                                Label(L10n.text("清除遺留事件", "Clean Up Leftover Events"), systemImage: "trash")
-                                    .frame(minHeight: 44)
-                            }
-                            .accessibilityIdentifier("open-orphan-cleanup")
-                        }
-                        .disabled(!calendar.hasFullAccess)
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 3)
+        Group {
+            if usesPadLayout {
+                GeometryReader { proxy in
+                    HStack(spacing: 0) {
+                        padSidebar
+                            .frame(width: min(248, max(112, proxy.size.width * 0.30)))
+                        Divider()
+                        homeNavigation
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
-                .padding(.horizontal, 20)
-                .padding(.top, 2)
-                .padding(.bottom, 20)
+            } else {
+                homeNavigation
             }
-            .background(paper)
-            .navigationTitle("CalStitch")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    NavigationLink(value: Route.settings) {
-                        Image(systemName: "gearshape")
-                    }
-                    .accessibilityLabel(L10n.text("設定", "Settings"))
-                    .accessibilityIdentifier("open-settings")
-                }
-            }
-            .navigationDestination(for: Route.self) { route in
-                switch route {
-                case .settings:
-                    CalStitchSettingsView(hideFrozen: $hideFrozen)
-                case .edit(let rule, let isNew):
-                    if isDeletedInCloud(rule.id) {
-                        VStack(spacing: 20) {
-                            ContentUnavailableView(
-                                L10n.text("規則已刪除", "Rule Deleted"), systemImage: "trash",
-                                description: Text(CloudRuleError.ruleDeleted.localizedDescription)
-                            )
-                            if calendar.hasFullAccess && !pendingWait.expiredOperations(touching: rule.id).isEmpty {
-                                Button(L10n.text("解除凍結", "Unfreeze")) { freezeReview = rule }
-                            }
-                            Button(L10n.text("返回規則列表", "Back to Rules")) { path.removeAll() }
-                                .buttonStyle(.bordered)
-                        }
-                    } else {
-                        RuleEditor(initial: snapshot.rules.first { $0.id == rule.id } ?? rule, isNew: isNew,
-                                   parent: snapshot.rules.first { $0.id == rule.parent },
-                                   allRules: snapshot.rules, calendar: calendar,
-                                   preview: preview, onApply: apply, onApplied: returnAfterApply,
-                                   previewDeletion: { id in try previewRemoval([id], allowChild: true) },
-                                   deletionAvailability: deletionAvailability,
-                                   currentDeletionAvailability: { deletionAvailability },
-                                   rereadDeletion: { await load() },
-                                   onDelete: { id, expected in
-                                       let state = deletionAvailability
-                                       guard state == .ready else { throw RuleDeletionNotReady(availability: state) }
-                                       try await removeSelected([id], expected, allowChild: true)
-                                   },
-                                   onDeleted: { if !path.isEmpty { path.removeLast() } },
-                                   onSaveAppearance: saveRuleAppearance,
-                                   frozenReason: calendar.hasFullAccess ? (freezeReason(rule.id) ?? pendingReason(rule.id)) : CalendarIntegrationError.denied.localizedDescription,
-                                   hiddenRuleIDs: calendar.hasFullAccess && hideFrozen ? Set(snapshot.rules.filter { freezeReason($0.id) != nil }.map(\.id)) : [],
-                                   thawTitle: nil,
-                                   onThaw: !calendar.hasFullAccess || freezeReason(rule.id) == nil ? nil : { freezeReview = rule }) { child, isNew in
-                            path.append(.edit(child, isNew: isNew))
-                        }
-                    }
-                }
-            }
+        }
             .sheet(isPresented: $isAdding) { addSheet }
             .sheet(item: $freezeReview) { frozenRule in
                 FrozenRuleReview(rule: frozenRule, original: originalCalendarTitle(frozenRule.id),
@@ -812,9 +762,14 @@ private struct RulesHome: View {
             )) {
                 Button(L10n.text("好", "OK"), role: .cancel) { toolbarError = nil }
             } message: { Text(toolbarError ?? "") }
-        }
         .tint(slate)
-        .onChange(of: snapshot.rules) { _, _ in snapshot.pruneGroupAppearances() }
+        .onChange(of: snapshot.rules) { _, _ in
+            snapshot.pruneGroupAppearances()
+            if usesPadLayout && path.isEmpty { normalizePadGroup() }
+        }
+        .onChange(of: path) { _, value in
+            if usesPadLayout && value.isEmpty { normalizePadGroup() }
+        }
         .overlay(alignment: .bottom) {
             if appliedNotice != nil {
                 Label(L10n.text("已套用", "Applied"), systemImage: "checkmark.circle.fill")
@@ -876,6 +831,303 @@ private struct RulesHome: View {
                 showGettingStarted = rootRules.isEmpty
                 reachedBackground = false
             }
+        }
+    }
+
+    private var homeNavigation: some View {
+        NavigationStack(path: $path) {
+            Group {
+                if usesPadLayout { padRuleList } else { phoneHomeContent }
+            }
+            .navigationTitle(usesPadLayout ? padGroup.title : "CalStitch")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    if usesPadLayout && loaded {
+                        addRuleButton
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    NavigationLink(value: Route.settings) {
+                        Image(systemName: "gearshape")
+                    }
+                    .accessibilityLabel(L10n.text("設定", "Settings"))
+                    .accessibilityIdentifier("open-settings")
+                }
+            }
+            .navigationDestination(for: Route.self) { route in
+                switch route {
+                case .settings:
+                    CalStitchSettingsView(hideFrozen: $hideFrozen)
+                case .edit(let rule, let isNew):
+                    if isDeletedInCloud(rule.id) {
+                        VStack(spacing: 20) {
+                            ContentUnavailableView(
+                                L10n.text("規則已刪除", "Rule Deleted"), systemImage: "trash",
+                                description: Text(CloudRuleError.ruleDeleted.localizedDescription)
+                            )
+                            if calendar.hasFullAccess && !pendingWait.expiredOperations(touching: rule.id).isEmpty {
+                                Button(L10n.text("解除凍結", "Unfreeze")) { freezeReview = rule }
+                            }
+                            Button(L10n.text("返回規則列表", "Back to Rules")) { path.removeAll() }
+                                .buttonStyle(.bordered)
+                        }
+                    } else {
+                        RuleEditor(initial: snapshot.rules.first { $0.id == rule.id } ?? rule, isNew: isNew,
+                                   parent: snapshot.rules.first { $0.id == rule.parent },
+                                   allRules: snapshot.rules, calendar: calendar,
+                                   preview: preview, onApply: apply, onApplied: returnAfterApply,
+                                   previewDeletion: { id in try previewRemoval([id], allowChild: true) },
+                                   deletionAvailability: deletionAvailability,
+                                   currentDeletionAvailability: { deletionAvailability },
+                                   rereadDeletion: { await load() },
+                                   onDelete: { id, expected in
+                                       let state = deletionAvailability
+                                       guard state == .ready else { throw RuleDeletionNotReady(availability: state) }
+                                       try await removeSelected([id], expected, allowChild: true)
+                                   },
+                                   onDeleted: { if !path.isEmpty { path.removeLast() } },
+                                   onSaveAppearance: saveRuleAppearance,
+                                   frozenReason: calendar.hasFullAccess ? (freezeReason(rule.id) ?? pendingReason(rule.id)) : CalendarIntegrationError.denied.localizedDescription,
+                                   hiddenRuleIDs: calendar.hasFullAccess && hideFrozen ? Set(snapshot.rules.filter { freezeReason($0.id) != nil }.map(\.id)) : [],
+                                   padExitRequests: usesPadLayout ? padExitRequests : nil,
+                                   thawTitle: nil,
+                                   onThaw: !calendar.hasFullAccess || freezeReason(rule.id) == nil ? nil : { freezeReview = rule }) { child, isNew in
+                            path.append(.edit(child, isNew: isNew))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var phoneHomeContent: some View {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 23) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(L10n.text("行事曆規則", "Calendar Rules"))
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        toolsRow
+                    }
+                    if !calendar.hasFullAccess { calendarAccessNotice }
+                    if let cloudReadError {
+                        Label(cloudReadError, systemImage: "icloud.slash")
+                            .font(.footnote).foregroundStyle(.secondary)
+                        Button(L10n.text("重新同步", "Retry Sync")) { Task { await load() } }
+                    }
+                    if loaded && showGettingStarted { intro }
+                    if !loaded && !loadFailed {
+                        ProgressView(L10n.text("正在讀取規則…", "Loading rules…"))
+                    } else if loadFailed {
+                        Button(L10n.text("重新讀取規則", "Reload Rules")) { Task { await load() } }
+                    } else if visibleRootRules.isEmpty {
+                        emptyState
+                    }
+                    let names = uniqueNames(visibleRootRules.map(\.category))
+                    ForEach(names, id: \.self) { name in
+                        category(name, rules: visibleRootRules.filter { $0.category == name }, isFirst: name == names.first)
+                    }
+                    if loaded {
+                        let layout = dynamicTypeSize.isAccessibilitySize
+                            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10))
+                            : AnyLayout(HStackLayout(spacing: 20))
+                        layout {
+                            Button {
+                                showingBirthdayRoutes = true
+                            } label: {
+                                Label(L10n.text("匯入生日", "Import Birthdays"), systemImage: "person.crop.rectangle")
+                                    .frame(minHeight: 44)
+                            }
+                            .accessibilityIdentifier("open-birthday-import")
+                            Button {
+                                showingOrphanCleanup = true
+                            } label: {
+                                Label(L10n.text("清除遺留事件", "Clean Up Leftover Events"), systemImage: "trash")
+                                    .frame(minHeight: 44)
+                            }
+                            .accessibilityIdentifier("open-orphan-cleanup")
+                        }
+                        .disabled(!calendar.hasFullAccess)
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 3)
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 2)
+                .padding(.bottom, 20)
+            }
+            .background(paper)
+    }
+
+    private var padSidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("CalStitch")
+                .font(.headline)
+                .minimumScaleFactor(0.6)
+                .lineLimit(1)
+                .accessibilityAddTraits(.isHeader)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 3) {
+                    padGroupButton(.all, symbol: "list.bullet.rectangle")
+                    ForEach(uniqueNames(visibleRootRules.map(\.category)), id: \.self) { category in
+                        let rules = visibleRootRules.filter { $0.category == category }
+                        padGroupButton(.category(category), key: .init(category: category))
+                        ForEach(uniqueNames(rules.map(\.subcategory).filter { !$0.isEmpty }), id: \.self) { subcategory in
+                            let key = GroupAppearanceKey(category: category, subcategory: subcategory)
+                            padGroupButton(.subcategory(category, subcategory), key: key, isNested: true)
+                        }
+                    }
+                }
+                .padding(.horizontal, 6)
+            }
+            .accessibilityIdentifier("ipad-category-sidebar")
+        }
+        .frame(maxHeight: .infinity, alignment: .topLeading)
+        .background(paper)
+    }
+
+    private func padGroupButton(_ group: PadGroup, key: GroupAppearanceKey? = nil, symbol: String = "folder",
+                                isNested: Bool = false) -> some View {
+        let appearance = key.map(groupAppearance) ?? .init()
+        return Button {
+            requestPadGroupSwitch(group)
+        } label: {
+            Label {
+                Text(group.title).lineLimit(2)
+            } icon: {
+                Image(systemName: appearance.symbol(or: key?.defaultSymbol ?? symbol))
+                    .foregroundStyle(appearance.tint(or: slate))
+            }
+            .font(.subheadline.weight(isNested ? .regular : .semibold))
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .padding(.leading, isNested ? 16 : 7)
+            .padding(.trailing, 4)
+            .contentShape(Rectangle())
+            .background(padGroup == group ? slate.opacity(0.16) : .clear, in: RoundedRectangle(cornerRadius: 9))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(padGroup == group ? .isSelected : [])
+        .accessibilityIdentifier(group.accessibilityID)
+        .contextMenu {
+            if let key, calendar.hasFullAccess {
+                Button {
+                    appearanceGroup = key
+                } label: {
+                    Label(L10n.text("調整圖示與顏色", "Edit Icon and Color"), systemImage: "paintpalette")
+                }
+            }
+        }
+    }
+
+    private var padRuleList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                ViewThatFits(in: .horizontal) {
+                    padTools(horizontal: true)
+                    padTools(horizontal: false)
+                }
+                if !calendar.hasFullAccess { calendarAccessNotice }
+                if let cloudReadError {
+                    Label(cloudReadError, systemImage: "icloud.slash")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Button(L10n.text("重新同步", "Retry Sync")) { Task { await load() } }
+                }
+                if loaded && showGettingStarted { intro }
+                if !loaded && !loadFailed {
+                    ProgressView(L10n.text("正在讀取規則…", "Loading rules…"))
+                } else if loadFailed {
+                    Button(L10n.text("重新讀取規則", "Reload Rules")) { Task { await load() } }
+                } else {
+                    let filtered = visibleRootRules.filter(padGroup.includes)
+                    let names = uniqueNames(filtered.map(\.category))
+                    if names.isEmpty {
+                        ContentUnavailableView {
+                            Label(L10n.text("還沒有規則", "No Rules Yet"), systemImage: "calendar.badge.plus")
+                        } description: {
+                            Text(L10n.text("新增一條日期規則，或從通訊錄選擇生日匯入。", "Add a rule or import birthdays from Contacts."))
+                        }
+                    } else {
+                        ForEach(names, id: \.self) { name in
+                            category(name, rules: filtered.filter { $0.category == name }, isFirst: false)
+                        }
+                    }
+                }
+            }
+            .padding(16)
+            .frame(maxWidth: 860)
+            .frame(maxWidth: .infinity)
+        }
+        .background(paper)
+        .accessibilityIdentifier("ipad-rule-detail")
+    }
+
+    private func padTools(horizontal: Bool) -> some View {
+        let layout = horizontal
+            ? AnyLayout(HStackLayout(spacing: 14))
+            : AnyLayout(VStackLayout(alignment: .leading, spacing: 2))
+        return layout {
+            Button { isShowingBatch = true } label: {
+                Label(L10n.text("批次調整", "Batch Edit"), systemImage: "checklist")
+            }
+            .disabled(!calendar.hasFullAccess || !loaded || rootRules.isEmpty)
+            .accessibilityIdentifier("start-batch")
+            Button(action: showAppleCalendar) {
+                Label(L10n.text("行事曆", "Calendar"), systemImage: "calendar")
+            }
+            .accessibilityIdentifier("open-apple-calendar")
+            if loaded {
+                Button { showingBirthdayRoutes = true } label: {
+                    Label(L10n.text("匯入生日", "Import Birthdays"), systemImage: "person.crop.rectangle")
+                }
+                .disabled(!calendar.hasFullAccess)
+                .accessibilityIdentifier("open-birthday-import")
+                Button { showingOrphanCleanup = true } label: {
+                    Label(L10n.text("清除遺留事件", "Clean Up Leftover Events"), systemImage: "trash")
+                }
+                .disabled(!calendar.hasFullAccess)
+                .accessibilityIdentifier("open-orphan-cleanup")
+            }
+        }
+        .font(.subheadline.weight(.semibold))
+        .buttonStyle(PadToolButtonStyle(horizontal: horizontal))
+    }
+
+    private struct PadToolButtonStyle: ButtonStyle {
+        let horizontal: Bool
+
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label
+                .fixedSize(horizontal: horizontal, vertical: !horizontal)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+                .opacity(configuration.isPressed ? 0.55 : 1)
+        }
+    }
+
+    private func requestPadGroupSwitch(_ group: PadGroup) {
+        guard group != padGroup || !path.isEmpty else { return }
+        let finish = {
+            padGroup = group
+            path.removeAll()
+            normalizePadGroup()
+        }
+        if case let .edit(rule, _) = path.last, !isDeletedInCloud(rule.id) {
+            padExitRequests.send(.init(ruleID: rule.id, finish: finish))
+        } else {
+            finish()
+        }
+    }
+
+    private func normalizePadGroup() {
+        guard loaded, padGroup != .all, !visibleRootRules.contains(where: padGroup.includes) else { return }
+        if case let .subcategory(category, _) = padGroup,
+           visibleRootRules.contains(where: { $0.category == category }) {
+            padGroup = .category(category)
+        } else {
+            padGroup = .all
         }
     }
 
@@ -2193,7 +2445,9 @@ private struct RulesHome: View {
                 ForEach(RuleKind.allCases) { kind in
                     Button {
                         guard calendar.hasFullAccess else { return }
-                        var rule = Rule(name: "", kind: kind, date: kind.dates.first ?? "", category: "")
+                        let group = usesPadLayout ? padGroup.preset : ("", "")
+                        var rule = Rule(name: "", kind: kind, date: kind.dates.first ?? "", category: group.0)
+                        rule.subcategory = group.1
                         if kind == .solar {
                             rule.pinSolarTimeZone()
                             rule.start = RuleEngine.civilCalendar(for: rule).startOfDay(for: Date())
@@ -2285,12 +2539,20 @@ private func ruleTreeRows(roots: [Rule], rules: [Rule]) -> [BatchRemovalRule] {
     return rows
 }
 
+private struct PadExitRequest {
+    let ruleID: UUID
+    let finish: () -> Void
+}
+
 private struct RuleEditor: View {
     @State private var rule: Rule
     @State private var baseline: Rule?
     @State private var emptyCutoffSchedule: Rule?
     @State private var exitBaseline: Rule
     @State private var pendingDiscard = false
+    @State private var padExitFinish: (() -> Void)?
+    @State private var padChild: (rule: Rule, isNew: Bool)?
+    let padExitRequests: PassthroughSubject<PadExitRequest, Never>?
     @State private var exitAction: ExitAction?
     private enum ExitAction { case apply, discard }
     @State private var operationError: String?
@@ -2336,7 +2598,7 @@ private struct RuleEditor: View {
          onDelete: @escaping (UUID, BatchRemovalPreview) async throws -> Void,
          onDeleted: @escaping () -> Void,
          onSaveAppearance: @escaping (UUID, RuleAppearance) async throws -> Bool,
-         frozenReason: String?, hiddenRuleIDs: Set<UUID>, thawTitle: String?, onThaw: (() -> Void)?,
+         frozenReason: String?, hiddenRuleIDs: Set<UUID>, padExitRequests: PassthroughSubject<PadExitRequest, Never>? = nil, thawTitle: String?, onThaw: (() -> Void)?,
          onOpenChild: @escaping (Rule, Bool) -> Void) {
         let isFresh = isNew && !allRules.contains { $0.id == initial.id }
         self.isFreshRule = isFresh
@@ -2368,6 +2630,7 @@ private struct RuleEditor: View {
         self.frozenReason = frozenReason
         self.thawTitle = thawTitle
         self.hiddenRuleIDs = hiddenRuleIDs
+        self.padExitRequests = padExitRequests
         self.onThaw = onThaw
         self.onOpenChild = onOpenChild
     }
@@ -2550,7 +2813,7 @@ private struct RuleEditor: View {
                     var child = Rule(name: "", kind: rule.kind, date: rule.date, category: rule.category, subcategory: rule.subcategory, parent: rule.id)
                     child.startTime = ruleCalendar.date(bySettingHour: 9, minute: 0, second: 0, of: Date()) ?? child.startTime
                     child.target = rule.target
-                    onOpenChild(child, true)
+                    requestChild(child, isNew: true)
                 } label: {
                     Label(L10n.text("新增子規則", "Add Child Rule"), systemImage: "plus")
                 }
@@ -2604,6 +2867,15 @@ private struct RuleEditor: View {
             }
         }
         .navigationBarTitleDisplayMode(.inline)
+        .onReceive(padExitRequests?.eraseToAnyPublisher() ?? Empty().eraseToAnyPublisher()) { request in
+            guard request.ruleID == rule.id, !applying, !showingDeletion, !editingAppearance, !pendingDiscard else { return }
+            if hasUnsavedChanges {
+                padExitFinish = request.finish
+                pendingDiscard = true
+            } else {
+                request.finish()
+            }
+        }
         .navigationBarBackButtonHidden(hasUnsavedChanges)
         .toolbar {
             if hasUnsavedChanges {
@@ -2693,14 +2965,43 @@ private struct RuleEditor: View {
     private func handleExitAction() {
         let action = exitAction
         exitAction = nil
+        let finish = padExitFinish
+        padExitFinish = nil
+        if let child = padChild {
+            padChild = nil
+            switch action {
+            case .apply:
+                applyAndReturn(then: { onOpenChild(child.rule, child.isNew) }, returns: false)
+            case .discard:
+                rule = exitBaseline
+                onOpenChild(child.rule, child.isNew)
+            case nil:
+                break
+            }
+            return
+        }
         switch action {
-        case .apply: applyAndReturn()
-        case .discard: dismiss()
+        case .apply: applyAndReturn(then: finish)
+        case .discard:
+            if let finish { finish() } else { dismiss() }
         case nil: break
         }
     }
 
+    private func requestChild(_ child: Rule, isNew: Bool) {
+        if padExitRequests != nil && hasUnsavedChanges {
+            padChild = (child, isNew)
+            pendingDiscard = true
+        } else {
+            onOpenChild(child, isNew)
+        }
+    }
+
     private func applyAndReturn() {
+        applyAndReturn(then: nil)
+    }
+
+    private func applyAndReturn(then finish: (() -> Void)?, returns: Bool = true) {
         guard canApply else {
             operationError = frozenReason ?? missingRequiredPrompt
             return
@@ -2717,7 +3018,8 @@ private struct RuleEditor: View {
                 baseline = saved
                 compareBaseline = saved
                 exitBaseline = saved
-                onApplied()
+                if returns { onApplied() }
+                finish?()
             } catch {
                 operationError = error.localizedDescription
             }
@@ -2804,7 +3106,7 @@ private struct RuleEditor: View {
             }
             if row.depth == 0 {
                 Button {
-                    onOpenChild(row.item, false)
+                    requestChild(row.item, isNew: false)
                 } label: {
                     HStack {
                         treeLabel(row)
