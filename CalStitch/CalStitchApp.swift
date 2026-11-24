@@ -735,7 +735,14 @@ private struct RulesHome: View {
                                    allRules: snapshot.rules, calendar: calendar,
                                    preview: preview, onApply: apply, onApplied: returnAfterApply,
                                    previewDeletion: { id in try previewRemoval([id], allowChild: true) },
-                                   onDelete: { id, expected in try await removeSelected([id], expected, allowChild: true) },
+                                   deletionAvailability: deletionAvailability,
+                                   currentDeletionAvailability: { deletionAvailability },
+                                   rereadDeletion: { await load() },
+                                   onDelete: { id, expected in
+                                       let state = deletionAvailability
+                                       guard state == .ready else { throw RuleDeletionNotReady(availability: state) }
+                                       try await removeSelected([id], expected, allowChild: true)
+                                   },
                                    onDeleted: { if !path.isEmpty { path.removeLast() } },
                                    onSaveAppearance: saveRuleAppearance,
                                    frozenReason: calendar.hasFullAccess ? (freezeReason(rule.id) ?? pendingReason(rule.id)) : CalendarIntegrationError.denied.localizedDescription,
@@ -1322,7 +1329,7 @@ private struct RulesHome: View {
                                  desired: [PlannedOccurrence] = [], previous: [PlannedOccurrence] = [],
                                  eventRuleIDs: Set<UUID> = [], removal: [CalendarRemovalEvent]? = nil) async throws {
         guard !cloudBusy, !cloudRefreshing else {
-            throw RuleOperationError(L10n.text("iCloud 正在核對規則，請稍候重試。", "iCloud is checking rules. Try again shortly."))
+            throw RuleDeletionNotReady(availability: .checking)
         }
         // A new child is not in the visible tree until the server commits it. Reserve
         // its ancestor too so a concurrent parent change cannot miss that new child.
@@ -1863,6 +1870,14 @@ private struct RulesHome: View {
         return ids
     }
 
+    private var deletionAvailability: RuleDeletionAvailability {
+        if cloudBusy || cloudRefreshing || cloudResetPending { return .checking }
+        if !cloudReady {
+            return .readFailed(cloudReadError ?? CloudRuleError.unavailable.localizedDescription)
+        }
+        return .ready
+    }
+
     private func previewRemoval(_ selected: Set<UUID>) throws -> BatchRemovalPreview {
         try previewRemoval(selected, allowChild: false)
     }
@@ -2297,6 +2312,9 @@ private struct RuleEditor: View {
     let onApply: (Rule, Rule?) async throws -> Rule
     let onApplied: () -> Void
     let previewDeletion: (UUID) throws -> BatchRemovalPreview
+    let deletionAvailability: RuleDeletionAvailability
+    let currentDeletionAvailability: () -> RuleDeletionAvailability
+    let rereadDeletion: () async -> Void
     let onDelete: (UUID, BatchRemovalPreview) async throws -> Void
     let onDeleted: () -> Void
     let onSaveAppearance: (UUID, RuleAppearance) async throws -> Bool
@@ -2312,6 +2330,9 @@ private struct RuleEditor: View {
          preview: @escaping (Rule) throws -> RuleEventPreviewResult, onApply: @escaping (Rule, Rule?) async throws -> Rule,
          onApplied: @escaping () -> Void,
          previewDeletion: @escaping (UUID) throws -> BatchRemovalPreview,
+         deletionAvailability: RuleDeletionAvailability,
+         currentDeletionAvailability: @escaping () -> RuleDeletionAvailability,
+         rereadDeletion: @escaping () async -> Void,
          onDelete: @escaping (UUID, BatchRemovalPreview) async throws -> Void,
          onDeleted: @escaping () -> Void,
          onSaveAppearance: @escaping (UUID, RuleAppearance) async throws -> Bool,
@@ -2338,6 +2359,9 @@ private struct RuleEditor: View {
         self.onApply = onApply
         self.onApplied = onApplied
         self.previewDeletion = previewDeletion
+        self.deletionAvailability = deletionAvailability
+        self.currentDeletionAvailability = currentDeletionAvailability
+        self.rereadDeletion = rereadDeletion
         self.onDelete = onDelete
         self.onDeleted = onDeleted
         self.onSaveAppearance = onSaveAppearance
@@ -2606,7 +2630,8 @@ private struct RuleEditor: View {
             }
         }) {
             RuleDeletionPreview(civilCalendar: ruleCalendar, hasUnsavedChanges: hasUnsavedChanges,
-                                load: { try previewDeletion(rule.id) }) { expected in
+                                availability: deletionAvailability, currentAvailability: currentDeletionAvailability,
+                                reread: rereadDeletion, load: { try previewDeletion(rule.id) }) { expected in
                 try await onDelete(rule.id, expected)
                 didDelete = true
                 showingDeletion = false
@@ -3197,29 +3222,94 @@ private struct RulePreviewTree<Rows: View>: View {
     }
 }
 
+// MARK: Single-rule deletion confirmation
+enum RuleDeletionAvailability: Equatable {
+    case checking
+    case readFailed(String)
+    case ready
+}
+
+struct RuleDeletionReviewGate<Preview: Equatable> {
+    private(set) var preview: Preview?
+    private(set) var submitting = false
+    private(set) var changed = false
+    private var needsVerification = true
+    var canDismiss: Bool { !submitting }
+
+    mutating func invalidate() { needsVerification = true }
+
+    mutating func accept(_ fresh: Preview) {
+        if let preview, preview != fresh { changed = true }
+        preview = fresh
+        needsVerification = false
+    }
+
+    func canConfirm(_ availability: RuleDeletionAvailability, hasError: Bool) -> Bool {
+        availability == .ready && preview != nil && !needsVerification && !hasError && !submitting
+    }
+
+    mutating func begin(_ availability: RuleDeletionAvailability, hasError: Bool) -> Preview? {
+        guard canConfirm(availability, hasError: hasError) else { return nil }
+        submitting = true
+        changed = false
+        return preview
+    }
+
+    mutating func end() { submitting = false }
+}
+
+// MARK: Single-rule deletion presentation
+private struct RuleDeletionNotReady: LocalizedError {
+    let availability: RuleDeletionAvailability
+
+    var errorDescription: String? {
+        if case let .readFailed(message) = availability { return message }
+        return L10n.text("iCloud 正在核對規則，請稍候重試。", "iCloud is checking rules. Try again shortly.")
+    }
+}
+
 private struct RuleDeletionPreview: View {
     let civilCalendar: Calendar
     let hasUnsavedChanges: Bool
+    let availability: RuleDeletionAvailability
+    let currentAvailability: () -> RuleDeletionAvailability
+    let reread: () async -> Void
     let load: () throws -> BatchRemovalPreview
     let remove: (BatchRemovalPreview) async throws -> Void
-    @State private var removing = false
+    @State private var review = RuleDeletionReviewGate<BatchRemovalPreview>()
     @Environment(\.dismiss) private var dismiss
-    @State private var preview: BatchRemovalPreview?
     @State private var failure: String?
     @State private var canReload = true
 
     var body: some View {
         NavigationStack {
             List {
-                if let failure {
-                    Section {
-                        Label(failure, systemImage: "exclamationmark.circle")
-                        if canReload {
-                            Button(L10n.text("重新預覽", "Preview Again"), action: refresh)
+                if review.submitting {
+                    ProgressView(L10n.text("正在刪除…", "Deleting…"))
+                } else {
+                    switch availability {
+                    case .checking:
+                        ProgressView(L10n.text("iCloud 正在核對規則…", "Checking rules with iCloud…"))
+                    case .readFailed(let message):
+                        Section {
+                            Label(message, systemImage: "icloud.slash")
+                            Button(L10n.text("重新核對", "Check Again")) { Task { await reread() } }
+                        }
+                    case .ready:
+                        if let failure {
+                            Section {
+                                Label(failure, systemImage: "exclamationmark.circle")
+                                if canReload {
+                                    Button(L10n.text("重新預覽", "Preview Again"), action: refresh)
+                                }
+                            }
+                        } else if review.changed {
+                            Text(L10n.text("刪除預覽已更新，請核對後重新確認。", "The deletion preview changed. Review it before confirming."))
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
-                if let preview {
+                if let preview = review.preview {
                     Section {
                         Text(L10n.text("將刪除 \(preview.ruleCount) 條規則及 \(preview.eventCount) 筆尚未開始的事件。",
                                        "Rules to delete: \(preview.ruleCount). Upcoming events to delete: \(preview.eventCount)."))
@@ -3261,7 +3351,7 @@ private struct RuleDeletionPreview: View {
                             }
                         }
                     }
-                } else if failure == nil {
+                } else if failure == nil && availability == .ready && !review.submitting {
                     ProgressView(L10n.text("正在讀取事件…", "Loading events…"))
                 }
             }
@@ -3271,9 +3361,10 @@ private struct RuleDeletionPreview: View {
                 HStack {
                     Button(L10n.text("取消", "Cancel"), role: .cancel) { dismiss() }
                         .frame(maxWidth: .infinity, minHeight: 44)
+                        .disabled(!review.canDismiss)
                     Button(L10n.text("確認刪除", "Confirm Deletion"), role: .destructive, action: confirm)
                         .frame(maxWidth: .infinity, minHeight: 44)
-                        .disabled(preview == nil || removing)
+                        .disabled(!review.canConfirm(availability, hasError: failure != nil))
                         .accessibilityIdentifier("confirm-delete-rule")
                 }
                 .font(.body.weight(.semibold))
@@ -3281,27 +3372,36 @@ private struct RuleDeletionPreview: View {
                 .background(.regularMaterial)
             }
         }
-        .task { if preview == nil && failure == nil { refresh() } }
+        .interactiveDismissDisabled(!review.canDismiss)
+        .onChange(of: availability, initial: true) { _, state in
+            if state != .ready { review.invalidate() }
+            else if !review.submitting, canReload { refresh() }
+        }
     }
 
     private func refresh() {
+        guard !review.submitting, currentAvailability() == .ready else { return }
         do {
-            preview = try load()
+            review.accept(try load())
             failure = nil
         } catch {
-            preview = nil
             failure = error.localizedDescription
         }
     }
 
     private func confirm() {
-        guard let preview, !removing else { return }
-        removing = true
+        guard let preview = review.begin(currentAvailability(), hasError: failure != nil) else { return }
         Task { @MainActor in
-            defer { removing = false }
-            do { try await remove(preview) }
-            catch {
-                self.preview = nil
+            defer { review.end() }
+            do {
+                try await remove(preview)
+            } catch is RuleDeletionNotReady {
+                // A read won the race after the tap. Leave the preview in place.
+                // Rechecking readiness never queues or retries the delete.
+                review.end()
+                review.invalidate()
+                refresh()
+            } catch {
                 failure = error.localizedDescription
                 if let calendarError = error as? CalendarIntegrationError, case .writeFailed = calendarError {
                     canReload = false
