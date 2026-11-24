@@ -400,13 +400,20 @@ private struct RuleSnapshot: Codable {
         try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                     appropriateFor: nil, create: true)
             .appendingPathComponent("CalStitch", isDirectory: true)
-            .appendingPathComponent(localOnly ? "rules-local-v2.json" : "rules-v1.json")
+            .appendingPathComponent(CloudRuleEnvironment.current.localKey(
+                localOnly ? "rules-local-v2.json" : "rules-before-cloud-v2.json"
+            ))
     }
 
     static func read(localOnly: Bool = false) throws -> Self {
-        let url = try Self.url(localOnly: localOnly)
-        guard FileManager.default.fileExists(atPath: url.path) else { return Self() }
-        return try JSONDecoder().decode(Self.self, from: Data(contentsOf: url))
+        let scoped = try Self.url(localOnly: localOnly)
+        let fm = FileManager.default
+        // Both environments can import the unchanged pre-sync baseline independently.
+        // Once local edits are made they stay in the active environment's file.
+        let source = !localOnly && !fm.fileExists(atPath: scoped.path)
+            ? scoped.deletingLastPathComponent().appendingPathComponent("rules-v1.json") : scoped
+        guard fm.fileExists(atPath: source.path) else { return Self() }
+        return try JSONDecoder().decode(Self.self, from: Data(contentsOf: source))
     }
 
     func preflightWrite() throws {
@@ -469,7 +476,23 @@ private struct LocalRuleWriteJournal: Codable {
         try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                     appropriateFor: nil, create: true)
             .appendingPathComponent("CalStitch", isDirectory: true)
-            .appendingPathComponent(localOnly ? "local-only-journal-v1.json" : "legacy-local-journal-v1.json")
+            .appendingPathComponent(CloudRuleEnvironment.current.localKey(
+                localOnly ? "local-only-journal-v1.json" : "before-cloud-journal-v2.json"
+            ))
+    }
+
+    static func hasUnscopedLegacyJournal() throws -> Bool {
+        let old = try url(localOnly: false).deletingLastPathComponent()
+            .appendingPathComponent("legacy-local-journal-v1.json")
+        do {
+            _ = try old.resourceValues(forKeys: [.isRegularFileKey])
+            return true
+        } catch {
+            let failure = error as NSError
+            guard failure.domain == NSCocoaErrorDomain,
+                  failure.code == NSFileReadNoSuchFileError || failure.code == NSFileNoSuchFileError else { throw error }
+            return false
+        }
     }
 
     static func read(localOnly: Bool) throws -> Self? {
@@ -579,7 +602,7 @@ private struct RulesHome: View {
     @State private var directFrozen: [UUID: String] = [:]
     @State private var freezeReview: Rule?
     @AppStorage("settings.hideFrozenRules") private var hideFrozen = false
-    @AppStorage("rules.hasCloudAccount") private var hasCloudAccount = false
+    @AppStorage(CloudRuleEnvironment.current.localKey("rules.hasCloudAccount")) private var hasCloudAccount = false
     @State private var awaitingLocalRecovery = false
     @State private var path: [Route] = []
     @State private var isAdding = false
@@ -930,6 +953,9 @@ private struct RulesHome: View {
             loaded = false
         }
         do {
+            if try LocalRuleWriteJournal.hasUnscopedLegacyJournal() {
+                throw RuleOperationError(L10n.text("舊版有尚未確認的本機寫入，無法判定它屬於哪個同步環境。請先在原版本完成復原。", "An unverified local calendar update from an older version has no sync environment. Recover it in the version that started it first."))
+            }
             if var session = try await cloud.refresh() {
                 if try LocalRuleWriteJournal.read(localOnly: hasCloudAccount) != nil {
                     throw RuleOperationError(L10n.text("有尚未確認的本機寫入，請先完成原本機狀態的復原，再啟用 iCloud 規則同步。", "A local calendar update has not been verified. Recover it in the original local mode before enabling rule sync."))
@@ -1012,29 +1038,29 @@ private struct RulesHome: View {
         var merged = bindings(account)
         merged.merge(values) { _, newValue in newValue }
         if let data = try? JSONEncoder().encode(merged) {
-            UserDefaults.standard.set(data, forKey: "rules.destinationBindings." + account)
+            UserDefaults.standard.set(data, forKey: cloudLocalKey("rules.destinationBindings." + account))
         }
     }
 
     private func bindings(_ account: String) -> [UUID: String] {
-        let data = UserDefaults.standard.data(forKey: "rules.destinationBindings." + account)
+        let data = UserDefaults.standard.data(forKey: cloudLocalKey("rules.destinationBindings." + account))
         return data.flatMap { try? JSONDecoder().decode([UUID: String].self, from: $0) } ?? [:]
     }
 
     private func saveAppearances(_ appearances: [GroupAppearance]?, account: String,
                                  replacing: Bool = true) throws {
-        let key = "rules.localAppearance." + account
+        let key = cloudLocalKey("rules.localAppearance." + account)
         guard replacing || UserDefaults.standard.data(forKey: key) == nil else { return }
         UserDefaults.standard.set(try JSONEncoder().encode(appearances ?? []), forKey: key)
     }
 
     private func accountAppearances(_ account: String) -> [GroupAppearance]? {
-        let key = "rules.localAppearance." + account
+        let key = cloudLocalKey("rules.localAppearance." + account)
         return UserDefaults.standard.data(forKey: key).flatMap { try? JSONDecoder().decode([GroupAppearance].self, from: $0) }
     }
 
     private func birthdaySources(_ account: String) -> [UUID: BirthdayImportSource] {
-        let key = "rules.localBirthdaySources." + account
+        let key = cloudLocalKey("rules.localBirthdaySources." + account)
         return UserDefaults.standard.data(forKey: key).flatMap { try? JSONDecoder().decode([UUID: BirthdayImportSource].self, from: $0) } ?? [:]
     }
 
@@ -1044,7 +1070,7 @@ private struct RulesHome: View {
             if let source = rule.birthdaySource { values[rule.id] = source }
         }
         if let data = try? JSONEncoder().encode(values) {
-            UserDefaults.standard.set(data, forKey: "rules.localBirthdaySources." + account)
+            UserDefaults.standard.set(data, forKey: cloudLocalKey("rules.localBirthdaySources." + account))
         }
     }
 
@@ -1136,32 +1162,28 @@ private struct RulesHome: View {
         }
     }
 
+    private func cloudLocalKey(_ legacy: String) -> String {
+        CloudRuleEnvironment.current.localKey(legacy)
+    }
+
     private var accountsSeen: Set<String> {
-        Set(UserDefaults.standard.stringArray(forKey: "rules.cloudAccountsSeen") ?? [])
+        Set(UserDefaults.standard.stringArray(forKey: cloudLocalKey("rules.cloudAccountsSeen")) ?? [])
     }
 
     private func recordAccountSeen(_ account: String) {
-        UserDefaults.standard.set(Array(accountsSeen.union([account])).sorted(), forKey: "rules.cloudAccountsSeen")
+        UserDefaults.standard.set(Array(accountsSeen.union([account])).sorted(), forKey: cloudLocalKey("rules.cloudAccountsSeen"))
     }
 
     private func orphanProtectedIDs() throws -> Set<UUID> {
-        guard cloudReady, !cloudResetPending else {
-            throw RuleOperationError(L10n.text("請等 iCloud 規則和刪除紀錄載入後再搜尋。", "Wait for iCloud rules and deletion records before searching."))
-        }
-        guard (!hasCloudAccount || cloudSession != nil), accountsSeen.count <= 1, !awaitingLocalRecovery else {
-            throw RuleOperationError(L10n.text("無法確認所有規則的帳號範圍，現在不能安全清除遺留事件。", "The account scope of these rules cannot be verified. Leftover events cannot safely be removed now."))
-        }
-        var protected = Set(snapshot.rules.map(\.id))
-        if let ledger = cloudSession?.ledger {
-            protected.formUnion(ledger.tombstones)
-            for pending in ledger.pending { protected.formUnion(pending.scope) }
-        }
-        return protected
+        // Existing EventKit markers are shared across devices and don't encode
+        // either the CloudKit environment or the iCloud account. A missing ID
+        // here is not evidence that the event is safe to remove.
+        throw RuleOperationError(L10n.text("目前無法從事件標記判定同步環境或帳號，因此暫停清除遺留事件。仍可從規則移除其事件。", "Event markers do not identify their sync environment or account, so leftover cleanup is paused. You can still remove events through their rules."))
     }
 
     private func saveDraft(_ rule: Rule, account: String) {
         if let data = try? JSONEncoder().encode(rule) {
-            UserDefaults.standard.set(data, forKey: "rules.cloudDraft.\(account).\(rule.id)")
+            UserDefaults.standard.set(data, forKey: cloudLocalKey("rules.cloudDraft.\(account).\(rule.id)"))
         }
     }
 
@@ -1364,7 +1386,7 @@ private struct RulesHome: View {
     }
 
     private func verifiedBindings(_ account: String) -> [UUID: VerifiedCalendarBinding] {
-        let data = UserDefaults.standard.data(forKey: "rules.verifiedBindings." + account)
+        let data = UserDefaults.standard.data(forKey: cloudLocalKey("rules.verifiedBindings." + account))
         return data.flatMap { try? JSONDecoder().decode([UUID: VerifiedCalendarBinding].self, from: $0) } ?? [:]
     }
 
@@ -1372,7 +1394,7 @@ private struct RulesHome: View {
         var values = verifiedBindings(account)
         values[rule] = VerifiedCalendarBinding(id: id, descriptor: descriptor)
         let data = try JSONEncoder().encode(values)
-        UserDefaults.standard.set(data, forKey: "rules.verifiedBindings." + account)
+        UserDefaults.standard.set(data, forKey: cloudLocalKey("rules.verifiedBindings." + account))
         mergeBindings([rule: id], account: account)
     }
 
@@ -1433,7 +1455,7 @@ private struct RulesHome: View {
         var desired = try original.desired.map(binding)
         let previous = try original.previous.map(binding)
         if op.deletions.isEmpty,
-           let data = UserDefaults.standard.data(forKey: "rules.cloudDraft.\(session.accountID).\(rule.id)"),
+           let data = UserDefaults.standard.data(forKey: cloudLocalKey("rules.cloudDraft.\(session.accountID).\(rule.id)")),
            var draft = try? JSONDecoder().decode(Rule.self, from: data) {
             draft.target = destinationID
             let res = try resolve(draft, allowingVerifiedRebinding: true)
@@ -1489,7 +1511,7 @@ private struct RulesHome: View {
         try cloud.recordEventKitComplete(operation.id, in: verified)
         let done = try await cloud.finish(operation.id, in: verified)
         try storeVerifiedBinding(destinationID, descriptor: current.descriptor, for: rule.id, account: done.accountID)
-        UserDefaults.standard.removeObject(forKey: "rules.cloudDraft.\(done.accountID).\(rule.id)")
+        UserDefaults.standard.removeObject(forKey: cloudLocalKey("rules.cloudDraft.\(done.accountID).\(rule.id)"))
         restoreCloud(done)
     }
 
@@ -1590,7 +1612,7 @@ private struct RulesHome: View {
             updated.rules = plan.rules
             try await performMutation(updated, scope: plan.ruleIDs, desired: plan.desired,
                                       previous: plan.previous, eventRuleIDs: plan.ruleIDs)
-            if let account { UserDefaults.standard.removeObject(forKey: "rules.cloudDraft.\(account).\(rule.id)") }
+            if let account { UserDefaults.standard.removeObject(forKey: cloudLocalKey("rules.cloudDraft.\(account).\(rule.id)")) }
             return snapshot.rules.first { $0.id == rule.id } ?? rule
         } catch {
             if let account { saveDraft(rule, account: account) }
@@ -2926,7 +2948,9 @@ private struct EventPreview: View {
                                 .foregroundStyle(.secondary)
                         }
                         let eventsByRule = Dictionary(grouping: preview.events, by: \.ruleID)
-                        RulePreviewTree(rows: preview.rules) { row in
+                        RulePreviewTree(rows: preview.rules, titleShownInEvents: { row in
+                            eventsByRule[row.id]?.contains { $0.title == row.title } == true
+                        }) { row in
                             if let events = eventsByRule[row.id], !events.isEmpty {
                                 ForEach(events) { event in
                                     RulePreviewEventRow(event: event, civilCalendar: civilCalendar)
@@ -2977,6 +3001,7 @@ private struct EventPreview: View {
 
 private struct RulePreviewTree<Rows: View>: View {
     let rows: [BatchRemovalRule]
+    let titleShownInEvents: (BatchRemovalRule) -> Bool
     @ViewBuilder let content: (BatchRemovalRule) -> Rows
     @State private var collapsed: Set<UUID> = []
 
@@ -2998,7 +3023,8 @@ private struct RulePreviewTree<Rows: View>: View {
                     Button {
                         if !collapsed.insert(row.id).inserted { collapsed.remove(row.id) }
                     } label: {
-                        Label(row.title, systemImage: collapsed.contains(row.id) ? "chevron.right" : "chevron.down")
+                        Label(titleShownInEvents(row) ? L10n.text("子規則", "Child Rules") : row.title,
+                              systemImage: collapsed.contains(row.id) ? "chevron.right" : "chevron.down")
                             .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
                             .contentShape(Rectangle())
                     }
@@ -3006,7 +3032,7 @@ private struct RulePreviewTree<Rows: View>: View {
                     .accessibilityLabel(collapsed.contains(row.id)
                         ? L10n.text("展開子規則：\(row.title)", "Expand child rules: \(row.title)")
                         : L10n.text("收合子規則：\(row.title)", "Collapse child rules: \(row.title)"))
-                } else {
+                } else if !titleShownInEvents(row) {
                     Text(row.title)
                         .accessibilityAddTraits(.isHeader)
                 }
@@ -3055,7 +3081,10 @@ private struct RuleDeletionPreview: View {
                     let byRule = Dictionary(grouping: preview.events, by: \.ruleID)
                     let retainedByRule = Dictionary(grouping: preview.retained, by: \.ruleID)
                     Section {
-                        RulePreviewTree(rows: preview.rules) { row in
+                        RulePreviewTree(rows: preview.rules, titleShownInEvents: { row in
+                            byRule[row.id]?.contains { $0.title == row.title } == true
+                                || retainedByRule[row.id]?.contains { $0.title == row.title } == true
+                        }) { row in
                             if let kept = retainedByRule[row.id] {
                                 ForEach(kept) { event in
                                     RulePreviewEventRow(event: event, civilCalendar: civilCalendar)

@@ -463,9 +463,12 @@ struct BatchActionsView: View {
                 Text(L10n.text("將移除的規則（\(review.ruleCount)）", "Rules to Remove (\(review.ruleCount))"))
                     .font(.subheadline.weight(.semibold))
                     .accessibilityAddTraits(.isHeader)
+                let eventsByRule = Dictionary(grouping: review.events, by: \.ruleID)
                 ForEach(review.rules) { row in
-                    Text(row.title)
-                        .padding(.leading, CGFloat(min(row.depth, 6)) * 12)
+                    if eventsByRule[row.id]?.contains(where: { $0.title == row.title }) != true {
+                        Text(row.title)
+                            .padding(.leading, CGFloat(min(row.depth, 6)) * 12)
+                    }
                 }
                 Text(L10n.text("將移除的行事曆事件（\(review.eventCount)）", "Calendar Events to Remove (\(review.eventCount))"))
                     .font(.subheadline.weight(.semibold))

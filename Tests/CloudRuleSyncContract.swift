@@ -118,6 +118,46 @@ import Foundation
         let restored = try await reopened.refresh()!
         let notReimported = try await reopened.migrate([envelope], in: restored)
         precondition(notReimported.ledger.rules.isEmpty)
-        print("Cloud sync contract passed: migration, ID redaction, overlapping CAS, lost responses, takeover/stale owner, restart before CAS, tombstones, and account isolation")
+        // Reopen the exact unscoped filename used by the installed Development build.
+        let sharedDirectory = directory.appendingPathComponent("environment")
+        let devTransport = MemoryTransport()
+        let prodTransport = MemoryTransport()
+        let oldDev = RuleCloudSync(transport: devTransport,
+            stateURL: sharedDirectory.appendingPathComponent("cloud-state-v1.json"))
+        let oldMigrated = try await oldDev.migrate([envelope], in: oldDev.refresh()!)
+        precondition(oldDev.hasMigratedLegacy(in: oldMigrated))
+        let oldOperation = CloudRuleOperation(owner: oldDev.deviceID, scope: [rule.id],
+                                              upserts: [envelope], deletions: [])
+        let oldPending = try await oldDev.claim(oldOperation, localBefore: [], localAfter: [], in: oldMigrated)
+        let dev = RuleCloudSync(transport: devTransport, environment: .development, stateDirectory: sharedDirectory)
+        precondition(dev.deviceID == oldDev.deviceID && dev.recoverableJournal(in: oldPending)?.operation.id == oldOperation.id)
+        let prod = RuleCloudSync(transport: prodTransport, environment: .production, stateDirectory: sharedDirectory)
+        let emptyProd = try await prod.refresh()!
+        precondition(prod.deviceID != dev.deviceID && prod.canMigrateLegacy(in: emptyProd))
+        precondition(!prod.hasMigratedLegacy(in: emptyProd) && prod.recoverableJournal(in: emptyProd) == nil)
+        do { _ = try await prod.verifyOwnership(oldOperation.id, in: emptyProd); fatalError("Development authorization leaked") }
+        catch CloudRuleError.notOwner {}
+        var productionLegacy = envelope
+        productionLegacy.rule.name = "Original local rules, not Development edits"
+        let legacyFixture = [productionLegacy] + (1...35).map {
+            CloudRuleEnvelope(rule: Rule(name: "Legacy rule \($0)", kind: .gregorian, date: "", category: "Main"),
+                              destination: nil, prior: nil)
+        }
+        let prodFirst = try await prod.migrate(legacyFixture, in: emptyProd)
+        precondition(prodFirst.ledger.rules.first?.rule.name == productionLegacy.rule.name && prodFirst.ledger.pending.isEmpty && prodFirst.ledger.rules.count == 36)
+        let prodReload = RuleCloudSync(transport: prodTransport, environment: .production, stateDirectory: sharedDirectory)
+        let prodSecond = try await prodReload.migrate(legacyFixture, in: prodReload.refresh()!)
+        precondition(prodReload.deviceID == prod.deviceID && prodReload.hasMigratedLegacy(in: prodSecond) && prodTransport.serial == 1 && prodSecond.ledger.rules.count == 36)
+        prodTransport.active = nil
+        let signedOut = try await prodReload.refresh()
+        precondition(signedOut == nil)
+        prodTransport.active = "B"
+        let prodOther = try await prodReload.refresh()!
+        do { _ = try await prodReload.migrate([productionLegacy], in: prodOther); fatalError("Production leaked to wrong account") }
+        catch CloudRuleError.legacyAccountMismatch {}
+        precondition(prodOther.ledger.rules.isEmpty && prodTransport.serial == 1)
+        precondition(CloudRuleEnvironment.development.localKey("rules.hasCloudAccount") == "rules.hasCloudAccount")
+        precondition(CloudRuleEnvironment.production.localKey("rules.hasCloudAccount") != "rules.hasCloudAccount")
+        print("Cloud sync contract passed: migration, ID redaction, overlapping CAS, lost responses, takeover/stale owner, restart before CAS, tombstones, account isolation, and Development-to-Production migration of 36 synthetic rules")
     }
 }

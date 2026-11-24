@@ -38,6 +38,7 @@ struct CalendarSyncPlan: Codable, Equatable {
 
 struct CalendarChange: Identifiable {
     let id: String
+    let ruleID: UUID
     let verb: String
     let title: String
     let date: Date
@@ -178,11 +179,11 @@ final class CalendarIntegration: ObservableObject {
         var change: CalendarChange {
             switch self {
             case let .insert(identity, value):
-                return CalendarChange(id: identity.displayID, verb: L10n.text("新增", "Add"), title: value.title, date: value.start)
+                return CalendarChange(id: identity.displayID, ruleID: identity.rule, verb: L10n.text("新增", "Add"), title: value.title, date: value.start)
             case let .update(identity, _, value):
-                return CalendarChange(id: identity.displayID, verb: L10n.text("更新", "Update"), title: value.title, date: value.start)
+                return CalendarChange(id: identity.displayID, ruleID: identity.rule, verb: L10n.text("更新", "Update"), title: value.title, date: value.start)
             case let .remove(identity, value):
-                return CalendarChange(id: identity.displayID, verb: L10n.text("移除", "Remove"), title: value.title ?? L10n.text("無標題", "Untitled"), date: value.startDate)
+                return CalendarChange(id: identity.displayID, ruleID: identity.rule, verb: L10n.text("移除", "Remove"), title: value.title ?? L10n.text("無標題", "Untitled"), date: value.startDate)
             }
         }
     }

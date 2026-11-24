@@ -1,6 +1,26 @@
 import CloudKit
 import Foundation
 
+/// Matches the signed CloudKit entitlement selected for this Xcode configuration.
+enum CloudRuleEnvironment: String {
+    case development = "Development"
+    case production = "Production"
+
+    static let current: Self = {
+        #if DEBUG
+        .development
+        #else
+        .production
+        #endif
+    }()
+
+    /// The only unscoped cloud release, build 20, was signed for Development.
+    /// Keep its durable state available only in Development; Production starts clean.
+    func localKey(_ legacy: String) -> String {
+        self == .development ? legacy : "production." + legacy
+    }
+}
+
 struct CloudRuleEnvelope: Codable, Hashable, Identifiable {
     var id: UUID { rule.id }
     var rule: Rule
@@ -164,7 +184,8 @@ enum CloudRuleError: LocalizedError {
     private var activeOperations: Set<UUID> = []
     var deviceID: UUID { state.deviceID }
 
-    init(transport: (any CloudRuleTransport)? = nil, stateURL: URL? = nil) {
+    init(transport: (any CloudRuleTransport)? = nil, stateURL: URL? = nil,
+         environment: CloudRuleEnvironment = .current, stateDirectory: URL? = nil) {
         #if DEBUG && targetEnvironment(simulator)
         if Bundle.main.bundleIdentifier == "org.peiyu66.CalStitch.CloudSyncSmokeTest",
            ProcessInfo.processInfo.environment["CALSTITCH_SIGNED_OUT_SMOKE"] == "1" {
@@ -175,8 +196,9 @@ enum CloudRuleError: LocalizedError {
         #else
         self.transport = transport ?? CloudKitRuleTransport()
         #endif
-        self.stateURL = stateURL ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("CalStitch", isDirectory: true).appendingPathComponent("cloud-state-v1.json")
+        let directory = stateDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("CalStitch", isDirectory: true)
+        self.stateURL = stateURL ?? directory.appendingPathComponent(environment.localKey("cloud-state-v1.json"))
         do {
             let data = try Data(contentsOf: self.stateURL)
             self.state = try JSONDecoder().decode(DeviceState.self, from: data)
