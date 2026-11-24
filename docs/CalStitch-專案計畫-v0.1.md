@@ -35,3 +35,7 @@ CalStitch 是 iPhone 上的**行事曆規則工具**。使用者在 CalStitch �
 | [英文本地化與日期格式](development/rules.md#section-11) | 已結案。 |
 
 [建置與驗證](development/build-and-test.md)保留當時的驗收方法、已驗證範圍及未涵蓋情境，供日後回歸測試使用，不代表仍有未結案問題。
+
+## 4. 下一階段：iPhone iCloud 規則同步
+
+新開發以已送審的 iPhone 1.0 (18) 為基準。詳見 [iCloud 規則同步計畫](development/icloud-sync-plan.md)及[開發會議與決策紀錄](development/decision-log.md)。iPhone 開發里程碑為 1.0 (25)；iPad 19 UI 不納入本里程碑。
