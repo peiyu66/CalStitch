@@ -11,6 +11,31 @@ struct CalendarDestination: Identifiable, Hashable {
     var displayTitle: String { sourceTitle.isEmpty ? title : "\(title) · \(sourceTitle)" }
 }
 
+/// Portable, private account metadata. Neither identifiers nor notes from EventKit leave the device.
+struct CalendarSyncDestination: Codable, Hashable {
+    let title: String
+    let sourceTitle: String
+    let sourceType: Int
+    let localOwner: UUID?
+}
+
+struct CalendarSyncMutation: Codable, Equatable {
+    enum Kind: String, Codable { case insert, update, remove }
+    let kind: Kind
+    let old: PlannedOccurrence?
+    let new: PlannedOccurrence?
+    var priorAttemptID: UUID? = nil
+}
+
+struct CalendarSyncPlan: Codable, Equatable {
+    let attemptID: UUID
+    let ruleIDs: Set<UUID>
+    let desired: [PlannedOccurrence]
+    let previous: [PlannedOccurrence]
+    let result: [PlannedOccurrence]
+    let mutations: [CalendarSyncMutation]
+}
+
 struct CalendarChange: Identifiable {
     let id: String
     let verb: String
@@ -83,7 +108,7 @@ struct CalendarOrphanPreview {
 enum CalendarIntegrationError: LocalizedError {
     case denied, noLocalSource, noDestination, readOnlyDestination, conflictingDestination
     case invalidPlan, ambiguousEvent, missingEvent, excessiveRange
-    case writeFailed, orphanSelectionChanged, removalSelectionChanged
+    case writeFailed, orphanSelectionChanged, removalSelectionChanged, uncertainRemovalRecovery
 
     var errorDescription: String? {
         switch self {
@@ -99,6 +124,7 @@ enum CalendarIntegrationError: LocalizedError {
         case .orphanSelectionChanged: return L10n.text("行事曆或規則已變動。未刪除事件，請重新掃描並確認選擇。", "The calendar or rules have changed. No events were deleted. Scan again and confirm your selection.")
         case .removalSelectionChanged: return L10n.text("待移除的事件已變動。未刪除事件，請重新檢視預覽。", "The events to remove have changed. No events were deleted. Review the preview again.")
         case .writeFailed: return L10n.text("行事曆未能確認儲存結果。請先檢查行事曆，再重新開啟 CalStitch。", "The calendar could not confirm that the changes were saved. Check your calendar before reopening CalStitch.")
+        case .uncertainRemovalRecovery: return L10n.text("無法確認待移除的事件是已刪除，還是尚未同步。已停止自動復原；請先核對行事曆，再手動接手。", "CalStitch cannot tell whether the event to remove was deleted or has not synced. Automatic recovery stopped. Check the calendar before taking over manually.")
         }
     }
 }
@@ -247,6 +273,55 @@ final class CalendarIntegration: ObservableObject {
                      isWritable: isWritable(calendar))
     }
 
+    func syncDestination(id: String, deviceID: UUID) throws -> CalendarSyncDestination {
+        guard hasFullAccess else { throw CalendarIntegrationError.denied }
+        let calendar = try writableCalendar(id: id)
+        guard let source = calendar.source, !calendar.title.isEmpty,
+              source.sourceType == .local || !source.title.isEmpty else {
+            throw CalendarIntegrationError.noDestination
+        }
+        return .init(title: calendar.title, sourceTitle: source.sourceType == .local ? "" : source.title,
+                     sourceType: source.sourceType.rawValue, localOwner: source.sourceType == .local ? deviceID : nil)
+    }
+
+    func resolveSyncDestination(_ descriptor: CalendarSyncDestination, rememberedID: String?, deviceID: UUID) throws -> String {
+        guard hasFullAccess else { throw CalendarIntegrationError.denied }
+        if let owner = descriptor.localOwner {
+            guard owner == deviceID, let rememberedID,
+                  let calendar = try? writableCalendar(id: rememberedID), Self.isLocalWritable(calendar) else {
+                throw CalendarIntegrationError.noDestination
+            }
+            return rememberedID
+        }
+        guard descriptor.sourceType != EKSourceType.local.rawValue, !descriptor.sourceTitle.isEmpty,
+              !descriptor.title.isEmpty else { throw CalendarIntegrationError.noDestination }
+        func matches(_ calendar: EKCalendar) -> Bool {
+            calendar.source?.sourceType.rawValue == descriptor.sourceType &&
+                calendar.source?.title == descriptor.sourceTitle && calendar.title == descriptor.title
+        }
+        if let rememberedID, let calendar = try? writableCalendar(id: rememberedID), matches(calendar) {
+            return rememberedID
+        }
+        let candidates = store.calendars(for: .event).filter(matches)
+        guard candidates.count == 1, let match = candidates.first else {
+            throw candidates.isEmpty ? CalendarIntegrationError.noDestination : CalendarIntegrationError.conflictingDestination
+        }
+        return try writableCalendar(id: match.calendarIdentifier).calendarIdentifier
+    }
+
+    /// Verify already-known ownership before replacing a local destination binding.
+    func verifySyncRebinding(ruleID: UUID, destinationID: String, previous: [PlannedOccurrence],
+                             deviceID: UUID, confirmedOriginal: Bool = false) throws -> CalendarSyncDestination {
+        let descriptor = try syncDestination(id: destinationID, deviceID: deviceID)
+        let prior = previous.map { bind($0, to: destinationID) }
+        // No EventKit writes. A missing previously managed future event fails closed.
+        let reconciliation = try reconcile(desired: prior, previous: prior, ruleIDs: [ruleID], now: .now, includingEvents: true)
+        guard confirmedOriginal || !reconciliation.previewEvents.isEmpty else {
+            throw CalendarIntegrationError.missingEvent
+        }
+        return descriptor
+    }
+
     private struct Reconciliation {
         var operations: [Operation]
         var snapshot: [PlannedOccurrence]
@@ -330,7 +405,244 @@ final class CalendarIntegration: ObservableObject {
         try apply(reconcile(desired: desired, previous: previous, ruleIDs: ruleIDs, now: .now))
     }
 
-    private func apply(_ reconciliation: Reconciliation) throws -> [PlannedOccurrence] {
+    /// Call before claiming the attempt, save the returned portable plan durably, then
+    /// invoke applySyncPlan only after CloudKit confirms this exact attempt's ownership.
+    func prepareSyncPlan(desired: [PlannedOccurrence], previous: [PlannedOccurrence], ruleIDs: Set<UUID>,
+                         attemptID: UUID, matchingRemoval: [CalendarRemovalEvent]? = nil,
+                         takeover: Bool = false) throws -> CalendarSyncPlan {
+        store.reset()
+        let reconciled = try reconcile(desired: desired, previous: previous, ruleIDs: ruleIDs, now: .now, takeover: takeover)
+        if let matchingRemoval, try removalEvents(in: reconciled) != matchingRemoval {
+            throw CalendarIntegrationError.removalSelectionChanged
+        }
+        return try syncPlan(from: reconciled, desired: desired, previous: previous, ruleIDs: ruleIDs, attemptID: attemptID)
+    }
+
+    private func bind(_ value: PlannedOccurrence, to calendarID: String) -> PlannedOccurrence {
+        var value = value
+        value.calendarID = calendarID
+        return value
+    }
+
+    private func operationState(_ identity: Identity, event: EKEvent) throws -> PlannedOccurrence {
+        guard let start = event.startDate, let end = event.endDate else { throw CalendarIntegrationError.invalidPlan }
+        return .init(ruleID: identity.rule, key: identity.occurrence,
+                     title: event.title ?? "", start: plannedDate(start, allDay: event.isAllDay),
+                     end: plannedEndDate(end, allDay: event.isAllDay), isAllDay: event.isAllDay, calendarID: "",
+                     timeZoneIdentifier: event.timeZone?.identifier)
+    }
+
+    private func syncPlan(from reconciliation: Reconciliation, desired: [PlannedOccurrence],
+                          previous: [PlannedOccurrence], ruleIDs: Set<UUID>, attemptID: UUID) throws -> CalendarSyncPlan {
+        func portable(_ records: [PlannedOccurrence]) -> [PlannedOccurrence] {
+            records.map { bind($0, to: "") }.sorted {
+                $0.ruleID == $1.ruleID ? $0.key < $1.key : $0.ruleID.uuidString < $1.ruleID.uuidString
+            }
+        }
+        let changes = try reconciliation.operations.map { operation -> CalendarSyncMutation in
+            switch operation {
+            case let .insert(_, value): return .init(kind: .insert, old: nil, new: bind(value, to: ""))
+            case let .update(identity, event, value): return .init(kind: .update, old: try operationState(identity, event: event), new: bind(value, to: ""), priorAttemptID: attemptMarker(in: event.notes))
+            case let .remove(identity, event): return .init(kind: .remove, old: try operationState(identity, event: event), new: nil, priorAttemptID: attemptMarker(in: event.notes))
+            }
+        }
+        return .init(attemptID: attemptID, ruleIDs: ruleIDs, desired: portable(desired), previous: portable(previous),
+                     result: portable(reconciliation.snapshot), mutations: changes)
+    }
+
+    private struct LocalRemovalEvidence: Codable, Equatable {
+        let itemID: String
+        let eventID: String?
+        let calendarID: String
+        let notes: String?
+        let title: String?
+        let start: Date
+        let end: Date
+        let lastModified: Date?
+    }
+
+    private func localRemovalEvidence(_ event: EKEvent) throws -> LocalRemovalEvidence {
+        guard let calendarID = event.calendar?.calendarIdentifier,
+              let start = event.startDate, let end = event.endDate else {
+            throw CalendarIntegrationError.invalidPlan
+        }
+        return .init(itemID: event.calendarItemIdentifier, eventID: event.eventIdentifier, calendarID: calendarID,
+                     notes: event.notes, title: event.title, start: start, end: end, lastModified: event.lastModifiedDate)
+    }
+
+    /// Call before the asynchronous CloudKit claim. The result is device-local evidence,
+    /// containing private notes and device identifiers: never include it in a CloudKit record.
+    func syncRemovalGuard(for plan: CalendarSyncPlan, destinations: [UUID: String]) throws -> Data {
+        guard hasFullAccess else { throw CalendarIntegrationError.denied }
+        store.reset()
+        let removals = plan.mutations.filter { $0.kind == .remove }
+        var evidence: [String: LocalRemovalEvidence] = [:]
+        let oldValues = removals.compactMap(\.old)
+        guard oldValues.count == removals.count else { throw CalendarIntegrationError.invalidPlan }
+        for (ruleID, values) in Dictionary(grouping: oldValues, by: \.ruleID) {
+            guard let id = destinations[ruleID],
+                  let first = values.map({ storageDate($0.start, allDay: $0.isAllDay) }).min(),
+                  let last = values.map({ storageDate($0.end, allDay: $0.isAllDay) }).max() else {
+                throw CalendarIntegrationError.invalidPlan
+            }
+            let calendar = try writableCalendar(id: id)
+            let found = try findEvents(from: first, through: last, calendar: calendar, ruleIDs: [ruleID])
+            for value in values {
+                let identity = Identity(rule: ruleID, occurrence: value.key)
+                guard let event = found[identity], try operationState(identity, event: event) == value,
+                      evidence[identity.displayID] == nil else {
+                    throw CalendarIntegrationError.removalSelectionChanged
+                }
+                evidence[identity.displayID] = try localRemovalEvidence(event)
+            }
+        }
+        return try JSONEncoder().encode(evidence)
+    }
+
+    /// Reconcile exactly what the operation journal claimed, even when an EventKit commit
+    /// succeeded but its response was lost. No unlisted mutation can enter this transaction.
+    func applySyncPlan(_ plan: CalendarSyncPlan, destinations: [UUID: String], recovering: Bool = false,
+                       removalGuard: Data? = nil) throws -> [PlannedOccurrence] {
+        store.reset()
+        guard hasFullAccess else { throw CalendarIntegrationError.denied }
+        let now = Date.now
+        let removalEvidence = try removalGuard.map { try JSONDecoder().decode([String: LocalRemovalEvidence].self, from: $0) }
+        if let removalEvidence {
+            let expected = Set(plan.mutations.filter { $0.kind == .remove }.compactMap { mutation in
+                mutation.old.map { Identity(rule: $0.ruleID, occurrence: $0.key).displayID }
+            })
+            guard Set(removalEvidence.keys) == expected else { throw CalendarIntegrationError.invalidPlan }
+        }
+        var destinationCache: [String: EKCalendar] = [:]
+        var found: [Identity: EKEvent] = [:]
+        let universe = plan.previous + plan.desired + plan.result + plan.mutations.flatMap { [$0.old, $0.new].compactMap { $0 } }
+        for (ruleID, values) in Dictionary(grouping: universe, by: \.ruleID) {
+            guard plan.ruleIDs.contains(ruleID), let localID = destinations[ruleID], !localID.isEmpty,
+                  let first = values.map({ storageDate($0.start, allDay: $0.isAllDay) }).min(),
+                  let last = values.map({ storageDate($0.end, allDay: $0.isAllDay) }).max() else {
+                throw CalendarIntegrationError.invalidPlan
+            }
+            let calendar = try writableCalendar(id: localID)
+            destinationCache[localID] = calendar
+            try found.merge(findEvents(from: first, through: last, calendar: calendar, ruleIDs: [ruleID])) { _, _ in
+                throw CalendarIntegrationError.ambiguousEvent
+            }
+        }
+        let changed = Set(plan.mutations.compactMap { operation in (operation.new ?? operation.old).map { Identity(rule: $0.ruleID, occurrence: $0.key) } })
+        let known = Set(universe.map { Identity(rule: $0.ruleID, occurrence: $0.key) })
+        guard changed.count == plan.mutations.count, found.keys.allSatisfy(known.contains) else {
+            throw CalendarIntegrationError.ambiguousEvent
+        }
+        // Re-check any untouched managed future rows before attempting writes.
+        for value in plan.result where storageDate(value.start, allDay: value.isAllDay) > now {
+            let key = Identity(rule: value.ruleID, occurrence: value.key)
+            if !changed.contains(key), found[key] == nil { throw CalendarIntegrationError.missingEvent }
+        }
+        var operations: [Operation] = []
+        for mutation in plan.mutations {
+            guard let value = mutation.new ?? mutation.old, let localID = destinations[value.ruleID] else {
+                throw CalendarIntegrationError.invalidPlan
+            }
+            let identity = Identity(rule: value.ruleID, occurrence: value.key)
+            let event = found[identity]
+            let observed = try event.map { try operationState(identity, event: $0) }
+            let observedAttempt = event.flatMap { attemptMarker(in: $0.notes) }
+            let alreadyDone = observedAttempt == plan.attemptID
+            switch mutation.kind {
+            case .insert:
+                guard let target = mutation.new, mutation.old == nil else { throw CalendarIntegrationError.invalidPlan }
+                if let event {
+                    guard recovering, alreadyDone, !differs(event, from: target) else { throw CalendarIntegrationError.ambiguousEvent }
+                } else {
+                    guard storageDate(target.start, allDay: target.isAllDay) > now else { throw CalendarIntegrationError.removalSelectionChanged }
+                    operations.append(.insert(identity, bind(target, to: localID)))
+                }
+            case .update:
+                guard let target = mutation.new, let old = mutation.old,
+                      old.ruleID == identity.rule, old.key == identity.occurrence,
+                      let event else { throw CalendarIntegrationError.missingEvent }
+                if recovering, alreadyDone, !differs(event, from: target) { continue }
+                guard observed == old, observedAttempt == mutation.priorAttemptID,
+                      event.startDate > now, storageDate(target.start, allDay: target.isAllDay) > now else {
+                    throw CalendarIntegrationError.removalSelectionChanged
+                }
+                operations.append(.update(identity, event, bind(target, to: localID)))
+            case .remove:
+                guard mutation.old != nil, mutation.new == nil else { throw CalendarIntegrationError.invalidPlan }
+                if let event {
+                    guard observed == mutation.old, observedAttempt == mutation.priorAttemptID, event.startDate > now else {
+                        throw CalendarIntegrationError.removalSelectionChanged
+                    }
+                    if let removalEvidence,
+                       try localRemovalEvidence(event) != removalEvidence[identity.displayID] {
+                        throw CalendarIntegrationError.removalSelectionChanged
+                    }
+                    operations.append(.remove(identity, event))
+                } else {
+                    // An absent event does not tell us whether our previous deletion was committed,
+                    // hidden by provider sync, or externally moved. Only verified completion or
+                    // an explicit, freshly reconciled manual takeover can finish this attempt.
+                    throw recovering ? CalendarIntegrationError.uncertainRemovalRecovery : CalendarIntegrationError.missingEvent
+                }
+            }
+        }
+        let snapshot = try plan.result.map { value in
+            guard let destination = destinations[value.ruleID] else { throw CalendarIntegrationError.noDestination }
+            return bind(value, to: destination)
+        }
+        _ = try apply(.init(operations: operations, snapshot: snapshot, calendars: destinationCache), attemptID: plan.attemptID)
+        store.reset()
+        // Verify the committed outcome through EventKit, rather than treating a successful
+        // response as sufficient. On failure leave the durable CloudKit attempt pending.
+        for (ruleID, values) in Dictionary(grouping: universe, by: \.ruleID) {
+            guard let id = destinations[ruleID],
+                  let first = values.map({ storageDate($0.start, allDay: $0.isAllDay) }).min(),
+                  let last = values.map({ storageDate($0.end, allDay: $0.isAllDay) }).max() else {
+                throw CalendarIntegrationError.invalidPlan
+            }
+            let calendar = try writableCalendar(id: id)
+            let refreshed = try findEvents(from: first, through: last, calendar: calendar, ruleIDs: [ruleID])
+            for mutation in plan.mutations where (mutation.new ?? mutation.old)?.ruleID == ruleID {
+                guard let value = mutation.new ?? mutation.old else { throw CalendarIntegrationError.invalidPlan }
+                let identity = Identity(rule: ruleID, occurrence: value.key)
+                if mutation.kind == .remove {
+                    guard refreshed[identity] == nil else { throw CalendarIntegrationError.writeFailed }
+                } else {
+                    guard let event = refreshed[identity], let target = mutation.new,
+                          attemptMarker(in: event.notes) == plan.attemptID, !differs(event, from: target) else {
+                        throw CalendarIntegrationError.writeFailed
+                    }
+                }
+            }
+        }
+        return snapshot
+    }
+
+    private func attemptLines(in notes: String?) -> [Substring] {
+        (notes ?? "").split(whereSeparator: \.isNewline).filter { $0.hasPrefix("[CalStitch:apply=") }
+    }
+
+    private func attemptMarker(in notes: String?) -> UUID? {
+        let marker = "[CalStitch:apply="
+        let lines = attemptLines(in: notes)
+        guard lines.count == 1, let line = lines.first, line.hasSuffix("]") else { return nil }
+        let value = line.dropFirst(marker.count).dropLast()
+        return value.utf8.count == 36 ? UUID(uuidString: String(value)) : nil
+    }
+
+    private func stampedNotes(_ notes: String, attemptID: UUID) -> String {
+        var lines = notes.components(separatedBy: "\n")
+        let prefix = "[CalStitch:apply="
+        lines.removeAll { rawLine in
+            let line = rawLine.hasSuffix("\r") ? String(rawLine.dropLast()) : rawLine
+            return line.hasPrefix(prefix) && line.hasSuffix("]") &&
+                UUID(uuidString: String(line.dropFirst(prefix.count).dropLast())) != nil
+        }
+        lines.append(prefix + attemptID.uuidString + "]")
+        return lines.joined(separator: "\n")
+    }
+
+    private func apply(_ reconciliation: Reconciliation, attemptID: UUID? = nil) throws -> [PlannedOccurrence] {
         guard !reconciliation.operations.isEmpty else { return reconciliation.snapshot }
         do {
             for operation in reconciliation.operations {
@@ -342,10 +654,12 @@ final class CalendarIntegration: ObservableObject {
                     let event = EKEvent(eventStore: store)
                     event.calendar = calendar
                     event.notes = "\n\n----\n\n" + identity.marker
+                    if let attemptID { event.notes = stampedNotes(event.notes ?? "", attemptID: attemptID) }
                     configure(event, with: occurrence)
                     try store.save(event, span: .thisEvent, commit: false)
                 case let .update(_, event, occurrence):
-                    // Leave existing notes untouched, including prose around our exact marker.
+                    // Keep prose and the legacy rule marker; replace only an exact old attempt marker.
+                    if let attemptID { event.notes = stampedNotes(event.notes ?? "", attemptID: attemptID) }
                     configure(event, with: occurrence)
                     try store.save(event, span: .thisEvent, commit: false)
                 case let .remove(_, event):
@@ -517,7 +831,7 @@ final class CalendarIntegration: ObservableObject {
         return result
     }
 
-    private func reconcile(desired: [PlannedOccurrence], previous: [PlannedOccurrence], ruleIDs: Set<UUID>, now: Date, includingEvents: Bool = false) throws -> Reconciliation {
+    private func reconcile(desired: [PlannedOccurrence], previous: [PlannedOccurrence], ruleIDs: Set<UUID>, now: Date, includingEvents: Bool = false, takeover: Bool = false) throws -> Reconciliation {
         let all = desired + previous
         guard !all.isEmpty else { return .init(operations: [], snapshot: []) }
         guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else {
@@ -544,7 +858,7 @@ final class CalendarIntegration: ObservableObject {
         for id in destinationGroups.keys.sorted() {
             let calendar = try writableCalendar(id: id)
             let group = try reconcileCalendar(desired: wantedGroups[id] ?? [], previous: priorGroups[id] ?? [],
-                                              ruleIDs: destinationGroups[id] ?? [], now: now, calendar: calendar, includingEvents: includingEvents)
+                                              ruleIDs: destinationGroups[id] ?? [], now: now, calendar: calendar, includingEvents: includingEvents, takeover: takeover)
             batch.calendars[id] = calendar
             batch.operations.append(contentsOf: group.operations)
             batch.snapshot.append(contentsOf: group.snapshot)
@@ -559,7 +873,7 @@ final class CalendarIntegration: ObservableObject {
     }
 
     private func reconcileCalendar(desired: [PlannedOccurrence], previous: [PlannedOccurrence], ruleIDs: Set<UUID>,
-                                   now: Date, calendar: EKCalendar, includingEvents: Bool) throws -> Reconciliation {
+                                   now: Date, calendar: EKCalendar, includingEvents: Bool, takeover: Bool = false) throws -> Reconciliation {
         let wanted = try table(desired, calendarID: calendar.calendarIdentifier, ruleIDs: ruleIDs)
         let prior = try table(previous, calendarID: calendar.calendarIdentifier, ruleIDs: ruleIDs)
         let all = desired + previous
@@ -569,11 +883,11 @@ final class CalendarIntegration: ObservableObject {
 
         // A matching marker suffices to locate a candidate, not to claim an event
         // absent from the app's successful-apply snapshot.
-        guard found.keys.allSatisfy({ prior[$0] != nil }) else {
+        guard takeover || found.keys.allSatisfy({ prior[$0] != nil }) else {
             throw CalendarIntegrationError.ambiguousEvent
         }
         for (key, occurrence) in prior {
-            if storageDate(occurrence.start, allDay: occurrence.isAllDay) > now && found[key] == nil {
+            if !takeover && storageDate(occurrence.start, allDay: occurrence.isAllDay) > now && found[key] == nil {
                 throw CalendarIntegrationError.missingEvent
             }
         }
@@ -679,6 +993,7 @@ final class CalendarIntegration: ObservableObject {
                 let distinct = "\(event.calendarItemIdentifier)/\(event.startDate.timeIntervalSinceReferenceDate)"
                 guard seen.insert(distinct).inserted else { continue }
                 guard markers.count == 1, !event.hasRecurrenceRules, !event.isDetached,
+                      attemptLines(in: notes).isEmpty || attemptMarker(in: notes) != nil,
                       let key = affected.first, result[key] == nil else {
                     throw CalendarIntegrationError.ambiguousEvent
                 }

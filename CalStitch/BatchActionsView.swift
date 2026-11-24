@@ -51,9 +51,9 @@ struct BatchActionsView: View {
     let rules: [BatchRuleOption]
     let categories: [BatchCategoryOption]
     let preview: (BatchEdit) throws -> BatchDurationPreview
-    let apply: (BatchEdit) throws -> Void
+    let apply: (BatchEdit) async throws -> Void
     let removalPreview: (Set<UUID>) throws -> BatchRemovalPreview
-    let remove: (Set<UUID>, BatchRemovalPreview) throws -> Void
+    let remove: (Set<UUID>, BatchRemovalPreview) async throws -> Void
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var textSize
@@ -72,6 +72,7 @@ struct BatchActionsView: View {
     @State private var cachedRemoval: CachedRemoval?
     @State private var confirmation: Confirmation?
     @State private var failure: String?
+    @State private var isCommitting = false
 
     private enum Confirmation {
         case apply(BatchEdit)
@@ -88,9 +89,9 @@ struct BatchActionsView: View {
     }
 
     init(rules: [BatchRuleOption], initiallySelected: Set<UUID>, categories: [BatchCategoryOption],
-         preview: @escaping (BatchEdit) throws -> BatchDurationPreview, apply: @escaping (BatchEdit) throws -> Void,
+         preview: @escaping (BatchEdit) throws -> BatchDurationPreview, apply: @escaping (BatchEdit) async throws -> Void,
          removalPreview: @escaping (Set<UUID>) throws -> BatchRemovalPreview,
-         remove: @escaping (Set<UUID>, BatchRemovalPreview) throws -> Void) {
+         remove: @escaping (Set<UUID>, BatchRemovalPreview) async throws -> Void) {
         self.rules = rules
         self.categories = categories
         self.preview = preview
@@ -312,16 +313,18 @@ struct BatchActionsView: View {
                     }
                 }
             }
+            .disabled(isCommitting)
             .navigationTitle(L10n.text("批次調整", "Batch Edit"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(L10n.text("取消", "Cancel")) { dismiss() }
+                        .disabled(isCommitting)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(L10n.text("套用", "Apply"), action: beginConfirmation)
                         .fontWeight(.semibold)
-                        .disabled(!canApply)
+                        .disabled(!canApply || isCommitting)
                         .accessibilityIdentifier("batch-apply")
                 }
             }
@@ -342,9 +345,13 @@ struct BatchActionsView: View {
             .alert(confirmationTitle, isPresented: showingConfirmation, presenting: confirmation) { presented in
                 switch presented {
                 case let .apply(request):
-                    Button(L10n.text("確認套用", "Confirm Apply")) { commit(request) }
+                    Button(L10n.text("確認套用", "Confirm Apply")) {
+                        performMutation { await commit(request) }
+                    }
                 case let .removal(review, selected):
-                    Button(L10n.text("移除", "Remove"), role: .destructive) { confirmRemoval(review, selected: selected) }
+                    Button(L10n.text("移除", "Remove"), role: .destructive) {
+                        performMutation { await confirmRemoval(review, selected: selected) }
+                    }
                 }
                 Button(L10n.text("取消", "Cancel"), role: .cancel) {}
             } message: { presented in
@@ -356,6 +363,7 @@ struct BatchActionsView: View {
                 }
             }
         }
+        .interactiveDismissDisabled(isCommitting)
     }
 
     private func groupSelection(_ label: String, rules: [BatchRuleOption], isSubcategory: Bool) -> some View {
@@ -504,7 +512,7 @@ struct BatchActionsView: View {
     }
 
     private func beginConfirmation() {
-        guard canApply else { return }
+        guard canApply, !isCommitting else { return }
         failure = nil
         if removalMode {
             let selected = selection
@@ -526,7 +534,16 @@ struct BatchActionsView: View {
         }
     }
 
-    private func commit(_ request: BatchEdit) {
+    private func performMutation(_ action: @escaping @MainActor () async -> Void) {
+        guard !isCommitting else { return }
+        isCommitting = true
+        Task { @MainActor in
+            defer { isCommitting = false }
+            await action()
+        }
+    }
+
+    private func commit(_ request: BatchEdit) async {
         guard let edit, edit == request else {
             failure = L10n.text("調整條件已變更，請重新確認。", "The batch settings have changed. Please confirm again.")
             return
@@ -540,7 +557,7 @@ struct BatchActionsView: View {
                 failure = L10n.text("行事曆內容已變更，請重新確認下面的預覽。", "Calendar has changed. Review the updated preview before confirming.")
                 return
             }
-            try apply(edit)
+            try await apply(edit)
             dismiss()
         } catch {
             cachedReview = nil
@@ -548,7 +565,7 @@ struct BatchActionsView: View {
         }
     }
 
-    private func confirmRemoval(_ proposed: BatchRemovalPreview, selected: Set<UUID>) {
+    private func confirmRemoval(_ proposed: BatchRemovalPreview, selected: Set<UUID>) async {
         do {
             guard removalMode, selected == selection else {
                 failure = L10n.text("受影響的資料已變更，請重新按「套用」再確認。", "The affected rules or events have changed. Tap Apply and confirm again.")
@@ -559,7 +576,7 @@ struct BatchActionsView: View {
                 showUpdatedRemoval(current, selected: selected)
                 return
             }
-            try remove(selected, proposed)
+            try await remove(selected, proposed)
             dismiss()
         } catch {
             preparePreview(force: true)

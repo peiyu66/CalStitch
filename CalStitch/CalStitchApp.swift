@@ -1,4 +1,5 @@
 import SwiftUI
+import CloudKit
 import UIKit
 
 @main
@@ -393,16 +394,17 @@ private struct RuleSnapshot: Codable {
     var rules: [Rule] = []
     var occurrences: [PlannedOccurrence] = []
     var groupAppearances: [GroupAppearance]? = nil
+    var knownEmptyRuleIDs: Set<UUID>? = nil
 
-    private static func url() throws -> URL {
+    private static func url(localOnly: Bool = false) throws -> URL {
         try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                     appropriateFor: nil, create: true)
             .appendingPathComponent("CalStitch", isDirectory: true)
-            .appendingPathComponent("rules-v1.json")
+            .appendingPathComponent(localOnly ? "rules-local-v2.json" : "rules-v1.json")
     }
 
-    static func read() throws -> Self {
-        let url = try Self.url()
+    static func read(localOnly: Bool = false) throws -> Self {
+        let url = try Self.url(localOnly: localOnly)
         guard FileManager.default.fileExists(atPath: url.path) else { return Self() }
         return try JSONDecoder().decode(Self.self, from: Data(contentsOf: url))
     }
@@ -415,8 +417,8 @@ private struct RuleSnapshot: Codable {
         try JSONEncoder().encode(self).write(to: temporary, options: .atomic)
     }
 
-    func write() throws {
-        let url = try Self.url()
+    func write(localOnly: Bool = false) throws {
+        let url = try Self.url(localOnly: localOnly)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         var clean = self
         clean.pruneGroupAppearances()
@@ -434,6 +436,56 @@ private struct RuleSnapshot: Codable {
         }
         let remaining = stored.filter { keys.contains($0.key) }
         groupAppearances = remaining.isEmpty ? nil : remaining
+    }
+}
+
+private struct VerifiedCalendarBinding: Codable {
+    let id: String
+    let descriptor: CalendarSyncDestination
+}
+
+private struct CloudLocalWritePlan: Codable {
+    let destinations: [UUID: String]
+    let removalGuard: Data?
+}
+
+private extension CalendarIntegrationError {
+    var requiresManualRecovery: Bool {
+        switch self {
+        case .uncertainRemovalRecovery, .ambiguousEvent, .invalidPlan, .writeFailed, .removalSelectionChanged: true
+        default: false
+        }
+    }
+}
+
+private struct LocalRuleWriteJournal: Codable {
+    let plan: CalendarSyncPlan
+    let destinations: [UUID: String]
+    var proposed: RuleSnapshot
+    var removalGuard: Data? = nil
+    var eventKitComplete: Bool = false
+
+    private static func url(localOnly: Bool) throws -> URL {
+        try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                    appropriateFor: nil, create: true)
+            .appendingPathComponent("CalStitch", isDirectory: true)
+            .appendingPathComponent(localOnly ? "local-only-journal-v1.json" : "legacy-local-journal-v1.json")
+    }
+
+    static func read(localOnly: Bool) throws -> Self? {
+        let path = try url(localOnly: localOnly)
+        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
+        return try JSONDecoder().decode(Self.self, from: Data(contentsOf: path))
+    }
+
+    func write(localOnly: Bool) throws {
+        let path = try Self.url(localOnly: localOnly)
+        try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONEncoder().encode(self).write(to: path, options: .atomic)
+    }
+
+    static func clear(localOnly: Bool) throws {
+        try FileManager.default.removeItem(at: url(localOnly: localOnly))
     }
 }
 
@@ -516,6 +568,19 @@ private enum Route: Hashable {
 
 private struct RulesHome: View {
     @StateObject private var calendar = CalendarIntegration()
+    @State private var cloud = RuleCloudSync()
+    @State private var cloudSession: CloudRuleSession?
+    @State private var cloudReadError: String?
+    @State private var cloudReady = false
+    @State private var cloudBusy = false
+    @State private var cloudRefreshing = false
+    @State private var cloudResetPending = false
+    @State private var knownDestinations: [UUID: String] = [:]
+    @State private var directFrozen: [UUID: String] = [:]
+    @State private var freezeReview: Rule?
+    @AppStorage("settings.hideFrozenRules") private var hideFrozen = false
+    @AppStorage("rules.hasCloudAccount") private var hasCloudAccount = false
+    @State private var awaitingLocalRecovery = false
     @State private var path: [Route] = []
     @State private var isAdding = false
     @State private var contactPickerRequest: UUID?
@@ -550,17 +615,22 @@ private struct RulesHome: View {
                             .foregroundStyle(.secondary)
                         toolsRow
                     }
+                    if let cloudReadError {
+                        Label(cloudReadError, systemImage: "icloud.slash")
+                            .font(.footnote).foregroundStyle(.secondary)
+                        Button(L10n.text("重新同步", "Retry Sync")) { Task { await load() } }
+                    }
                     if loaded && showGettingStarted { intro }
                     if !loaded && !loadFailed {
                         ProgressView(L10n.text("正在讀取規則…", "Loading rules…"))
                     } else if loadFailed {
-                        Button(L10n.text("重新讀取規則", "Reload Rules"), action: load)
-                    } else if rootRules.isEmpty {
+                        Button(L10n.text("重新讀取規則", "Reload Rules")) { Task { await load() } }
+                    } else if visibleRootRules.isEmpty {
                         emptyState
                     }
-                    let names = uniqueNames(rootRules.map(\.category))
+                    let names = uniqueNames(visibleRootRules.map(\.category))
                     ForEach(names, id: \.self) { name in
-                        category(name, rules: rootRules.filter { $0.category == name }, isFirst: name == names.first)
+                        category(name, rules: visibleRootRules.filter { $0.category == name }, isFirst: name == names.first)
                     }
                     if loaded {
                         let layout = dynamicTypeSize.isAccessibilitySize
@@ -605,21 +675,30 @@ private struct RulesHome: View {
             .navigationDestination(for: Route.self) { route in
                 switch route {
                 case .settings:
-                    CalStitchSettingsView()
+                    CalStitchSettingsView(hideFrozen: $hideFrozen)
                 case .edit(let rule, let isNew):
                     RuleEditor(initial: snapshot.rules.first { $0.id == rule.id } ?? rule, isNew: isNew,
                                parent: snapshot.rules.first { $0.id == rule.parent },
                                allRules: snapshot.rules, calendar: calendar,
                                preview: preview, onApply: apply, onApplied: returnAfterApply,
                                previewDeletion: { id in try previewRemoval([id], allowChild: true) },
-                               onDelete: { id, expected in try removeSelected([id], expected, allowChild: true) },
+                               onDelete: { id, expected in try await removeSelected([id], expected, allowChild: true) },
                                onDeleted: { if !path.isEmpty { path.removeLast() } },
-                               onSaveAppearance: saveRuleAppearance) { child, isNew in
+                               onSaveAppearance: saveRuleAppearance,
+                               frozenReason: freezeReason(rule.id) ?? pendingReason(rule.id),
+                               hiddenRuleIDs: hideFrozen ? Set(snapshot.rules.filter { freezeReason($0.id) != nil }.map(\.id)) : [],
+                               onThaw: freezeReason(rule.id) == nil ? nil : { freezeReview = rule }) { child, isNew in
                         path.append(.edit(child, isNew: isNew))
                     }
                 }
             }
             .sheet(isPresented: $isAdding) { addSheet }
+            .sheet(item: $freezeReview) { frozenRule in
+                FrozenRuleReview(rule: frozenRule, calendar: calendar,
+                                 interrupted: interruptedOperation(frozenRule.id) != nil,
+                                 inspect: { id in try inspectThaw(frozenRule, destinationID: id) },
+                                 confirm: { id, expected in try await confirmThaw(frozenRule, destinationID: id, expected: expected) })
+            }
             .background {
                 ContactPickerPresenter(request: contactPickerRequest) { selection in
                     contactPickerRequest = nil
@@ -650,10 +729,11 @@ private struct RulesHome: View {
                                         }, onImport: importBirthdays)
             }
             .sheet(isPresented: $showingOrphanCleanup) {
-                OrphanCleanupView(calendar: calendar, existingRuleIDs: { Set(snapshot.rules.map(\.id)) })
+                OrphanCleanupView(calendar: calendar, existingRuleIDs: orphanProtectedIDs,
+                                  beforeRemove: refreshBeforeOrphans)
             }
             .sheet(isPresented: $isShowingBatch) {
-                BatchActionsView(rules: rootRules.map {
+                BatchActionsView(rules: batchEligibleRoots.map {
                     .init(id: $0.id, title: $0.displayName, subtitle: $0.recurrenceCaption,
                           category: $0.category, subcategory: $0.subcategory)
                 }, initiallySelected: [], categories: batchCategories,
@@ -692,16 +772,39 @@ private struct RulesHome: View {
         }
         .environment(\.timeZone, ruleZone)
         .environment(\.calendar, gregorianCalendar)
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(30)) } catch { break }
+                await load()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .CKAccountChanged)) { _ in
+            cloudReady = false
+            cloudResetPending = true
+            if !cloudBusy {
+                snapshot = RuleSnapshot()
+                cloudSession = nil
+                loaded = false
+                Task { await load() }
+            }
+        }
+        .onChange(of: calendar.destinations) { _, _ in
+            if let session = cloudSession, !cloudBusy { restoreCloud(session) }
+        }
         .task {
             calendar.refreshCalendars()
-            if !loaded && !loadFailed { load() }
+            if !loaded && !loadFailed { await load() }
             if !checkedBirthdaySettingsReturn {
                 checkedBirthdaySettingsReturn = true
                 if BirthdayGroupSettingsReturn.consume() { selectingBirthdayGroup = true }
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { calendar.refreshCalendars() }
+            if phase == .active {
+                calendar.refreshCalendars()
+                Task { await load() }
+            }
             if phase == .background { reachedBackground = true }
             if phase == .active && reachedBackground {
                 showGettingStarted = rootRules.isEmpty
@@ -711,6 +814,23 @@ private struct RulesHome: View {
     }
 
     private var rootRules: [Rule] { snapshot.rules.filter { $0.parent == nil } }
+    private var visibleRootRules: [Rule] {
+        hideFrozen ? rootRules.filter { freezeReason($0.id) == nil } : rootRules
+    }
+
+    private var batchEligibleRoots: [Rule] {
+        let branches = Dictionary(grouping: snapshot.rules, by: \.parent)
+        return rootRules.filter { root in
+            var seen: Set<UUID> = []
+            var pending = [root]
+            while let rule = pending.popLast() {
+                guard seen.insert(rule.id).inserted else { continue }
+                if freezeReason(rule.id) != nil || pendingOperation(rule.id) != nil { return false }
+                pending += branches[rule.id] ?? []
+            }
+            return true
+        }
+    }
 
     private var birthdayRouteSheet: some View {
         NavigationStack {
@@ -764,16 +884,19 @@ private struct RulesHome: View {
         entries.removeAll { $0.key == key }
         if !appearance.isDefault { entries.append(.init(key: key, value: appearance)) }
         updated.groupAppearances = entries.isEmpty ? nil : entries
-        try updated.write()
+        if let account = cloudSession?.accountID {
+            try saveAppearances(updated.groupAppearances, account: account)
+        } else {
+            try updated.write(localOnly: hasCloudAccount)
+        }
         snapshot = updated
     }
 
-    private func saveRuleAppearance(_ id: UUID, _ appearance: RuleAppearance) throws -> Bool {
+    private func saveRuleAppearance(_ id: UUID, _ appearance: RuleAppearance) async throws -> Bool {
         guard let index = snapshot.rules.firstIndex(where: { $0.id == id }) else { return false }
         var updated = snapshot
         updated.rules[index].appearance = appearance.isDefault ? nil : appearance
-        try updated.write()
-        snapshot = updated
+        try await performMutation(updated, scope: [id])
         return true
     }
 
@@ -793,20 +916,584 @@ private struct RulesHome: View {
         }
     }
 
-    private func load() {
+    private func load() async {
+        guard !cloudBusy, !cloudRefreshing else { return }
+        cloudRefreshing = true
+        defer {
+            cloudRefreshing = false
+            if cloudResetPending && !cloudBusy { Task { await load() } }
+        }
+        if cloudResetPending {
+            cloudResetPending = false
+            snapshot = RuleSnapshot()
+            cloudSession = nil
+            loaded = false
+        }
         do {
-            snapshot = try RuleSnapshot.read()
-            showGettingStarted = rootRules.isEmpty
+            if var session = try await cloud.refresh() {
+                if try LocalRuleWriteJournal.read(localOnly: hasCloudAccount) != nil {
+                    throw RuleOperationError(L10n.text("有尚未確認的本機寫入，請先完成原本機狀態的復原，再啟用 iCloud 規則同步。", "A local calendar update has not been verified. Recover it in the original local mode before enabling rule sync."))
+                }
+                recordAccountSeen(session.accountID)
+                if let preceding = cloudSession, preceding.accountID != session.accountID {
+                    snapshot = RuleSnapshot()
+                    knownDestinations = [:]
+                }
+                if cloud.canMigrateLegacy(in: session),
+                   !hasCloudAccount || (cloud.hasLegacyMigrationOwner && !cloud.hasMigratedLegacy(in: session)) {
+                    let legacy = try RuleSnapshot.read()
+                    if !legacy.rules.isEmpty {
+                        let envelope = legacy.rules.map { rule in
+                            let destination = rule.target.isEmpty ? nil : try? calendar.syncDestination(id: rule.target, deviceID: cloud.deviceID)
+                            let prior = legacy.occurrences.filter { $0.ruleID == rule.id }
+                            return portable(rule, destination: destination,
+                                            prior: rule.hasApplied && prior.isEmpty && legacy.knownEmptyRuleIDs?.contains(rule.id) != true ? nil : prior)
+                        }
+                        let alreadyCloud = Set(session.ledger.rules.map(\.id)).union(session.ledger.tombstones)
+                        let knownBindings = bindings(session.accountID)
+                        let seedRules = legacy.rules.filter {
+                            (!$0.target.isEmpty || $0.birthdaySource != nil) && !alreadyCloud.contains($0.id)
+                        }
+                        let seeds = Dictionary(uniqueKeysWithValues: seedRules
+                            .filter { !$0.target.isEmpty && knownBindings[$0.id] == nil }.map { ($0.id, $0.target) })
+                        do {
+                            // Keep known local identities even if the server response is lost.
+                            mergeBindings(seeds, account: session.accountID)
+                            rememberBirthdaySources(seedRules, account: session.accountID)
+                            try saveAppearances(legacy.groupAppearances, account: session.accountID, replacing: false)
+                            session = try await cloud.migrate(envelope, in: session)
+                        } catch CloudRuleError.legacyAccountMismatch {
+                            // Local data is permanently tied to its first iCloud namespace.
+                            // A different signed-in account can still show its own ledger.
+                        }
+                    }
+                }
+                guard !cloudResetPending else { throw CloudRuleError.accountChanged }
+                hasCloudAccount = true
+                restoreCloud(session)
+                cloudReady = true
+                cloudReadError = nil
+                await recoverCloud(session)
+            } else {
+                // An explicit no-account response is not an empty cloud ledger.
+                guard !cloudResetPending else { throw CloudRuleError.accountChanged }
+                cloudSession = nil
+                knownDestinations = [:]
+                directFrozen = [:]
+                snapshot = try RuleSnapshot.read(localOnly: hasCloudAccount)
+                cloudReady = true
+                cloudReadError = nil
+                await recoverLocal()
+            }
+            if !loaded { showGettingStarted = snapshot.rules.isEmpty }
             loadFailed = false
             loaded = true
         } catch {
-            loaded = false
-            loadFailed = true
-            toolbarError = L10n.text("讀取已儲存的規則失敗。原資料沒有覆寫。請重新開啟 App 或再試一次。\n\(error.localizedDescription)", "Could not load saved rules. Existing data was not overwritten. Reopen the app or try again.\n\(error.localizedDescription)")
+            cloudReady = false
+            cloudReadError = error.localizedDescription
+            loadFailed = !loaded
         }
     }
 
-    private func resolve(_ input: Rule) throws -> RuleReconciliation {
+    private func portable(_ input: Rule, destination: CalendarSyncDestination?,
+                          prior: [PlannedOccurrence]?) -> CloudRuleEnvelope {
+        var rule = input
+        rule.target = ""
+        return CloudRuleEnvelope(rule: rule, destination: destination,
+                                 prior: prior?.map { value in
+                                     var occurrence = value
+                                     occurrence.calendarID = ""
+                                     return occurrence
+                                 },
+                                 unresolvedOwner: destination == nil && !input.target.isEmpty ? cloud.deviceID : nil)
+    }
+
+    private func mergeBindings(_ values: [UUID: String], account: String) {
+        var merged = bindings(account)
+        merged.merge(values) { _, newValue in newValue }
+        if let data = try? JSONEncoder().encode(merged) {
+            UserDefaults.standard.set(data, forKey: "rules.destinationBindings." + account)
+        }
+    }
+
+    private func bindings(_ account: String) -> [UUID: String] {
+        let data = UserDefaults.standard.data(forKey: "rules.destinationBindings." + account)
+        return data.flatMap { try? JSONDecoder().decode([UUID: String].self, from: $0) } ?? [:]
+    }
+
+    private func saveAppearances(_ appearances: [GroupAppearance]?, account: String,
+                                 replacing: Bool = true) throws {
+        let key = "rules.localAppearance." + account
+        guard replacing || UserDefaults.standard.data(forKey: key) == nil else { return }
+        UserDefaults.standard.set(try JSONEncoder().encode(appearances ?? []), forKey: key)
+    }
+
+    private func accountAppearances(_ account: String) -> [GroupAppearance]? {
+        let key = "rules.localAppearance." + account
+        return UserDefaults.standard.data(forKey: key).flatMap { try? JSONDecoder().decode([GroupAppearance].self, from: $0) }
+    }
+
+    private func birthdaySources(_ account: String) -> [UUID: BirthdayImportSource] {
+        let key = "rules.localBirthdaySources." + account
+        return UserDefaults.standard.data(forKey: key).flatMap { try? JSONDecoder().decode([UUID: BirthdayImportSource].self, from: $0) } ?? [:]
+    }
+
+    private func rememberBirthdaySources(_ rules: [Rule], account: String) {
+        var values = birthdaySources(account)
+        for rule in rules {
+            if let source = rule.birthdaySource { values[rule.id] = source }
+        }
+        if let data = try? JSONEncoder().encode(values) {
+            UserDefaults.standard.set(data, forKey: "rules.localBirthdaySources." + account)
+        }
+    }
+
+    private func restoreCloud(_ session: CloudRuleSession) {
+        cloudSession = session
+        let remembered = bindings(session.accountID)
+        let verified = verifiedBindings(session.accountID)
+        let contactOrigins = birthdaySources(session.accountID)
+        var known: [UUID: String] = [:]
+        var frozen: [UUID: String] = [:]
+        var rules: [Rule] = []
+        var occurrences: [PlannedOccurrence] = []
+        let committed = Set(session.ledger.rules.map(\.id))
+        let placeholders = session.ledger.pending.flatMap(\.upserts).filter { !committed.contains($0.id) }
+        for entry in session.ledger.rules + placeholders {
+            var rule = entry.rule
+            if !committed.contains(rule.id) { rule.hasApplied = false }
+            rule.birthdaySource = contactOrigins[rule.id]
+            if let binding = verified[rule.id],
+               (try? calendar.resolveSyncDestination(binding.descriptor, rememberedID: binding.id, deviceID: cloud.deviceID)) == binding.id {
+                rule.target = binding.id
+            } else if let destination = entry.destination {
+                if let owner = destination.localOwner, owner != cloud.deviceID {
+                    frozen[rule.id] = L10n.text("這是原 iPhone 的本機行事曆，請回該裝置操作。", "This calendar is local to the original iPhone. Use that device for changes.")
+                } else {
+                do {
+                    rule.target = try calendar.resolveSyncDestination(destination, rememberedID: remembered[rule.id], deviceID: cloud.deviceID)
+                } catch { frozen[rule.id] = error.localizedDescription }
+                }
+            } else if entry.unresolvedOwner == cloud.deviceID,
+                      let id = remembered[rule.id],
+                      (try? calendar.syncDestination(id: id, deviceID: cloud.deviceID)) != nil {
+                rule.target = id
+            } else if rule.hasApplied || entry.unresolvedOwner != nil {
+                frozen[rule.id] = L10n.text("無法確認原行事曆。", "The original calendar could not be confirmed.")
+            }
+            if !rule.target.isEmpty {
+                known[rule.id] = rule.target
+                occurrences += (entry.prior ?? []).map { original in
+                    var occurrence = original
+                    occurrence.calendarID = rule.target
+                    return occurrence
+                }
+            }
+            rules.append(rule)
+        }
+        mergeBindings(known, account: session.accountID)
+        knownDestinations = known
+        directFrozen = frozen
+        let appearances = accountAppearances(session.accountID)
+        snapshot = RuleSnapshot(rules: rules, occurrences: occurrences, groupAppearances: appearances)
+    }
+
+    private func freezeReason(_ id: UUID, includingAncestors: Bool = true) -> String? {
+        var cursor: UUID? = id
+        var seen = Set<UUID>()
+        while let current = cursor, seen.insert(current).inserted {
+            if interruptedOperation(current) != nil {
+                return L10n.text("套用中斷。", "The update was interrupted.")
+            }
+            if pendingOperation(current) != nil { return nil }
+            if let reason = directFrozen[current] { return reason }
+            cursor = includingAncestors ? snapshot.rules.first(where: { $0.id == current })?.parent : nil
+        }
+        return nil
+    }
+
+    private func pendingOperation(_ id: UUID) -> CloudRuleOperation? {
+        cloudSession?.ledger.pending.first { operation in
+            operation.deletions.contains(id) || operation.upserts.contains(where: { $0.id == id })
+                || operation.plan?.ruleIDs.contains(id) == true
+        }
+    }
+
+    private func interruptedOperation(_ id: UUID) -> CloudRuleOperation? {
+        pendingOperation(id).flatMap { $0.interrupted ? $0 : nil }
+    }
+
+    private func assertWritable(_ scope: Set<UUID>, eventRuleIDs: Set<UUID> = []) throws {
+        guard loaded, cloudReady, !cloudResetPending, !awaitingLocalRecovery else {
+            throw RuleOperationError(L10n.text("規則尚未與 iCloud 核對，暫未更動行事曆。", "Rules have not been verified with iCloud. No calendar events changed."))
+        }
+        guard scope.allSatisfy({ freezeReason($0) == nil && pendingOperation($0) == nil }) else {
+            throw RuleOperationError(L10n.text("此次操作包含凍結或等待完成的規則，未更動行事曆。", "This action includes frozen or pending rules. No calendar events changed."))
+        }
+        if let session = cloudSession,
+           session.ledger.rules.contains(where: { eventRuleIDs.contains($0.rule.id) && $0.rule.hasApplied && $0.prior == nil }) {
+            throw RuleOperationError(L10n.text("無法確認舊版的套用紀錄，不能安全地重新建立或移除事件。", "The previous update record is unavailable. Events cannot safely be recreated or removed."))
+        }
+    }
+
+    private var accountsSeen: Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: "rules.cloudAccountsSeen") ?? [])
+    }
+
+    private func recordAccountSeen(_ account: String) {
+        UserDefaults.standard.set(Array(accountsSeen.union([account])).sorted(), forKey: "rules.cloudAccountsSeen")
+    }
+
+    private func orphanProtectedIDs() throws -> Set<UUID> {
+        guard cloudReady, !cloudResetPending else {
+            throw RuleOperationError(L10n.text("請等 iCloud 規則和刪除紀錄載入後再搜尋。", "Wait for iCloud rules and deletion records before searching."))
+        }
+        guard (!hasCloudAccount || cloudSession != nil), accountsSeen.count <= 1, !awaitingLocalRecovery else {
+            throw RuleOperationError(L10n.text("無法確認所有規則的帳號範圍，現在不能安全清除遺留事件。", "The account scope of these rules cannot be verified. Leftover events cannot safely be removed now."))
+        }
+        var protected = Set(snapshot.rules.map(\.id))
+        if let ledger = cloudSession?.ledger {
+            protected.formUnion(ledger.tombstones)
+            for pending in ledger.pending { protected.formUnion(pending.scope) }
+        }
+        return protected
+    }
+
+    private func saveDraft(_ rule: Rule, account: String) {
+        if let data = try? JSONEncoder().encode(rule) {
+            UserDefaults.standard.set(data, forKey: "rules.cloudDraft.\(account).\(rule.id)")
+        }
+    }
+
+    /// The sole EventKit mutation entry point for user-initiated rule changes.
+    private func performMutation(_ proposed: RuleSnapshot, scope: Set<UUID>,
+                                 desired: [PlannedOccurrence] = [], previous: [PlannedOccurrence] = [],
+                                 eventRuleIDs: Set<UUID> = [], removal: [CalendarRemovalEvent]? = nil) async throws {
+        guard !cloudBusy, !cloudRefreshing else {
+            throw RuleOperationError(L10n.text("iCloud 正在核對規則，請稍候重試。", "iCloud is checking rules. Try again shortly."))
+        }
+        // A new child is not in the visible tree until the server commits it. Reserve
+        // its ancestor too so a concurrent parent change cannot miss that new child.
+        var lockScope = scope
+        let ancestry = Dictionary(uniqueKeysWithValues: snapshot.rules.map { ($0.id, $0) })
+            .merging(Dictionary(uniqueKeysWithValues: proposed.rules.map { ($0.id, $0) })) { _, new in new }
+        for id in scope {
+            var cursor = ancestry[id]?.parent
+            while let ancestor = cursor, lockScope.insert(ancestor).inserted { cursor = ancestry[ancestor]?.parent }
+        }
+        try assertWritable(lockScope, eventRuleIDs: eventRuleIDs)
+        cloudBusy = true
+        defer {
+            cloudBusy = false
+            if cloudResetPending { Task { await load() } }
+        }
+        try proposed.preflightWrite()
+        let attemptID = UUID()
+        defer { cloud.endLocalExecution(attemptID) }
+        let eventPlan: CalendarSyncPlan?
+        do {
+            eventPlan = try eventRuleIDs.isEmpty ? nil : calendar.prepareSyncPlan(
+                desired: desired, previous: previous, ruleIDs: eventRuleIDs, attemptID: attemptID, matchingRemoval: removal
+            )
+        } catch CalendarIntegrationError.missingEvent where cloudSession != nil {
+            throw RuleOperationError(L10n.text("正在等待行事曆同步，請在舊事件可見後重試。未更動行事曆。", "Wait for Calendar to sync the existing events and try again. No calendar events changed."))
+        }
+        let before = Dictionary(uniqueKeysWithValues: snapshot.rules.map { ($0.id, $0.target) })
+        let after = Dictionary(uniqueKeysWithValues: proposed.rules.map { ($0.id, $0.target) })
+        let locations = before.merging(after) { _, new in new }
+        let removalGuard = try eventPlan.map { try calendar.syncRemovalGuard(for: $0, destinations: locations) }
+        if let session = cloudSession {
+            let deletion = scope.subtracting(Set(proposed.rules.map(\.id)))
+            let old = Dictionary(uniqueKeysWithValues: session.ledger.rules.map { ($0.rule.id, $0) })
+            let envelopes = try proposed.rules.filter { scope.contains($0.id) }.map { rule in
+                let destination = rule.target.isEmpty ? old[rule.id]?.destination :
+                    try calendar.syncDestination(id: rule.target, deviceID: cloud.deviceID)
+                let prior: [PlannedOccurrence]? = eventRuleIDs.contains(rule.id)
+                    ? eventPlan?.result.filter { $0.ruleID == rule.id } : (old[rule.id]?.prior ?? (rule.hasApplied ? nil : []))
+                return portable(rule, destination: destination, prior: prior)
+            }
+            let operation = CloudRuleOperation(id: attemptID, owner: cloud.deviceID, scope: lockScope,
+                                               upserts: envelopes, deletions: deletion, plan: eventPlan)
+            mergeBindings(locations.filter { scope.contains($0.key) && !$0.value.isEmpty }, account: session.accountID)
+            rememberBirthdaySources(proposed.rules.filter { scope.contains($0.id) }, account: session.accountID)
+            do {
+                let localLocations = locations.filter { scope.contains($0.key) && !$0.value.isEmpty }
+                let claimed = try await cloud.claim(operation, localBefore: previous, localAfter: desired,
+                                                    localPlan: try JSONEncoder().encode(CloudLocalWritePlan(destinations: localLocations, removalGuard: removalGuard)), in: session)
+                restoreCloud(claimed)
+                let current = try await cloud.verifyOwnership(attemptID, in: claimed)
+                guard !cloudResetPending else { throw CloudRuleError.accountChanged }
+                if let removal {
+                    let currentRemoval = try calendar.previewRemoval(previous: previous, ruleIDs: eventRuleIDs)
+                    guard currentRemoval == removal else { throw CalendarIntegrationError.removalSelectionChanged }
+                }
+                if let eventPlan { _ = try calendar.applySyncPlan(eventPlan, destinations: localLocations, removalGuard: removalGuard) }
+                try cloud.recordEventKitComplete(attemptID, in: current)
+                let completed = try await cloud.finish(attemptID, in: current)
+                restoreCloud(completed)
+            } catch {
+                if let refreshed = try? await cloud.refresh() {
+                    if refreshed.accountID == session.accountID {
+                        restoreCloud(refreshed)
+                    } else {
+                        cloudResetPending = true
+                        cloudReady = false
+                    }
+                }
+                throw error
+            }
+        } else {
+            guard try await cloud.refresh() == nil, !cloudResetPending else {
+                cloudReady = false
+                cloudResetPending = true
+                throw RuleOperationError(L10n.text("iCloud 帳號已變更，未更動行事曆。請重試。", "The iCloud account changed. No calendar events changed. Try again."))
+            }
+            if let eventPlan {
+                var journal = LocalRuleWriteJournal(plan: eventPlan, destinations: locations, proposed: proposed,
+                                                    removalGuard: removalGuard)
+                try journal.write(localOnly: hasCloudAccount)
+                awaitingLocalRecovery = true
+                let result = try calendar.applySyncPlan(eventPlan, destinations: locations, removalGuard: removalGuard)
+                try finishLocal(&journal, occurrences: result)
+            } else {
+                try proposed.write(localOnly: hasCloudAccount)
+                snapshot = proposed
+            }
+        }
+    }
+
+    private func finishLocal(_ journal: inout LocalRuleWriteJournal, occurrences: [PlannedOccurrence]) throws {
+        let scope = journal.plan.ruleIDs
+        var result = journal.proposed
+        result.occurrences.removeAll { scope.contains($0.ruleID) }
+        result.occurrences += occurrences
+        var zeros = result.knownEmptyRuleIDs ?? []
+        zeros.subtract(scope)
+        let nonempty = Set(occurrences.map(\.ruleID))
+        zeros.formUnion(result.rules.filter {
+            scope.contains($0.id) && $0.hasApplied && !nonempty.contains($0.id)
+        }.map(\.id))
+        result.knownEmptyRuleIDs = zeros
+        // Persist confirmation before any further disk operation. If saving the rules
+        // fails we can redo only that part without replaying EventKit.
+        journal.proposed = result
+        journal.eventKitComplete = true
+        try journal.write(localOnly: hasCloudAccount)
+        try result.write(localOnly: hasCloudAccount)
+        try LocalRuleWriteJournal.clear(localOnly: hasCloudAccount)
+        awaitingLocalRecovery = false
+        snapshot = result
+    }
+
+    private func recoverLocal() async {
+        do {
+            guard var journal = try LocalRuleWriteJournal.read(localOnly: hasCloudAccount) else {
+                awaitingLocalRecovery = false
+                return
+            }
+            awaitingLocalRecovery = true
+            guard !cloudResetPending else { return }
+            if journal.eventKitComplete {
+                try finishLocal(&journal, occurrences: journal.proposed.occurrences.filter { journal.plan.ruleIDs.contains($0.ruleID) })
+            } else {
+                let result = try calendar.applySyncPlan(journal.plan, destinations: journal.destinations,
+                                                       recovering: true, removalGuard: journal.removalGuard)
+                try finishLocal(&journal, occurrences: result)
+            }
+        } catch {
+            cloudReadError = error.localizedDescription
+        }
+    }
+
+    private func recoverCloud(_ session: CloudRuleSession) async {
+        guard !cloudBusy, !cloudResetPending,
+              let journal = cloud.recoverableJournal(in: session) else { return }
+        cloudBusy = true
+        defer { cloudBusy = false }
+        do {
+            let reconciled = try await cloud.resolveAcquiringJournal(in: session)
+            restoreCloud(reconciled)
+            guard let active = cloud.recoverableJournal(in: reconciled) else { return }
+            if reconciled.ledger.completed.contains(active.operation.id) {
+                let complete = try await cloud.finish(active.operation.id, in: reconciled)
+                restoreCloud(complete)
+                return
+            }
+            try cloud.clearSupersededJournal(in: reconciled)
+            guard let operation = reconciled.ledger.pending.first(where: { $0.id == active.operation.id }),
+                  operation.owner == cloud.deviceID, !operation.interrupted, !cloudResetPending else { return }
+            let latest = try await cloud.verifyOwnership(operation.id, in: reconciled)
+            guard !cloudResetPending else { throw CloudRuleError.accountChanged }
+            if active.stage != .eventKitComplete {
+                if let plan = operation.plan {
+                    guard let data = active.localPlan else { throw CalendarIntegrationError.invalidPlan }
+                    let local = try JSONDecoder().decode(CloudLocalWritePlan.self, from: data)
+                    _ = try calendar.applySyncPlan(plan, destinations: local.destinations,
+                                                   recovering: true, removalGuard: local.removalGuard)
+                }
+                try cloud.recordEventKitComplete(operation.id, in: latest)
+            }
+            let complete = try await cloud.finish(operation.id, in: latest)
+            restoreCloud(complete)
+        } catch {
+            // Unknown cloud outcomes stay pending. Only a verified owner with an EventKit
+            // recovery failure can mark this attempt interrupted.
+            if let eventError = error as? CalendarIntegrationError,
+               eventError.requiresManualRecovery,
+               let latest = try? await cloud.refresh(), latest.accountID == session.accountID,
+               latest.ledger.pending.contains(where: { $0.id == journal.operation.id && $0.owner == cloud.deviceID }),
+               let frozen = try? await cloud.markInterrupted(journal.operation.id, in: latest) {
+                restoreCloud(frozen)
+            }
+            cloudReadError = error.localizedDescription
+        }
+    }
+
+    private func pendingReason(_ id: UUID) -> String? {
+        let pending = pendingOperation(id)
+        return pending != nil && pending?.interrupted == false
+            ? L10n.text("待完成", "Pending") : nil
+    }
+
+    private func refreshBeforeOrphans() async throws {
+        guard !cloudBusy, !cloudRefreshing else { throw CloudRuleError.reserved }
+        let priorAccount = cloudSession?.accountID
+        await load()
+        guard cloudSession?.accountID == priorAccount else { throw CloudRuleError.accountChanged }
+        _ = try orphanProtectedIDs()
+    }
+
+    private func verifiedBindings(_ account: String) -> [UUID: VerifiedCalendarBinding] {
+        let data = UserDefaults.standard.data(forKey: "rules.verifiedBindings." + account)
+        return data.flatMap { try? JSONDecoder().decode([UUID: VerifiedCalendarBinding].self, from: $0) } ?? [:]
+    }
+
+    private func storeVerifiedBinding(_ id: String, descriptor: CalendarSyncDestination, for rule: UUID, account: String) throws {
+        var values = verifiedBindings(account)
+        values[rule] = VerifiedCalendarBinding(id: id, descriptor: descriptor)
+        let data = try JSONEncoder().encode(values)
+        UserDefaults.standard.set(data, forKey: "rules.verifiedBindings." + account)
+        mergeBindings([rule: id], account: account)
+    }
+
+    private func inspectThaw(_ rule: Rule, destinationID: String) throws -> CloudThawProposal {
+        guard cloudReady, !cloudResetPending,
+              let session = cloudSession,
+              let entry = (session.ledger.rules.first(where: { $0.id == rule.id })
+                           ?? pendingOperation(rule.id)?.upserts.first(where: { $0.id == rule.id })) else {
+            throw CloudRuleError.unavailable
+        }
+        guard !destinationID.isEmpty else { throw CalendarIntegrationError.noDestination }
+        if let parent = rule.parent, freezeReason(parent) != nil, interruptedOperation(rule.id) == nil {
+            throw RuleOperationError(L10n.text("請先解除依據規則的凍結。", "Unfreeze the parent rule first."))
+        }
+        if let owner = entry.destination?.localOwner ?? entry.unresolvedOwner, owner != cloud.deviceID {
+            throw RuleOperationError(L10n.text("請回原 iPhone 操作本機行事曆。", "Use the original iPhone for this local calendar."))
+        }
+        let remembered = bindings(session.accountID)
+        let originallyMatched = if let descriptor = entry.destination {
+            (try? calendar.resolveSyncDestination(descriptor, rememberedID: remembered[rule.id], deviceID: cloud.deviceID)) == destinationID
+        } else {
+            entry.unresolvedOwner == cloud.deviceID && remembered[rule.id] == destinationID
+        }
+        let confirmed = originallyMatched || knownDestinations[rule.id] == destinationID
+        let descriptor: CalendarSyncDestination
+        if confirmed {
+            descriptor = try calendar.syncDestination(id: destinationID, deviceID: cloud.deviceID)
+        } else {
+            guard let previous = entry.prior, !previous.isEmpty else { throw CalendarIntegrationError.noDestination }
+            descriptor = try calendar.verifySyncRebinding(ruleID: rule.id, destinationID: destinationID,
+                                                           previous: previous, deviceID: cloud.deviceID)
+        }
+        var locations = knownDestinations
+        locations[rule.id] = destinationID
+        guard var op = interruptedOperation(rule.id) else {
+            return CloudThawProposal(descriptor: descriptor, locations: locations, operation: nil)
+        }
+        guard let original = op.plan else {
+            op.owner = cloud.deviceID
+            op.interrupted = false
+            return CloudThawProposal(descriptor: descriptor, locations: locations, operation: op)
+        }
+        // A pending addition can be missing from the active ledger. Resolve its recorded
+        // destination without substituting a default or a same-name local calendar.
+        for envelope in op.upserts where original.ruleIDs.contains(envelope.id) && locations[envelope.id] == nil {
+            if let descriptor = envelope.destination {
+                locations[envelope.id] = try calendar.resolveSyncDestination(descriptor, rememberedID: remembered[envelope.id],
+                                                                             deviceID: cloud.deviceID)
+            }
+        }
+        guard original.ruleIDs.allSatisfy({ locations[$0] != nil }) else { throw CalendarIntegrationError.noDestination }
+        func binding(_ item: PlannedOccurrence) throws -> PlannedOccurrence {
+            guard let id = locations[item.ruleID] else { throw CalendarIntegrationError.noDestination }
+            var item = item
+            item.calendarID = id
+            return item
+        }
+        var desired = try original.desired.map(binding)
+        let previous = try original.previous.map(binding)
+        if op.deletions.isEmpty,
+           let data = UserDefaults.standard.data(forKey: "rules.cloudDraft.\(session.accountID).\(rule.id)"),
+           var draft = try? JSONDecoder().decode(Rule.self, from: data) {
+            draft.target = destinationID
+            let res = try resolve(draft, allowingVerifiedRebinding: true)
+            guard res.ruleIDs.isSubset(of: original.ruleIDs) else { throw CloudRuleError.conflict }
+            desired.removeAll { res.ruleIDs.contains($0.ruleID) }
+            desired += try res.desired.map(binding)
+            for updated in res.rules where res.ruleIDs.contains(updated.id) {
+                guard let index = op.upserts.firstIndex(where: { $0.id == updated.id }) else { throw CloudRuleError.conflict }
+                let destination = updated.id == rule.id ? descriptor : op.upserts[index].destination
+                op.upserts[index] = portable(updated, destination: destination, prior: op.upserts[index].prior)
+            }
+        }
+        let recovery = try calendar.prepareSyncPlan(desired: desired, previous: previous, ruleIDs: original.ruleIDs,
+                                                    attemptID: op.id, matchingRemoval: nil, takeover: true)
+        op.owner = cloud.deviceID
+        op.plan = recovery
+        op.interrupted = false
+        for index in op.upserts.indices where recovery.ruleIDs.contains(op.upserts[index].id) {
+            if op.upserts[index].id == rule.id { op.upserts[index].destination = descriptor }
+            op.upserts[index].prior = recovery.result.filter { $0.ruleID == op.upserts[index].id }
+        }
+        return CloudThawProposal(descriptor: descriptor, locations: locations, operation: op)
+    }
+
+    private func confirmThaw(_ rule: Rule, destinationID: String, expected: CloudThawProposal) async throws {
+        guard !cloudBusy, !cloudRefreshing, let session = cloudSession else { throw CloudRuleError.unavailable }
+        cloudBusy = true
+        defer {
+            cloudBusy = false
+            if cloudResetPending { Task { await load() } }
+        }
+        let latest = try await cloud.refresh()
+        guard let latest, latest.accountID == session.accountID, !cloudResetPending else { throw CloudRuleError.accountChanged }
+        restoreCloud(latest)
+        let current = try inspectThaw(rule, destinationID: destinationID)
+        guard expected == current else { throw CalendarIntegrationError.removalSelectionChanged }
+        guard let operation = current.operation else {
+            try storeVerifiedBinding(destinationID, descriptor: current.descriptor, for: rule.id, account: latest.accountID)
+            restoreCloud(latest)
+            return
+        }
+        defer { cloud.endLocalExecution(operation.id) }
+        let removalGuard = try operation.plan.map { try calendar.syncRemovalGuard(for: $0, destinations: current.locations) }
+        let local = CloudLocalWritePlan(destinations: current.locations.filter { operation.scope.contains($0.key) }, removalGuard: removalGuard)
+        let claimed = try await cloud.takeOver(operation, localBefore: [], localAfter: [],
+                                               localPlan: try JSONEncoder().encode(local), in: latest)
+        restoreCloud(claimed)
+        let verified = try await cloud.verifyOwnership(operation.id, in: claimed)
+        guard !cloudResetPending else { throw CloudRuleError.accountChanged }
+        if let plan = operation.plan {
+            _ = try calendar.applySyncPlan(plan, destinations: current.locations, removalGuard: removalGuard)
+        }
+        try cloud.recordEventKitComplete(operation.id, in: verified)
+        let done = try await cloud.finish(operation.id, in: verified)
+        try storeVerifiedBinding(destinationID, descriptor: current.descriptor, for: rule.id, account: done.accountID)
+        UserDefaults.standard.removeObject(forKey: "rules.cloudDraft.\(done.accountID).\(rule.id)")
+        restoreCloud(done)
+    }
+
+    private func resolve(_ input: Rule, allowingVerifiedRebinding: Bool = false) throws -> RuleReconciliation {
         guard loaded else { throw RuleOperationError(L10n.text("規則尚未讀取，請返回列表後重試。", "Rules have not loaded yet. Return to the list and try again.")) }
         var rule = input
         rule.name = rule.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -820,13 +1507,16 @@ private struct RulesHome: View {
         }
         if let parent = snapshot.rules.first(where: { $0.id == rule.parent }) {
             guard parent.hasApplied else { throw RuleOperationError(L10n.text("請先套用依據規則。", "Apply the parent rule first.")) }
-            rule.target = parent.target
+            if !allowingVerifiedRebinding {
+                let existing = snapshot.rules.first { $0.id == rule.id }
+                rule.target = existing?.hasApplied == true ? (existing?.target ?? "") : parent.target
+            }
             rule.category = parent.category
             rule.subcategory = parent.subcategory
         }
         guard !rule.target.isEmpty else { throw RuleOperationError(L10n.text("目的行事曆為必填。請返回規則主頁，先連接行事曆並選擇目的地。", "A destination calendar is required. Return to the rule, connect Calendar, and choose a destination.")) }
         if let saved = snapshot.rules.first(where: { $0.id == rule.id }),
-           saved.hasApplied && saved.target != rule.target {
+           saved.hasApplied && saved.target != rule.target && !allowingVerifiedRebinding {
             throw RuleOperationError(L10n.text("這條規則已套用，不能更換目的行事曆。", "This rule has already been applied. Its destination calendar cannot be changed."))
         }
         rule.hasApplied = true
@@ -889,27 +1579,23 @@ private struct RulesHome: View {
         }
     }
 
-    private func apply(_ rule: Rule) throws -> Rule {
-        let plan = try resolve(rule)
-        var updated = snapshot
-        updated.rules = plan.rules
-        updated.occurrences.removeAll { plan.ruleIDs.contains($0.ruleID) }
+    private func apply(_ rule: Rule, expected: Rule?) async throws -> Rule {
+        let account = cloudSession?.accountID
         do {
-            var staging = updated
-            staging.occurrences += plan.desired
-            try staging.preflightWrite()
+            guard snapshot.rules.first(where: { $0.id == rule.id }) == expected else {
+                throw CloudRuleError.conflict
+            }
+            let plan = try resolve(rule)
+            var updated = snapshot
+            updated.rules = plan.rules
+            try await performMutation(updated, scope: plan.ruleIDs, desired: plan.desired,
+                                      previous: plan.previous, eventRuleIDs: plan.ruleIDs)
+            if let account { UserDefaults.standard.removeObject(forKey: "rules.cloudDraft.\(account).\(rule.id)") }
+            return snapshot.rules.first { $0.id == rule.id } ?? rule
         } catch {
-            throw RuleOperationError(L10n.text("裝置目前無法儲存規則。未變更行事曆，請確認裝置空間後再試。", "The rule could not be saved. Calendar was not changed. Check available storage and try again."))
+            if let account { saveDraft(rule, account: account) }
+            throw error
         }
-        let committed = try calendar.apply(desired: plan.desired, previous: plan.previous, ruleIDs: plan.ruleIDs)
-        updated.occurrences += committed
-        do {
-            try updated.write()
-        } catch {
-            throw RuleOperationError(L10n.text("行事曆已寫入，但規則未能儲存。請先檢查裝置空間與行事曆，不要重複套用。\n\(error.localizedDescription)", "Calendar was updated, but the rule could not be saved. Check available storage and your calendar before applying again.\n\(error.localizedDescription)"))
-        }
-        snapshot = updated
-        return updated.rules.first { $0.id == rule.id } ?? rule
     }
 
     private func batchPlan(_ edit: BatchEdit) throws -> (plan: RuleReconciliation, rows: [BatchDurationRule]) {
@@ -978,31 +1664,15 @@ private struct RulesHome: View {
         return try calendar.preview(desired: plan.desired, previous: plan.previous, ruleIDs: plan.ruleIDs)
     }
 
-    private func applyBatch(_ edit: BatchEdit) throws {
+    private func applyBatch(_ edit: BatchEdit) async throws {
+        let scope = try selectedTreeIDs(edit.ruleIDs)
+        try assertWritable(scope)
         let plan = try batchPlan(edit).plan
         if plan.rules == snapshot.rules, try batchCalendarChanges(plan).isEmpty { return }
         var updated = snapshot
         updated.rules = plan.rules
-        if !plan.ruleIDs.isEmpty {
-            do {
-                var staging = updated
-                staging.occurrences += plan.desired
-                try staging.preflightWrite()
-            } catch {
-                throw RuleOperationError(L10n.text("不能儲存規則，行事曆沒有變更。請確認裝置空間後再試。", "The rules could not be saved. Calendar was not changed. Check available storage and try again."))
-            }
-            let committed = try calendar.apply(desired: plan.desired, previous: plan.previous, ruleIDs: plan.ruleIDs)
-            updated.occurrences.removeAll { plan.ruleIDs.contains($0.ruleID) }
-            updated.occurrences += committed
-        }
-        do {
-            try updated.write()
-        } catch {
-            throw RuleOperationError(plan.ruleIDs.isEmpty
-                ? L10n.text("不能儲存規則，行事曆沒有變更。請確認裝置空間後再試。", "The rules could not be saved. Calendar was not changed. Check available storage and try again.")
-                : L10n.text("行事曆已寫入，但規則未能儲存。請先檢查裝置空間與行事曆，不要重複套用。", "Calendar was updated, but the rules could not be saved. Check available storage and your calendar before applying again."))
-        }
-        snapshot = updated
+        try await performMutation(updated, scope: scope, desired: plan.desired,
+                                  previous: plan.previous, eventRuleIDs: plan.ruleIDs)
     }
 
     private var batchCategories: [BatchCategoryOption] {
@@ -1036,6 +1706,7 @@ private struct RulesHome: View {
         let rules = try removalRows(selected, allowChild: allowChild)
         let ids = Set(rules.map(\.id))
         let appliedIDs = Set(snapshot.rules.filter { ids.contains($0.id) && $0.hasApplied }.map(\.id))
+        try assertWritable(ids, eventRuleIDs: appliedIDs)
         let previous = snapshot.occurrences.filter { appliedIDs.contains($0.ruleID) }
         if allowChild {
             let details = try calendar.previewBranchRemoval(previous: previous, ruleIDs: appliedIDs)
@@ -1054,31 +1725,21 @@ private struct RulesHome: View {
         return ruleTreeRows(roots: roots, rules: snapshot.rules)
     }
 
-    private func removeSelected(_ selected: Set<UUID>, _ expected: BatchRemovalPreview) throws {
-        try removeSelected(selected, expected, allowChild: false)
+    private func removeSelected(_ selected: Set<UUID>, _ expected: BatchRemovalPreview) async throws {
+        try await removeSelected(selected, expected, allowChild: false)
     }
 
-    private func removeSelected(_ selected: Set<UUID>, _ expected: BatchRemovalPreview, allowChild: Bool) throws {
-        let current = try previewRemoval(selected, allowChild: allowChild)
-        guard current.rules == expected.rules, current.events == expected.events else { throw CalendarIntegrationError.removalSelectionChanged }
+    private func removeSelected(_ selected: Set<UUID>, _ expected: BatchRemovalPreview, allowChild: Bool) async throws {
         let ids = Set(expected.rules.map(\.id))
         let appliedIDs = Set(snapshot.rules.filter { ids.contains($0.id) && $0.hasApplied }.map(\.id))
+        try assertWritable(ids, eventRuleIDs: appliedIDs)
+        let current = try previewRemoval(selected, allowChild: allowChild)
+        guard current.rules == expected.rules, current.events == expected.events else { throw CalendarIntegrationError.removalSelectionChanged }
         var updated = snapshot
         updated.rules.removeAll { ids.contains($0.id) }
         updated.occurrences.removeAll { ids.contains($0.ruleID) }
-        if !appliedIDs.isEmpty {
-            try updated.preflightWrite()
-            let previous = snapshot.occurrences.filter { appliedIDs.contains($0.ruleID) }
-            try calendar.applyRemoval(previous: previous, ruleIDs: appliedIDs, matching: expected.events)
-        }
-        do {
-            try updated.write()
-        } catch {
-            throw RuleOperationError(appliedIDs.isEmpty
-                ? L10n.text("未能移除規則。請確認裝置空間後重試。", "The rules could not be removed. Check available storage and try again.")
-                : L10n.text("已處理行事曆，但無法儲存本機規則。請保留畫面並先確認裝置空間。", "Calendar was updated, but the local rules could not be saved. Keep this screen open and check available storage."))
-        }
-        snapshot = updated
+        try await performMutation(updated, scope: ids, previous: snapshot.occurrences.filter { appliedIDs.contains($0.ruleID) },
+                                  eventRuleIDs: appliedIDs, removal: expected.events)
     }
 
     private func birthdayStatus(_ candidate: BirthdayCandidate) -> BirthdayDuplicateStatus {
@@ -1105,7 +1766,7 @@ private struct RulesHome: View {
     }
 
     private func importBirthdays(_ candidates: [BirthdayCandidate], years: Int, target: String, applyNow: Bool,
-                                 category: String, subcategory: String, preferNickname: Bool) throws {
+                                 category: String, subcategory: String, preferNickname: Bool) async throws {
         guard loaded, (1...999).contains(years), !candidates.isEmpty else {
             throw RuleOperationError(L10n.text("請選擇要匯入的生日並填寫有效的期間。", "Select birthdays to import and enter a valid repeat period."))
         }
@@ -1168,26 +1829,8 @@ private struct RulesHome: View {
             imported.append(rule)
         }
         updated.rules.append(contentsOf: imported)
-        if applyNow {
-            do {
-                var staging = updated
-                staging.occurrences += planned
-                try staging.preflightWrite()
-            } catch {
-                throw RuleOperationError(L10n.text("無法儲存匯入的規則，行事曆沒有變更。請確認裝置空間。", "The imported rules could not be saved. Calendar was not changed. Check available storage."))
-            }
-            let ids = Set(imported.map(\.id))
-            _ = try calendar.preview(desired: planned, previous: [], ruleIDs: ids)
-            updated.occurrences += try calendar.apply(desired: planned, previous: [], ruleIDs: ids)
-        }
-        do {
-            try updated.write()
-        } catch {
-            throw RuleOperationError(applyNow
-                ? L10n.text("已寫入行事曆，但本機規則未能儲存。請先確認裝置空間及行事曆，不要重複匯入。", "Calendar was updated, but the local rules could not be saved. Check available storage and your calendar before importing again.")
-                : L10n.text("未能儲存匯入的生日，行事曆沒有變更。請確認裝置空間後重試。", "The imported birthdays could not be saved. Calendar was not changed. Check available storage and try again."))
-        }
-        snapshot = updated
+        let ids = Set(imported.map(\.id))
+        try await performMutation(updated, scope: ids, desired: planned, eventRuleIDs: applyNow ? ids : [])
         if !applyNow, imported.count == 1, let only = imported.first {
             path.append(.edit(only, isNew: true))
         }
@@ -1315,13 +1958,15 @@ private struct RulesHome: View {
                 .background(rule.displayAppearance.tint(or: slate).opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
                 .accessibilityHidden(true)
             let next = snapshot.occurrences.lazy.filter { $0.ruleID == rule.id && $0.start > Date() }.min { $0.start < $1.start }
-            let status = rule.hasApplied
+            let status = freezeReason(rule.id).map { L10n.text("凍結：", "Frozen: ") + $0 }
+                ?? pendingReason(rule.id)
+                ?? (rule.hasApplied
                 ? next.map { occurrence in
                     let civil = occurrence.isAllDay ? gregorianCalendar : RuleEngine.civilCalendar(for: rule)
                     let day = L10n.text("下次 ", "Next: ") + dateCaption(occurrence.start, calendar: civil)
                     return occurrence.isAllDay ? day : "\(day) \(timeCaption(occurrence.start, calendar: civil))"
                 } ?? L10n.text("無後續日期", "No Upcoming Date")
-                : L10n.text("未套用", "Not Applied")
+                : L10n.text("未套用", "Not Applied"))
             let layout = dynamicTypeSize.isAccessibilitySize
                 ? AnyLayout(VStackLayout(alignment: .leading, spacing: 6))
                 : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: 10))
@@ -1391,13 +2036,14 @@ private struct RulesHome: View {
 private struct AppearanceEditSheet: View {
     let title: String
     let defaultSymbol: String
-    let onSave: (RuleAppearance) throws -> Void
+    let onSave: (RuleAppearance) async throws -> Void
+    @State private var saving = false
     @State private var choice: RuleAppearance
     @State private var failure: String?
     @Environment(\.dismiss) private var dismiss
 
     init(title: String, initial: RuleAppearance, defaultSymbol: String,
-         onSave: @escaping (RuleAppearance) throws -> Void) {
+         onSave: @escaping (RuleAppearance) async throws -> Void) {
         self.title = title
         self.defaultSymbol = defaultSymbol
         self.onSave = onSave
@@ -1418,13 +2064,18 @@ private struct AppearanceEditSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(L10n.text("完成", "Done")) {
-                        do {
-                            try onSave(choice)
-                            dismiss()
-                        } catch {
-                            failure = error.localizedDescription
+                        guard !saving else { return }
+                        saving = true
+                        let value = choice
+                        Task { @MainActor in
+                            defer { saving = false }
+                            do {
+                                try await onSave(value)
+                                dismiss()
+                            } catch { failure = error.localizedDescription }
                         }
                     }
+                    .disabled(saving)
                 }
             }
             .alert(L10n.text("無法儲存外觀", "Could Not Save Appearance"), isPresented: Binding(
@@ -1473,21 +2124,27 @@ private struct RuleEditor: View {
     private let isFreshRule: Bool
     @ObservedObject var calendar: CalendarIntegration
     let preview: (Rule) throws -> RuleEventPreviewResult
-    let onApply: (Rule) throws -> Rule
+    let onApply: (Rule, Rule?) async throws -> Rule
     let onApplied: () -> Void
     let previewDeletion: (UUID) throws -> BatchRemovalPreview
-    let onDelete: (UUID, BatchRemovalPreview) throws -> Void
+    let onDelete: (UUID, BatchRemovalPreview) async throws -> Void
     let onDeleted: () -> Void
-    let onSaveAppearance: (UUID, RuleAppearance) throws -> Bool
+    let onSaveAppearance: (UUID, RuleAppearance) async throws -> Bool
+    let frozenReason: String?
+    let hiddenRuleIDs: Set<UUID>
+    let onThaw: (() -> Void)?
+    @State private var applying = false
+    @State private var compareBaseline: Rule?
     let onOpenChild: (Rule, Bool) -> Void
 
     init(initial: Rule, isNew: Bool, parent: Rule?, allRules: [Rule], calendar: CalendarIntegration,
-         preview: @escaping (Rule) throws -> RuleEventPreviewResult, onApply: @escaping (Rule) throws -> Rule,
+         preview: @escaping (Rule) throws -> RuleEventPreviewResult, onApply: @escaping (Rule, Rule?) async throws -> Rule,
          onApplied: @escaping () -> Void,
          previewDeletion: @escaping (UUID) throws -> BatchRemovalPreview,
-         onDelete: @escaping (UUID, BatchRemovalPreview) throws -> Void,
+         onDelete: @escaping (UUID, BatchRemovalPreview) async throws -> Void,
          onDeleted: @escaping () -> Void,
-         onSaveAppearance: @escaping (UUID, RuleAppearance) throws -> Bool,
+         onSaveAppearance: @escaping (UUID, RuleAppearance) async throws -> Bool,
+         frozenReason: String?, hiddenRuleIDs: Set<UUID>, onThaw: (() -> Void)?,
          onOpenChild: @escaping (Rule, Bool) -> Void) {
         let isFresh = isNew && !allRules.contains { $0.id == initial.id }
         self.isFreshRule = isFresh
@@ -1501,6 +2158,7 @@ private struct RuleEditor: View {
         _followsCategoryDestination = State(initialValue: isFresh && parent == nil && initial.target.isEmpty)
         _rule = State(initialValue: startingRule)
         _baseline = State(initialValue: isNew ? nil : initial)
+        _compareBaseline = State(initialValue: isFresh ? nil : initial)
         _exitBaseline = State(initialValue: startingRule)
         self.parent = parent
         self.allRules = allRules
@@ -1512,6 +2170,9 @@ private struct RuleEditor: View {
         self.onDelete = onDelete
         self.onDeleted = onDeleted
         self.onSaveAppearance = onSaveAppearance
+        self.frozenReason = frozenReason
+        self.hiddenRuleIDs = hiddenRuleIDs
+        self.onThaw = onThaw
         self.onOpenChild = onOpenChild
     }
 
@@ -1554,14 +2215,17 @@ private struct RuleEditor: View {
         guard followsCategoryDestination else { return "" }
         return categoryCalendarPresets(rules: allRules, destinations: calendar.destinations)[trimmedCategory] ?? ""
     }
-    private var destinationID: String { parent?.target ?? (followsCategoryDestination ? suggestedDestinationID : rule.target) }
+    private var destinationID: String {
+        if rule.hasApplied { return rule.target }
+        return parent?.target ?? (followsCategoryDestination ? suggestedDestinationID : rule.target)
+    }
     private var previewRule: Rule {
         var submitted = rule
         submitted.target = destinationID
         return submitted
     }
     private var hasDestination: Bool { calendar.destinations.contains { $0.id == destinationID && $0.isWritable } }
-    private var canApply: Bool { hasTitle && (parent != nil || !trimmedCategory.isEmpty) && hasDestination }
+    private var canApply: Bool { frozenReason == nil && !applying && hasTitle && (parent != nil || !trimmedCategory.isEmpty) && hasDestination }
     private var isDestinationLocked: Bool { parent != nil || baseline?.hasApplied == true }
     private var chosenDestination: String {
         let id = destinationID
@@ -1592,6 +2256,7 @@ private struct RuleEditor: View {
 
     var body: some View {
         Form {
+            Group {
             if let parent {
                 Section {
                     LabeledContent(L10n.text("依據規則", "Parent Rule"), value: parent.displayName)
@@ -1675,12 +2340,14 @@ private struct RuleEditor: View {
                         .accessibilityIdentifier("single-event-hours")
                 }
             } header: { Text(L10n.text("單次事件", "Each Event")) }
+            }
+            .disabled(frozenReason != nil)
 
             Section {
                 if children.isEmpty {
                     Text(L10n.text("尚無子規則", "No Child Rules Yet")).foregroundStyle(.secondary)
                 }
-                ForEach(visibleTreeRows) { row in
+                ForEach(visibleTreeRows.filter { !hiddenRuleIDs.contains($0.id) }) { row in
                     treeRow(row)
                 }
                 Button {
@@ -1691,11 +2358,11 @@ private struct RuleEditor: View {
                 } label: {
                     Label(L10n.text("新增子規則", "Add Child Rule"), systemImage: "plus")
                 }
-                .disabled(baseline == nil)
+                .disabled(baseline == nil || frozenReason != nil)
             } header: { Text(L10n.text("子規則", "Child Rules")) }
               footer: { Text(baseline == nil ? L10n.text("先套用這條規則，才能新增它的子規則。", "Apply this rule before adding child rules.") : L10n.text("可編輯直接子規則；縮排的下游項目僅供查看。", "You can edit direct child rules here. Deeper levels are shown for reference.")) }
             EventPreview(rule: previewRule, savedRules: allRules, civilCalendar: ruleCalendar, load: preview)
-            if !isFreshRule {
+            if !isFreshRule && frozenReason == nil {
                 Section {
                     Button { showingDeletion = true } label: {
                         Label(L10n.text("刪除規則", "Delete Rule"), systemImage: "trash")
@@ -1711,16 +2378,29 @@ private struct RuleEditor: View {
         .onChange(of: rule.suggestedCategory) { _, suggestion in
             if followsSuggestedCategory { rule.category = suggestion ?? "" }
         }
+        .disabled(applying)
+        .safeAreaInset(edge: .top) {
+            if let frozenReason {
+                HStack {
+                    Label(frozenReason, systemImage: "lock")
+                    Spacer()
+                    if let onThaw {
+                        Button(L10n.text("解除凍結", "Unfreeze"), action: onThaw)
+                    }
+                }.font(.footnote).padding().background(.regularMaterial)
+            }
+        }
         .navigationTitle(baseline == nil ? L10n.text("新增規則", "New Rule") : L10n.text("編輯規則", "Edit Rule"))
         .sheet(isPresented: $editingAppearance) {
             AppearanceEditSheet(title: rule.displayName, initial: rule.displayAppearance,
                                 defaultSymbol: rule.defaultSymbol) { appearance in
                 let value = appearance.isDefault ? nil : appearance
                 guard rule.appearance != value else { return }
-                let alreadySaved = try onSaveAppearance(rule.id, appearance)
+                let alreadySaved = try await onSaveAppearance(rule.id, appearance)
                 rule.appearance = value
                 if alreadySaved {
                     baseline?.appearance = value
+                    compareBaseline?.appearance = value
                     exitBaseline.appearance = value
                 }
             }
@@ -1753,7 +2433,7 @@ private struct RuleEditor: View {
         }) {
             RuleDeletionPreview(civilCalendar: ruleCalendar, hasUnsavedChanges: hasUnsavedChanges,
                                 load: { try previewDeletion(rule.id) }) { expected in
-                try onDelete(rule.id, expected)
+                try await onDelete(rule.id, expected)
                 didDelete = true
                 showingDeletion = false
             }
@@ -1823,19 +2503,25 @@ private struct RuleEditor: View {
 
     private func applyAndReturn() {
         guard canApply else {
-            operationError = missingRequiredPrompt
+            operationError = frozenReason ?? missingRequiredPrompt
             return
         }
-        do {
-            var submitted = rule
-            submitted.target = destinationID
-            let saved = try onApply(submitted)
-            rule = saved
-            baseline = saved
-            exitBaseline = saved
-            onApplied()
-        } catch {
-            operationError = error.localizedDescription
+        applying = true
+        var submitted = rule
+        submitted.target = destinationID
+        let old = compareBaseline
+        Task { @MainActor in
+            defer { applying = false }
+            do {
+                let saved = try await onApply(submitted, old)
+                rule = saved
+                baseline = saved
+                compareBaseline = saved
+                exitBaseline = saved
+                onApplied()
+            } catch {
+                operationError = error.localizedDescription
+            }
         }
     }
 
@@ -2337,7 +3023,8 @@ private struct RuleDeletionPreview: View {
     let civilCalendar: Calendar
     let hasUnsavedChanges: Bool
     let load: () throws -> BatchRemovalPreview
-    let remove: (BatchRemovalPreview) throws -> Void
+    let remove: (BatchRemovalPreview) async throws -> Void
+    @State private var removing = false
     @Environment(\.dismiss) private var dismiss
     @State private var preview: BatchRemovalPreview?
     @State private var failure: String?
@@ -2405,7 +3092,7 @@ private struct RuleDeletionPreview: View {
                         .frame(maxWidth: .infinity, minHeight: 44)
                     Button(L10n.text("確認刪除", "Confirm Deletion"), role: .destructive, action: confirm)
                         .frame(maxWidth: .infinity, minHeight: 44)
-                        .disabled(preview == nil)
+                        .disabled(preview == nil || removing)
                         .accessibilityIdentifier("confirm-delete-rule")
                 }
                 .font(.body.weight(.semibold))
@@ -2427,19 +3114,17 @@ private struct RuleDeletionPreview: View {
     }
 
     private func confirm() {
-        guard let preview else { return }
-        do {
-            try remove(preview)
-        } catch {
-            self.preview = nil
-            failure = error.localizedDescription
-            if let calendarError = error as? CalendarIntegrationError {
-                switch calendarError {
-                case .writeFailed: canReload = false
-                default: canReload = true
-                }
-            } else {
-                canReload = false
+        guard let preview, !removing else { return }
+        removing = true
+        Task { @MainActor in
+            defer { removing = false }
+            do { try await remove(preview) }
+            catch {
+                self.preview = nil
+                failure = error.localizedDescription
+                if let calendarError = error as? CalendarIntegrationError, case .writeFailed = calendarError {
+                    canReload = false
+                } else { canReload = true }
             }
         }
     }
@@ -2564,6 +3249,7 @@ struct CalendarDestinationField: View {
 }
 
 private struct CalStitchSettingsView: View {
+    @Binding var hideFrozen: Bool
     @AppStorage("settings.defaultTimeZoneIdentifier") private var overrideIdentifier = ""
 
     private var installedVersion: String {
@@ -2592,6 +3278,10 @@ private struct CalStitchSettingsView: View {
                     Text(L10n.text("版本", "Version"))
                 }
                 .accessibilityIdentifier("installed-version")
+            }
+
+            Section {
+                Toggle(L10n.text("隱藏凍結的規則", "Hide Frozen Rules"), isOn: $hideFrozen)
             }
 
             Section {
@@ -2819,7 +3509,9 @@ struct SelectionMark: View {
 
 private struct OrphanCleanupView: View {
     @ObservedObject var calendar: CalendarIntegration
-    let existingRuleIDs: () -> Set<UUID>
+    let existingRuleIDs: () throws -> Set<UUID>
+    let beforeRemove: () async throws -> Void
+    @State private var removing = false
     @Environment(\.dismiss) private var dismiss
     @State private var preview: CalendarOrphanPreview?
     @State private var selection: Set<String> = []
@@ -2954,7 +3646,12 @@ private struct OrphanCleanupView: View {
     private func removeSelected() {
         guard let preview, !selected.isEmpty else { return }
         let items = selected
-        do {
+        guard !removing else { return }
+        removing = true
+        Task { @MainActor in
+            defer { removing = false }
+            do {
+                try await beforeRemove()
             try calendar.removeOrphans(items, from: preview, existingRuleIDs: existingRuleIDs())
             removedCount = items.count
             refresh()
@@ -2963,5 +3660,102 @@ private struct OrphanCleanupView: View {
             refresh()
             failure = error.localizedDescription
         }
+    }
+    }
+}
+
+private struct CloudThawProposal: Equatable {
+    let descriptor: CalendarSyncDestination
+    let locations: [UUID: String]
+    let operation: CloudRuleOperation?
+}
+
+private struct FrozenRuleReview: View {
+    let rule: Rule
+    @ObservedObject var calendar: CalendarIntegration
+    let interrupted: Bool
+    let inspect: (String) throws -> CloudThawProposal
+    let confirm: (String, CloudThawProposal) async throws -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var destination = ""
+    @State private var proposal: CloudThawProposal?
+    @State private var oldDeviceStopped = false
+    @State private var processing = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Text(rule.displayName).font(.headline)
+                    if interrupted {
+                        Text(L10n.text("確認原裝置已停止這次操作，且不會繼續寫入，再選正確的行事曆。", "Confirm the original device has stopped this operation and will not resume writing, then select the correct calendar."))
+                        Toggle(L10n.text("原裝置不會再寫入", "The original device will not resume writing"), isOn: $oldDeviceStopped)
+                    } else {
+                        Text(L10n.text("選定可核對的原行事曆，不會搬移或新增事件。", "Choose a calendar that can be verified as the original. This does not move or add events."))
+                    }
+                }
+                Section {
+                    if !calendar.hasFullAccess {
+                        Button(L10n.text("連接行事曆", "Connect Calendar")) {
+                            Task {
+                                do { try await calendar.connectCalendars() }
+                                catch { errorMessage = error.localizedDescription }
+                            }
+                        }
+                    }
+                    Picker(L10n.text("原行事曆", "Original Calendar"), selection: $destination) {
+                        Text(L10n.text("請選擇", "Select")).tag("")
+                        ForEach(calendar.destinations.filter(\.isWritable)) { item in Text(item.displayTitle).tag(item.id) }
+                    }
+                    Button(L10n.text("核對與預覽", "Verify and Preview")) {
+                        do { proposal = try inspect(destination); errorMessage = nil }
+                        catch { proposal = nil; errorMessage = error.localizedDescription }
+                    }.disabled(destination.isEmpty || (interrupted && !oldDeviceStopped))
+                    if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
+                }
+                if let proposal {
+                    Section(L10n.text("待執行", "Proposed Changes")) {
+                        if let mutations = proposal.operation?.plan?.mutations, !mutations.isEmpty {
+                            ForEach(Array(mutations.enumerated()), id: \.offset) { _, action in
+                                if let event = action.new ?? action.old {
+                                    let label = switch action.kind {
+                                    case .insert: L10n.text("新增", "Add")
+                                    case .update: L10n.text("更新", "Update")
+                                    case .remove: L10n.text("移除", "Remove")
+                                    }
+                                    VStack(alignment: .leading) {
+                                        Text(label + " " + event.title)
+                                        Text(dateCaption(event.start)).font(.caption)
+                                    }
+                                }
+                            }
+                        } else {
+                            Text(L10n.text("不需寫入行事曆。", "No event changes are needed."))
+                        }
+                        Button(interrupted ? L10n.text("確認接手", "Confirm Takeover") : L10n.text("確認綁定", "Confirm Calendar")) {
+                            guard !processing, !interrupted || oldDeviceStopped else { return }
+                            processing = true
+                            let id = destination
+                            Task {
+                                defer { processing = false }
+                                do { try await confirm(id, proposal); dismiss() }
+                                catch { errorMessage = error.localizedDescription; self.proposal = nil }
+                            }
+                        }
+                    }
+                }
+            }
+            .disabled(processing)
+            .onChange(of: destination) { _, _ in proposal = nil }
+            .onChange(of: oldDeviceStopped) { _, _ in proposal = nil }
+            .navigationTitle(L10n.text("解除凍結", "Unfreeze Rule"))
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(L10n.text("取消", "Cancel")) { dismiss() }.disabled(processing)
+                }
+            }
+        }
+        .interactiveDismissDisabled(processing)
     }
 }

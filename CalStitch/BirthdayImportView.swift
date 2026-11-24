@@ -106,7 +106,7 @@ struct BirthdayImportView: View {
     let categories: [BatchCategoryOption]
     let presetCalendarIDs: () -> [String: String]
     let status: (BirthdayCandidate) -> BirthdayDuplicateStatus
-    let onImport: ([BirthdayCandidate], Int, String, Bool, String, String, Bool) throws -> Void
+    let onImport: ([BirthdayCandidate], Int, String, Bool, String, String, Bool) async throws -> Void
     private let cameFromGroup: Bool
 
     private enum ImportMode: CaseIterable, Hashable {
@@ -124,6 +124,7 @@ struct BirthdayImportView: View {
     @State private var errorMessage: String?
     @State private var calendarError: String?
     @State private var connecting = false
+    @State private var isImporting = false
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -143,7 +144,7 @@ struct BirthdayImportView: View {
          calendar: CalendarIntegration, categories: [BatchCategoryOption],
          presetCalendarIDs: @escaping () -> [String: String],
          status: @escaping (BirthdayCandidate) -> BirthdayDuplicateStatus,
-         onImport: @escaping ([BirthdayCandidate], Int, String, Bool, String, String, Bool) throws -> Void) {
+         onImport: @escaping ([BirthdayCandidate], Int, String, Bool, String, String, Bool) async throws -> Void) {
         self.calendar = calendar
         self.categories = categories
         self.presetCalendarIDs = presetCalendarIDs
@@ -301,15 +302,17 @@ struct BirthdayImportView: View {
                             .frame(maxWidth: .infinity, minHeight: 32)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!canImport)
+                    .disabled(!canImport || isImporting)
                     .accessibilityIdentifier("confirm-birthday-import")
                 }
             }
+            .disabled(isImporting)
             .navigationTitle(L10n.text("匯入生日", "Import Birthdays"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(L10n.text("取消", "Cancel")) { dismiss() }
+                        .disabled(isImporting)
                 }
             }
             .background {
@@ -318,6 +321,7 @@ struct BirthdayImportView: View {
                     .accessibilityHidden(true)
             }
         }
+        .interactiveDismissDisabled(isImporting)
     }
 
     @ViewBuilder
@@ -420,13 +424,23 @@ struct BirthdayImportView: View {
     }
 
     private func performImport() {
-        guard canImport, let destination else { return }
+        guard canImport, !isImporting, let destination else { return }
+        let selectedCandidates = importable
+        let repeatYears = years
+        let applyNow = mode == .apply
+        let category = categoryName
+        let subcategory = subcategoryName
+        let useNickname = preferNickname
         errorMessage = nil
-        do {
-            try onImport(importable, years, destination.id, mode == .apply, categoryName, subcategoryName, preferNickname)
-            dismiss()
-        } catch {
-            errorMessage = error.localizedDescription
+        isImporting = true
+        Task { @MainActor in
+            defer { isImporting = false }
+            do {
+                try await onImport(selectedCandidates, repeatYears, destination.id, applyNow, category, subcategory, useNickname)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -622,7 +636,7 @@ struct BirthdayGroupImportView: View {
     let presetCalendarIDs: () -> [String: String]
     let status: (BirthdayCandidate) -> BirthdayDuplicateStatus
     let onChoosePeople: () -> Void
-    let onImport: ([BirthdayCandidate], Int, String, Bool, String, String, Bool) throws -> Void
+    let onImport: ([BirthdayCandidate], Int, String, Bool, String, String, Bool) async throws -> Void
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
