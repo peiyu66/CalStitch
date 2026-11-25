@@ -6,13 +6,9 @@ enum CloudRuleEnvironment: String {
     case development = "Development"
     case production = "Production"
 
-    static let current: Self = {
-        #if DEBUG
-        .development
-        #else
-        .production
-        #endif
-    }()
+    // Debug and Release are both signed for Production. Development remains
+    // identifiable for archived local state and explicit isolated tests only.
+    static let current: Self = .production
 
     /// The only unscoped cloud release, build 20, was signed for Development.
     /// Keep its durable state available only in Development; Production starts clean.
@@ -108,6 +104,50 @@ struct CloudPendingWait {
     }
 }
 
+struct RuleGroupOrderKey: Codable, Hashable, Identifiable {
+    let category: String
+    var subcategory: String? = nil
+    var id: Self { self }
+}
+
+struct RuleCompletion: Codable, Equatable {
+    static let retention: TimeInterval = 2 * 60 * 60
+    let id: UUID
+    let at: Date
+    let added: Set<UUID>
+    let modified: Set<UUID>
+    let deleted: Set<UUID>
+    // Marker identity only. No names, notes, dates of events, or local calendar identifiers.
+    let removedOccurrences: Set<String>
+
+    init(id: UUID, at: Date = .now, added: Set<UUID>, modified: Set<UUID>, deleted: Set<UUID>, plan: CalendarSyncPlan?) {
+        self.id = id
+        self.at = at
+        self.added = added
+        self.modified = modified
+        self.deleted = deleted
+        self.removedOccurrences = Set((plan?.mutations ?? []).compactMap { mutation in
+            guard mutation.kind == .remove, let old = mutation.old else { return nil }
+            return "\(old.ruleID.uuidString)/\(old.key)"
+        })
+    }
+
+    static func recent(_ records: [Self], at now: Date = .now) -> [Self] {
+        records.filter { now.timeIntervalSince($0.at) < retention }
+    }
+}
+
+struct OrphanProtection: Equatable {
+    var accountID: String?
+    var ruleIDs: Set<UUID>
+    var occurrenceIDs: Set<String>
+    var waitingForOlderWriter: Bool = false
+
+    func includes(ruleID: UUID, occurrence: String) -> Bool {
+        ruleIDs.contains(ruleID) || occurrenceIDs.contains("\(ruleID.uuidString)/\(occurrence)")
+    }
+}
+
 struct CloudRuleLedger: Codable, Equatable {
     var schema = 1
     var rules: [CloudRuleEnvelope] = []
@@ -115,11 +155,20 @@ struct CloudRuleLedger: Codable, Equatable {
     var tombstones: Set<UUID> = []
     var completed: Set<UUID> = []
     var retired: Set<UUID>? = nil // Interrupted attempt ended without replaying or applying its edits.
+    // Stored only in the dedicated order record, never in the rule ledger.
+    var groupOrder: [RuleGroupOrderKey]? = nil
+    // Missing on older writers. Explicit [] indicates that the writer supports the log.
+    var recentCompletions: [RuleCompletion]? = nil
+    var olderWriterProtectionUntil: Date? = nil
 
     func pendingOperation(_ id: UUID) -> CloudRuleOperation? { pending.first { $0.id == id } }
 
+    fileprivate var requiredSchema: Int {
+        pending.contains { $0.plan?.movedRuleIDs != nil } ? 2 : 1
+    }
+
     fileprivate func validate() throws {
-        guard schema == 1, Set(rules.map(\.id)).count == rules.count,
+        guard schema == requiredSchema, Set(rules.map(\.id)).count == rules.count,
               Set(pending.map(\.id)).count == pending.count,
               Set(rules.map(\.id)).isDisjoint(with: tombstones),
               completed.isDisjoint(with: retired ?? []) else {
@@ -139,6 +188,7 @@ struct CloudRuleLedger: Codable, Equatable {
         }
         for entry in rules + pending.flatMap(\.upserts) {
             guard entry.rule.target.isEmpty, entry.rule.birthdaySource == nil,
+                  entry.rule.birthdayMatchToken.map(BirthdayMatchToken.isCloudValue) ?? true,
                   entry.prior?.allSatisfy({ $0.ruleID == entry.id && $0.calendarID.isEmpty }) != false else {
                 throw CloudRuleError.invalidLedger
             }
@@ -146,7 +196,9 @@ struct CloudRuleLedger: Codable, Equatable {
     }
 
     private static func validPlan(_ plan: CalendarSyncPlan, operation: CloudRuleOperation) -> Bool {
-        guard plan.attemptID == operation.id, plan.ruleIDs.isSubset(of: operation.scope) else { return false }
+        guard plan.attemptID == operation.id, plan.ruleIDs.isSubset(of: operation.scope),
+              plan.movedRuleIDs.map({ !$0.isEmpty && $0.isSubset(of: Set(operation.upserts.map(\.id))) && $0.isSubset(of: plan.ruleIDs) }) ?? true
+        else { return false }
         let occurrences = plan.desired + plan.previous + plan.result + plan.mutations.flatMap {
             [$0.old, $0.new].compactMap { $0 }
         }
@@ -161,6 +213,23 @@ struct CloudRuleSession {
     let version: Data?
     let ledger: CloudRuleLedger
     var changeTag: String? = nil
+    var modificationDate: Date? = nil
+
+    func orphanProtection(at now: Date = .now) -> OrphanProtection {
+        let recent = RuleCompletion.recent(ledger.recentCompletions ?? [], at: now)
+        let untrackedRecentWrite = olderWriterProtection(at: now) != nil
+        return .init(accountID: accountID,
+                     ruleIDs: Set(ledger.rules.map(\.id)).union(ledger.pending.flatMap(\.scope)),
+                     occurrenceIDs: Set(recent.flatMap(\.removedOccurrences)), waitingForOlderWriter: untrackedRecentWrite)
+    }
+
+    func olderWriterProtection(at now: Date) -> Date? {
+        // Older installed builds can rewrite the ledger without the optional completion field.
+        if let until = ledger.olderWriterProtectionUntil, now < until { return until }
+        guard ledger.recentCompletions == nil, version != nil else { return nil }
+        let until = (modificationDate ?? now).addingTimeInterval(RuleCompletion.retention)
+        return now < until ? until : nil
+    }
 }
 
 struct CloudRuleJournal: Codable {
@@ -182,10 +251,13 @@ func takeoverReturnsToRuleList(_ operation: CloudRuleOperation?, acknowledged: C
 }
 
 enum CloudRuleError: LocalizedError {
-    case unavailable, accountChanged, conflict, ruleDeleted, reserved, interruptedRequired, notOwner, invalidLedger, tooLarge, journalPending, legacyAccountMismatch
+    case birthdayAlreadyMatched
+    case developmentRetired, unavailable, accountChanged, conflict, ruleDeleted, reserved, interruptedRequired, notOwner, invalidLedger, tooLarge, journalPending, legacyAccountMismatch
 
     var errorDescription: String? {
         switch self {
+        case .birthdayAlreadyMatched: L10n.text("已有相同生日已匯入或正在套用，請回到清單確認。", "An identical birthday is already imported or being applied. Return to the list and review.")
+        case .developmentRetired: L10n.text("開發版規則同步已停用。請改用連接正式 iCloud 的版本；行事曆未修改。", "Development rule sync has been retired. Use a build connected to production iCloud. Your calendars have not been changed.")
         case .unavailable: L10n.text("iCloud 暫時不可用，請稍後再試。", "iCloud is temporarily unavailable. Try again later.")
         case .accountChanged: L10n.text("iCloud 帳號已變更。請重新載入規則。", "The iCloud account changed. Reload the rules.")
         case .conflict: L10n.text("另一台裝置已變更規則。請重新載入並確認後再試。", "Another device changed the rules. Reload and review before trying again.")
@@ -229,6 +301,7 @@ enum CloudRuleError: LocalizedError {
     }
 
     let transport: any CloudRuleTransport
+    private let groupOrderTransport: any CloudRuleTransport
     private let stateURL: URL
     private var state: DeviceState
     private var storeError: Error?
@@ -236,16 +309,18 @@ enum CloudRuleError: LocalizedError {
     var deviceID: UUID { state.deviceID }
 
     init(transport: (any CloudRuleTransport)? = nil, stateURL: URL? = nil,
-         environment: CloudRuleEnvironment = .current, stateDirectory: URL? = nil) {
+         environment: CloudRuleEnvironment = .current, stateDirectory: URL? = nil,
+         groupOrderTransport: (any CloudRuleTransport)? = nil) {
+        self.groupOrderTransport = groupOrderTransport ?? CloudKitRuleTransport(recordName: "CalStitchGroupOrder-v1", environment: environment)
         #if DEBUG && targetEnvironment(simulator)
         if Bundle.main.bundleIdentifier == "org.peiyu66.CalStitch.CloudSyncSmokeTest",
            ProcessInfo.processInfo.environment["CALSTITCH_SIGNED_OUT_SMOKE"] == "1" {
             self.transport = SignedOutSmokeTransport()
         } else {
-            self.transport = transport ?? CloudKitRuleTransport()
+            self.transport = transport ?? CloudKitRuleTransport(environment: environment)
         }
         #else
-        self.transport = transport ?? CloudKitRuleTransport()
+        self.transport = transport ?? CloudKitRuleTransport(environment: environment)
         #endif
         let directory = stateDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("CalStitch", isDirectory: true)
@@ -301,13 +376,84 @@ enum CloudRuleError: LocalizedError {
         return result
     }
 
-    private func save(_ ledger: CloudRuleLedger, from session: CloudRuleSession) async throws -> CloudRuleSession {
+    private func save(_ proposed: CloudRuleLedger, from session: CloudRuleSession) async throws -> CloudRuleSession {
+        var ledger = proposed
+        ledger.schema = ledger.requiredSchema
         try ledger.validate()
         guard try await transport.accountID() == session.accountID else { throw CloudRuleError.accountChanged }
         let result = try await transport.compareAndSwap(ledger, from: session)
         guard result.accountID == session.accountID, try await transport.accountID() == session.accountID else { throw CloudRuleError.accountChanged }
         try result.ledger.validate()
         return result
+    }
+
+    func pruneRecentCompletions(in session: CloudRuleSession, at now: Date = .now) async throws -> CloudRuleSession {
+        guard let history = session.ledger.recentCompletions else { return session }
+        let retained = RuleCompletion.recent(history, at: now)
+        let deadline = session.olderWriterProtection(at: now)
+        guard retained != history || deadline != session.ledger.olderWriterProtectionUntil else { return session }
+        var ledger = session.ledger
+        ledger.recentCompletions = retained
+        ledger.olderWriterProtectionUntil = deadline
+        return try await save(ledger, from: session)
+    }
+
+    func groupOrder(accountID: String, seed: [RuleGroupOrderKey] = []) async throws -> [RuleGroupOrderKey] {
+        let current = try await readGroupOrder(accountID: accountID)
+        if let order = current.ledger.groupOrder { return order }
+        guard !seed.isEmpty else { return [] }
+        do {
+            return try await writeGroupOrder(seed, from: current)
+        } catch CloudRuleError.conflict {
+            return try await readGroupOrder(accountID: accountID).ledger.groupOrder ?? []
+        }
+    }
+
+    func saveGroupOrder(_ siblings: [RuleGroupOrderKey], accountID: String) async throws -> [RuleGroupOrderKey] {
+        guard let scope = siblings.first, Set(siblings).count == siblings.count,
+              siblings.allSatisfy({
+                  if scope.subcategory == nil { return $0.subcategory == nil }
+                  return $0.subcategory != nil && $0.category == scope.category
+              }) else { throw CloudRuleError.invalidLedger }
+        for attempt in 0...2 {
+            let current = try await readGroupOrder(accountID: accountID)
+            let previous = current.ledger.groupOrder ?? []
+            // Update only the visible sibling keys; a lagging device must not
+            // discard a group whose rules it hasn't received yet.
+            let reordered = Set(siblings)
+            var remaining = siblings.makeIterator()
+            var next = previous.map { key in
+                reordered.contains(key) ? remaining.next() ?? key : key
+            }
+            while let key = remaining.next() { next.append(key) }
+            if next == previous { return previous }
+            do {
+                return try await writeGroupOrder(next, from: current)
+            } catch CloudRuleError.conflict where attempt < 2 {
+                continue
+            }
+        }
+        throw CloudRuleError.conflict
+    }
+
+    private func readGroupOrder(accountID: String) async throws -> CloudRuleSession {
+        guard try await groupOrderTransport.accountID() == accountID else { throw CloudRuleError.accountChanged }
+        let current = try await groupOrderTransport.fetch(accountID: accountID)
+        guard current.accountID == accountID, try await groupOrderTransport.accountID() == accountID else {
+            throw CloudRuleError.accountChanged
+        }
+        if let order = current.ledger.groupOrder, Set(order).count != order.count { throw CloudRuleError.invalidLedger }
+        return current
+    }
+
+    private func writeGroupOrder(_ order: [RuleGroupOrderKey], from current: CloudRuleSession) async throws -> [RuleGroupOrderKey] {
+        guard try await groupOrderTransport.accountID() == current.accountID else { throw CloudRuleError.accountChanged }
+        let saved = try await groupOrderTransport.compareAndSwap(.init(groupOrder: order), from: current)
+        guard saved.accountID == current.accountID, try await groupOrderTransport.accountID() == current.accountID else {
+            throw CloudRuleError.accountChanged
+        }
+        guard saved.ledger.groupOrder == order else { throw CloudRuleError.invalidLedger }
+        return order
     }
 
     func hasMigratedLegacy(in session: CloudRuleSession) -> Bool {
@@ -333,6 +479,9 @@ enum CloudRuleError: LocalizedError {
             var added = false
             for var entry in legacy where seen.insert(entry.id).inserted {
                 guard !next.pending.contains(where: { $0.scope.contains(entry.id) }) else { throw CloudRuleError.reserved }
+                if let token = entry.rule.birthdayMatchToken {
+                    entry.rule.birthdayMatchToken = BirthdayMatchToken.scoped(token, accountID: account)
+                }
                 entry.sanitize()
                 next.rules.append(entry)
                 added = true
@@ -360,15 +509,27 @@ enum CloudRuleError: LocalizedError {
     }
 
     func claim(_ operation: CloudRuleOperation, localBefore: [PlannedOccurrence], localAfter: [PlannedOccurrence],
-               localPlan: Data? = nil, in session: CloudRuleSession) async throws -> CloudRuleSession {
+               localPlan: Data? = nil, legacyBirthdayMatches: Set<String> = [], in session: CloudRuleSession) async throws -> CloudRuleSession {
         guard operation.owner == deviceID, !operation.interrupted else { throw CloudRuleError.notOwner }
         guard state.journals[session.accountID] == nil else { throw CloudRuleError.journalPending }
         guard session.ledger.pending.allSatisfy({ $0.scope.isDisjoint(with: operation.scope) }) else { throw CloudRuleError.reserved }
         guard Set(operation.upserts.map(\.id)).isDisjoint(with: session.ledger.tombstones) else { throw CloudRuleError.ruleDeleted }
+        let existingIDs = Set(session.ledger.rules.map(\.id))
+        let incoming = operation.upserts.filter { !existingIDs.contains($0.id) }.compactMap { $0.rule.birthdayMatchToken }
+        if !incoming.isEmpty {
+            let occupied = Set((session.ledger.rules + session.ledger.pending.flatMap(\.upserts)).compactMap {
+                $0.rule.birthdayMatchToken
+            })
+            guard Set(incoming).count == incoming.count,
+                  occupied.isDisjoint(with: Set(incoming).union(legacyBirthdayMatches)) else {
+                throw CloudRuleError.birthdayAlreadyMatched
+            }
+        }
         var portable = operation
         portable.sanitize()
         var next = session.ledger
         next.pending.append(portable)
+        next.schema = next.requiredSchema
         try next.validate()
         try changeState { $0.journals[session.accountID] = .init(operation: portable, localBefore: localBefore, localAfter: localAfter, localPlan: localPlan,
                  baseVersion: session.version, baseChangeTag: session.changeTag) }
@@ -466,13 +627,15 @@ enum CloudRuleError: LocalizedError {
     }
 
     /// Idempotent only after the caller has verified the EventKit effects and persisted that checkpoint.
-    func finish(_ operationID: UUID, in session: CloudRuleSession) async throws -> CloudRuleSession {
+    func finish(_ operationID: UUID, in session: CloudRuleSession,
+                beforeClearingJournal: (CloudRuleSession) -> Void = { _ in }) async throws -> CloudRuleSession {
         defer { activeOperations.remove(operationID) }
         let account = session.accountID
         var latest = try await refresh(accountID: account)
         for attempt in 0...2 {
             if latest.ledger.completed.contains(operationID) {
                 if state.journals[account]?.operation.id == operationID {
+                    beforeClearingJournal(latest)
                     try changeState { $0.journals.removeValue(forKey: account) }
                 }
                 return latest
@@ -493,14 +656,23 @@ enum CloudRuleError: LocalizedError {
             next.tombstones.formUnion(operation.deletions)
             next.pending.removeAll { $0.id == operationID }
             next.completed.insert(operationID)
+            let upserted = Set(replacements.keys)
+            let completedAt = Date.now
+            var history = RuleCompletion.recent(next.recentCompletions ?? [], at: completedAt)
+            next.olderWriterProtectionUntil = latest.olderWriterProtection(at: completedAt)
+            history.append(.init(id: operationID, at: completedAt, added: upserted.subtracting(existed),
+                                 modified: upserted.intersection(existed), deleted: operation.deletions, plan: operation.plan))
+            next.recentCompletions = history
             do {
                 let saved = try await save(next, from: latest)
+                beforeClearingJournal(saved)
                 try changeState { $0.journals.removeValue(forKey: account) }
                 return saved
             } catch {
                 let first = error
                 latest = try await refresh(accountID: account)
                 if latest.ledger.completed.contains(operationID) {
+                    beforeClearingJournal(latest)
                     try changeState { $0.journals.removeValue(forKey: account) }
                     return latest
                 }
@@ -567,6 +739,7 @@ enum CloudRuleError: LocalizedError {
         portable.sanitize()
         var next = session.ledger
         next.pending[index] = portable
+        next.schema = next.requiredSchema
         try next.validate()
         try changeState { $0.journals[session.accountID] = .init(operation: portable, localBefore: localBefore, localAfter: localAfter, localPlan: localPlan,
                  baseVersion: session.version, baseChangeTag: session.changeTag, isTakeover: true) }
@@ -610,11 +783,22 @@ enum CloudRuleError: LocalizedError {
 @MainActor final class CloudKitRuleTransport: CloudRuleTransport {
     static let containerIdentifier = "iCloud.org.peiyu66.CalStitch"
     static let maxLedgerBytes = 16 * 1024 * 1024
-    private let recordID = CKRecord.ID(recordName: "CalStitchRules-v1")
+    private let recordID: CKRecord.ID
+    private let environment: CloudRuleEnvironment
+    init(recordName: String = "CalStitchRules-v1", environment: CloudRuleEnvironment = .current) {
+        recordID = CKRecord.ID(recordName: recordName)
+        self.environment = environment
+    }
+
+    private func requireLiveEnvironment() throws {
+        // An error, not a signed-out result: never fall back to local calendar writes.
+        guard environment == .production else { throw CloudRuleError.developmentRetired }
+    }
     private lazy var container = CKContainer(identifier: Self.containerIdentifier)
     private var database: CKDatabase { container.privateCloudDatabase }
 
     func accountID() async throws -> String? {
+        try requireLiveEnvironment()
         switch try await container.accountStatus() {
         case .noAccount: return nil
         case .available: return try await container.userRecordID().recordName
@@ -623,6 +807,7 @@ enum CloudRuleError: LocalizedError {
     }
 
     func fetch(accountID: String) async throws -> CloudRuleSession {
+        try requireLiveEnvironment()
         let record: CKRecord
         do { record = try await database.record(for: recordID) }
         catch let error as CKError where error.code == .unknownItem {
@@ -634,10 +819,12 @@ enum CloudRuleError: LocalizedError {
         let data = try Data(contentsOf: url, options: .mappedIfSafe)
         guard data.count <= Self.maxLedgerBytes else { throw CloudRuleError.tooLarge }
         let ledger = try JSONDecoder().decode(CloudRuleLedger.self, from: data)
-        return .init(accountID: accountID, version: systemFields(record), ledger: ledger, changeTag: record.recordChangeTag)
+        return .init(accountID: accountID, version: systemFields(record), ledger: ledger, changeTag: record.recordChangeTag,
+                     modificationDate: record.modificationDate)
     }
 
     func compareAndSwap(_ ledger: CloudRuleLedger, from session: CloudRuleSession) async throws -> CloudRuleSession {
+        try requireLiveEnvironment()
         let record: CKRecord
         if let version = session.version {
             let decoder = try NSKeyedUnarchiver(forReadingFrom: version)
@@ -659,7 +846,8 @@ enum CloudRuleError: LocalizedError {
                 savePolicy: .ifServerRecordUnchanged, atomically: true)
             guard let result = saved[recordID] else { throw CloudRuleError.unavailable }
             let confirmed = try result.get()
-            return .init(accountID: session.accountID, version: systemFields(confirmed), ledger: ledger, changeTag: confirmed.recordChangeTag)
+            return .init(accountID: session.accountID, version: systemFields(confirmed), ledger: ledger, changeTag: confirmed.recordChangeTag,
+                         modificationDate: confirmed.modificationDate)
         } catch let error as CKError {
             if error.code == .serverRecordChanged
                 || (error.partialErrorsByItemID?[recordID] as? CKError)?.code == .serverRecordChanged {

@@ -149,7 +149,9 @@ struct Rule: Hashable, Identifiable, Codable {
     var hasApplied = false
     var weekdayPattern: WeekdayPattern? = nil
     var weeklyWeekday: Int? = nil
+    // Legacy data remains decodable; it is not used to match or persisted for new imports.
     var birthdaySource: BirthdayImportSource? = nil
+    var birthdayMatchToken: String? = nil
     var appearance: RuleAppearance? = nil
 
     var displayName: String { name.isEmpty ? L10n.text("未命名規則", "Untitled Rule") : name }
@@ -171,8 +173,12 @@ struct Rule: Hashable, Identifiable, Codable {
         return isMothersDayRule ? L10n.text("母親節", "Mother’s Day") : nil
     }
 
-    var suggestedCategory: String? {
-        guard parent == nil, birthdaySource == nil else { return nil }
+    func suggestedCategory(prefill: String) -> String? {
+        guard parent == nil, birthdaySource == nil, birthdayMatchToken == nil else { return nil }
+        if name.contains("生日") || name.range(of: "birthday", options: .caseInsensitive) != nil {
+            return "生日"
+        }
+        if !prefill.isEmpty { return prefill }
         switch kind {
         case .solar: return "節氣"
         case .lunar: return "祭祀"
@@ -371,10 +377,8 @@ func categoryCalendarPresets(rules: [Rule], destinations: [CalendarDestination])
     return result
 }
 
-private struct GroupAppearanceKey: Codable, Hashable, Identifiable {
-    let category: String
-    var subcategory: String? = nil
-    var id: Self { self }
+private typealias GroupAppearanceKey = RuleGroupOrderKey
+private extension RuleGroupOrderKey {
     var title: String { subcategory ?? L10n.category(category) }
     var defaultSymbol: String {
         guard subcategory == nil else { return "folder" }
@@ -383,6 +387,38 @@ private struct GroupAppearanceKey: Codable, Hashable, Identifiable {
         case Rule.life: return "leaf"
         default: return "folder"
         }
+    }
+}
+
+private struct RuleGroupFrames: PreferenceKey {
+    static let defaultValue: [GroupAppearanceKey: CGRect] = [:]
+    static func reduce(value: inout [GroupAppearanceKey: CGRect], nextValue: () -> [GroupAppearanceKey: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+private struct RuleListArrangement: Codable {
+    var order: [GroupAppearanceKey] = []
+    var collapsed: Set<GroupAppearanceKey> = []
+
+    func sorted(_ keys: [GroupAppearanceKey]) -> [GroupAppearanceKey] {
+        let present = Set(keys)
+        let pinned = order.filter(present.contains)
+        let known = Set(pinned)
+        return pinned + keys.filter { !known.contains($0) }
+    }
+
+    mutating func move(_ source: GroupAppearanceKey, to target: GroupAppearanceKey,
+                       among siblings: [GroupAppearanceKey]) {
+        guard source != target, collapsed.contains(source),
+              let from = siblings.firstIndex(of: source),
+              let to = siblings.firstIndex(of: target) else { return }
+        var moved = siblings
+        moved.remove(at: from)
+        moved.insert(source, at: to)
+        let current = Set(siblings)
+        order.removeAll(where: current.contains)
+        order.append(contentsOf: moved)
     }
 }
 
@@ -396,6 +432,7 @@ private struct RuleSnapshot: Codable {
     var occurrences: [PlannedOccurrence] = []
     var groupAppearances: [GroupAppearance]? = nil
     var knownEmptyRuleIDs: Set<UUID>? = nil
+    var recentCompletions: [RuleCompletion]? = nil
 
     private static func url(localOnly: Bool = false) throws -> URL {
         try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
@@ -466,6 +503,7 @@ private struct CloudDestinationEvidence: Codable, Equatable {
 private struct CloudLocalWritePlan: Codable {
     let destinations: [UUID: String]
     let removalGuard: Data?
+    var moveSources: [UUID: String]? = nil
 }
 
 private extension CalendarIntegrationError {
@@ -483,6 +521,7 @@ private struct LocalRuleWriteJournal: Codable {
     var proposed: RuleSnapshot
     var removalGuard: Data? = nil
     var eventKitComplete: Bool = false
+    var moveSources: [UUID: String]? = nil
 
     private static func url(localOnly: Bool) throws -> URL {
         try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
@@ -534,6 +573,7 @@ private struct RuleReconciliation {
     let previous: [PlannedOccurrence]
     let ruleIDs: Set<UUID>
     let rules: [Rule]
+    var moves: [UUID: CalendarMove] = [:]
 }
 
 func dateCaption(_ date: Date, calendar: Calendar = gregorianCalendar) -> String {
@@ -601,6 +641,24 @@ private enum Route: Hashable {
     case edit(Rule, isNew: Bool)
 }
 
+private enum PadRuleColumn {
+    static let maxWidth: CGFloat = 860
+    static let listPadding: CGFloat = 16
+    static let groupIndent: CGFloat = 22
+
+    static func centeredCardInset(in availableWidth: CGFloat) -> CGFloat {
+        let centeredColumnInset = max(0, (availableWidth - maxWidth) / 2)
+        // Match the visible cards, splitting their leading-only indent across both sides.
+        return centeredColumnInset + listPadding + groupIndent / 2
+    }
+
+    static func centered<Content: View>(_ content: Content) -> some View {
+        GeometryReader { proxy in
+            content.contentMargins(.horizontal, centeredCardInset(in: proxy.size.width), for: .scrollContent)
+        }
+    }
+}
+
 private struct RulesHome: View {
     @StateObject private var calendar = CalendarIntegration()
     @State private var cloud = RuleCloudSync()
@@ -620,6 +678,7 @@ private struct RulesHome: View {
     @AppStorage(CloudRuleEnvironment.current.localKey("rules.hasCloudAccount")) private var hasCloudAccount = false
     @State private var awaitingLocalRecovery = false
     @State private var path: [Route] = []
+    @State private var deletingRuleOnThisDevice: UUID?
     @State private var isAdding = false
     @State private var contactPickerRequest: UUID?
     @State private var birthdaySelection: BirthdayPickerSelection?
@@ -643,6 +702,23 @@ private struct RulesHome: View {
     @State private var appliedNotice: UUID?
     @State private var snapshot = RuleSnapshot()
     @State private var appearanceGroup: GroupAppearanceKey?
+    @AppStorage("settings.ruleListArrangement") private var listArrangementData = Data()
+    @State private var ruleGroupFrames: [GroupAppearanceKey: CGRect] = [:]
+    @State private var savedCloudOrder: (account: String, keys: [GroupAppearanceKey])?
+    @State private var savingCloudOrder = false
+    @State private var groupOrderGeneration = UUID()
+    @GestureState private var reorderHover: GroupAppearanceKey?
+    private var localListArrangement: RuleListArrangement {
+        (try? JSONDecoder().decode(RuleListArrangement.self, from: listArrangementData)) ?? .init()
+    }
+
+    private var listArrangement: RuleListArrangement {
+        var arrangement = localListArrangement
+        if let account = cloudSession?.accountID {
+            arrangement.order = savedCloudOrder?.account == account ? savedCloudOrder?.keys ?? [] : []
+        }
+        return arrangement
+    }
 
     private enum PadGroup: Hashable {
         case all
@@ -740,8 +816,8 @@ private struct RulesHome: View {
                                         }, onImport: importBirthdays)
             }
             .sheet(isPresented: $showingOrphanCleanup) {
-                OrphanCleanupView(calendar: calendar, existingRuleIDs: orphanProtectedIDs,
-                                  beforeRemove: refreshBeforeOrphans)
+                OrphanCleanupView(calendar: calendar, protection: refreshOrphanProtection,
+                                  remove: removeOrphanSelection)
             }
             .sheet(isPresented: $isShowingBatch) {
                 BatchActionsView(rules: batchEligibleRoots.map {
@@ -798,6 +874,8 @@ private struct RulesHome: View {
         .onReceive(NotificationCenter.default.publisher(for: .CKAccountChanged)) { _ in
             cloudReady = false
             cloudResetPending = true
+            savedCloudOrder = nil
+            groupOrderGeneration = UUID()
             if !cloudBusy {
                 snapshot = RuleSnapshot()
                 cloudSession = nil
@@ -839,10 +917,14 @@ private struct RulesHome: View {
             Group {
                 if usesPadLayout { padRuleList } else { phoneHomeContent }
             }
-            .navigationTitle(usesPadLayout ? padGroup.title : "CalStitch")
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(paper, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .onPreferenceChange(RuleGroupFrames.self) { ruleGroupFrames = $0 }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    if usesPadLayout && loaded {
+                    if loaded {
                         addRuleButton
                     }
                 }
@@ -857,9 +939,11 @@ private struct RulesHome: View {
             .navigationDestination(for: Route.self) { route in
                 switch route {
                 case .settings:
-                    CalStitchSettingsView(hideFrozen: $hideFrozen)
+                    CalStitchSettingsView(hideFrozen: $hideFrozen, usesPadLayout: usesPadLayout,
+                                          noFrozenRules: loaded && cloudReady && !cloudResetPending && !awaitingLocalRecovery
+                                              && calendar.hasFullAccess && !snapshot.rules.contains { freezeReason($0.id) != nil })
                 case .edit(let rule, let isNew):
-                    if isDeletedInCloud(rule.id) {
+                    if isDeletedInCloud(rule.id) && deletingRuleOnThisDevice != rule.id {
                         VStack(spacing: 20) {
                             ContentUnavailableView(
                                 L10n.text("規則已刪除", "Rule Deleted"), systemImage: "trash",
@@ -880,12 +964,7 @@ private struct RulesHome: View {
                                    deletionAvailability: deletionAvailability,
                                    currentDeletionAvailability: { deletionAvailability },
                                    rereadDeletion: { await load() },
-                                   onDelete: { id, expected in
-                                       let state = deletionAvailability
-                                       guard state == .ready else { throw RuleDeletionNotReady(availability: state) }
-                                       try await removeSelected([id], expected, allowChild: true)
-                                   },
-                                   onDeleted: { if !path.isEmpty { path.removeLast() } },
+                                   onDelete: deleteRuleFromEditor,
                                    onSaveAppearance: saveRuleAppearance,
                                    frozenReason: calendar.hasFullAccess ? (freezeReason(rule.id) ?? pendingReason(rule.id)) : CalendarIntegrationError.denied.localizedDescription,
                                    hiddenRuleIDs: calendar.hasFullAccess && hideFrozen ? Set(snapshot.rules.filter { freezeReason($0.id) != nil }.map(\.id)) : [],
@@ -900,64 +979,93 @@ private struct RulesHome: View {
         }
     }
 
+    private enum RuleListScrollAnchor: Hashable { case top }
+
+    private func rulesScrollView<Content: View>(@ViewBuilder content: @escaping (ScrollViewProxy) -> Content) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView { content(proxy) }
+        }
+    }
+
     private var phoneHomeContent: some View {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 23) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(L10n.text("行事曆規則", "Calendar Rules"))
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                        toolsRow
-                    }
-                    if !calendar.hasFullAccess { calendarAccessNotice }
-                    if let cloudReadError {
-                        Label(cloudReadError, systemImage: "icloud.slash")
-                            .font(.footnote).foregroundStyle(.secondary)
-                        Button(L10n.text("重新同步", "Retry Sync")) { Task { await load() } }
-                    }
-                    if loaded && showGettingStarted { intro }
-                    if !loaded && !loadFailed {
-                        ProgressView(L10n.text("正在讀取規則…", "Loading rules…"))
-                    } else if loadFailed {
-                        Button(L10n.text("重新讀取規則", "Reload Rules")) { Task { await load() } }
-                    } else if visibleRootRules.isEmpty {
-                        emptyState
-                    }
-                    let names = uniqueNames(visibleRootRules.map(\.category))
-                    ForEach(names, id: \.self) { name in
-                        category(name, rules: visibleRootRules.filter { $0.category == name }, isFirst: name == names.first)
-                    }
-                    if loaded {
-                        let layout = dynamicTypeSize.isAccessibilitySize
-                            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10))
-                            : AnyLayout(HStackLayout(spacing: 20))
-                        layout {
-                            Button {
-                                showingBirthdayRoutes = true
-                            } label: {
-                                Label(L10n.text("匯入生日", "Import Birthdays"), systemImage: "person.crop.rectangle")
-                                    .frame(minHeight: 44)
-                            }
-                            .accessibilityIdentifier("open-birthday-import")
-                            Button {
-                                showingOrphanCleanup = true
-                            } label: {
-                                Label(L10n.text("清除遺留事件", "Clean Up Leftover Events"), systemImage: "trash")
-                                    .frame(minHeight: 44)
-                            }
-                            .accessibilityIdentifier("open-orphan-cleanup")
-                        }
-                        .disabled(!calendar.hasFullAccess)
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 3)
-                    }
+        rulesScrollView { proxy in
+            LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
+                VStack(alignment: .leading, spacing: 8) {
+                    homeHeading("CalStitch")
+                    Text(L10n.text("行事曆規則", "Calendar Rules"))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 2)
-                .padding(.bottom, 20)
+                .padding(.bottom, 4)
+                .id(RuleListScrollAnchor.top)
+                Section {
+                    VStack(alignment: .leading, spacing: 23) {
+                        if !calendar.hasFullAccess { calendarAccessNotice }
+                        if let cloudReadError {
+                            Label(cloudReadError, systemImage: "icloud.slash")
+                                .font(.footnote).foregroundStyle(.secondary)
+                            Button(L10n.text("重新同步", "Retry Sync")) { Task { await load() } }
+                        }
+                        if loaded && showGettingStarted { intro }
+                        if !loaded && !loadFailed {
+                            ProgressView(L10n.text("正在讀取規則…", "Loading rules…"))
+                        } else if loadFailed {
+                            Button(L10n.text("重新讀取規則", "Reload Rules")) { Task { await load() } }
+                        } else if visibleRootRules.isEmpty {
+                            emptyState
+                        }
+                        let groups = categoryKeys(visibleRootRules)
+                        let next = upcomingOccurrences()
+                        ForEach(groups) { key in
+                            category(key, rules: visibleRootRules.filter { $0.category == key.category },
+                                     next: next, canReorder: groups.count > 1)
+                        }
+                        if loaded {
+                            let layout = dynamicTypeSize.isAccessibilitySize
+                                ? AnyLayout(VStackLayout(alignment: .leading, spacing: 10))
+                                : AnyLayout(HStackLayout(spacing: 20))
+                            layout {
+                                Button {
+                                    showingBirthdayRoutes = true
+                                } label: {
+                                    Label(L10n.text("匯入生日", "Import Birthdays"), systemImage: "person.crop.rectangle")
+                                        .frame(minHeight: 44)
+                                }
+                                .accessibilityIdentifier("open-birthday-import")
+                                Button {
+                                    showingOrphanCleanup = true
+                                } label: {
+                                    Label(L10n.text("清除遺留事件", "Clean Up Leftover Events"), systemImage: "trash")
+                                        .frame(minHeight: 44)
+                                }
+                                .accessibilityIdentifier("open-orphan-cleanup")
+                            }
+                            .disabled(!calendar.hasFullAccess)
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 3)
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 14)
+                } header: {
+                    toolsRow { proxy.scrollTo(RuleListScrollAnchor.top, anchor: .top) }
+                        .padding(.horizontal, 20)
+                        .background(paper)
+                }
             }
-            .background(paper)
+        }
+        .background(paper)
+    }
+
+    private func homeHeading(_ title: String) -> some View {
+        Text(title)
+            .font(.largeTitle.bold())
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier("rules-home-heading")
     }
 
     private var padSidebar: some View {
@@ -972,12 +1080,13 @@ private struct RulesHome: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 3) {
                     padGroupButton(.all, symbol: "list.bullet.rectangle")
-                    ForEach(uniqueNames(visibleRootRules.map(\.category)), id: \.self) { category in
-                        let rules = visibleRootRules.filter { $0.category == category }
-                        padGroupButton(.category(category), key: .init(category: category))
-                        ForEach(uniqueNames(rules.map(\.subcategory).filter { !$0.isEmpty }), id: \.self) { subcategory in
-                            let key = GroupAppearanceKey(category: category, subcategory: subcategory)
-                            padGroupButton(.subcategory(category, subcategory), key: key, isNested: true)
+                    ForEach(categoryKeys(visibleRootRules)) { category in
+                        let rules = visibleRootRules.filter { $0.category == category.category }
+                        padGroupButton(.category(category.category), key: category)
+                        ForEach(subcategoryKeys(category.category, rules)) { key in
+                            if let subcategory = key.subcategory {
+                                padGroupButton(.subcategory(category.category, subcategory), key: key, isNested: true)
+                            }
                         }
                     }
                 }
@@ -1023,52 +1132,69 @@ private struct RulesHome: View {
     }
 
     private var padRuleList: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                ViewThatFits(in: .horizontal) {
-                    padTools(horizontal: true)
-                    padTools(horizontal: false)
-                }
-                if !calendar.hasFullAccess { calendarAccessNotice }
-                if let cloudReadError {
-                    Label(cloudReadError, systemImage: "icloud.slash")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    Button(L10n.text("重新同步", "Retry Sync")) { Task { await load() } }
-                }
-                if loaded && showGettingStarted { intro }
-                if !loaded && !loadFailed {
-                    ProgressView(L10n.text("正在讀取規則…", "Loading rules…"))
-                } else if loadFailed {
-                    Button(L10n.text("重新讀取規則", "Reload Rules")) { Task { await load() } }
-                } else {
-                    let filtered = visibleRootRules.filter(padGroup.includes)
-                    let names = uniqueNames(filtered.map(\.category))
-                    if names.isEmpty {
-                        ContentUnavailableView {
-                            Label(L10n.text("還沒有規則", "No Rules Yet"), systemImage: "calendar.badge.plus")
-                        } description: {
-                            Text(L10n.text("新增一條日期規則，或從通訊錄選擇生日匯入。", "Add a rule or import birthdays from Contacts."))
+        let filtered = visibleRootRules.filter(padGroup.includes)
+        return rulesScrollView { proxy in
+            LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
+                homeHeading(padGroup.title)
+                    .padding(.horizontal, PadRuleColumn.listPadding)
+                    .padding(.top, 4)
+                    .padding(.bottom, 6)
+                    .id(RuleListScrollAnchor.top)
+                Section {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if !calendar.hasFullAccess { calendarAccessNotice }
+                        if let cloudReadError {
+                            Label(cloudReadError, systemImage: "icloud.slash")
+                                .font(.footnote).foregroundStyle(.secondary)
+                            Button(L10n.text("重新同步", "Retry Sync")) { Task { await load() } }
                         }
-                    } else {
-                        ForEach(names, id: \.self) { name in
-                            category(name, rules: filtered.filter { $0.category == name }, isFirst: false)
+                        if loaded && showGettingStarted { intro }
+                        if !loaded && !loadFailed {
+                            ProgressView(L10n.text("正在讀取規則…", "Loading rules…"))
+                        } else if loadFailed {
+                            Button(L10n.text("重新讀取規則", "Reload Rules")) { Task { await load() } }
+                        } else {
+                            let groups = categoryKeys(filtered)
+                            if groups.isEmpty {
+                                ContentUnavailableView {
+                                    Label(L10n.text("還沒有規則", "No Rules Yet"), systemImage: "calendar.badge.plus")
+                                } description: {
+                                    Text(L10n.text("新增一條日期規則，或從通訊錄選擇生日匯入。", "Add a rule or import birthdays from Contacts."))
+                                }
+                            } else {
+                                let next = upcomingOccurrences()
+                                ForEach(groups) { key in
+                                    category(key, rules: filtered.filter { $0.category == key.category },
+                                             next: next, canReorder: groups.count > 1)
+                                }
+                            }
                         }
                     }
+                    .padding(PadRuleColumn.listPadding)
+                    .frame(maxWidth: PadRuleColumn.maxWidth)
+                    .frame(maxWidth: .infinity)
+                } header: {
+                    ViewThatFits(in: .horizontal) {
+                        padTools(horizontal: true) { proxy.scrollTo(RuleListScrollAnchor.top, anchor: .top) }
+                        padTools(horizontal: false) { proxy.scrollTo(RuleListScrollAnchor.top, anchor: .top) }
+                    }
+                    .padding(.horizontal, PadRuleColumn.listPadding)
+                    .frame(maxWidth: PadRuleColumn.maxWidth, alignment: .leading)
+                    .frame(maxWidth: .infinity)
+                    .background(paper)
                 }
             }
-            .padding(16)
-            .frame(maxWidth: 860)
-            .frame(maxWidth: .infinity)
         }
         .background(paper)
         .accessibilityIdentifier("ipad-rule-detail")
     }
 
-    private func padTools(horizontal: Bool) -> some View {
+    private func padTools(horizontal: Bool, scrollToTop: @escaping () -> Void) -> some View {
         let layout = horizontal
             ? AnyLayout(HStackLayout(spacing: 14))
             : AnyLayout(VStackLayout(alignment: .leading, spacing: 2))
         return layout {
+            groupExpansionButton(for: visibleRootRules.filter(padGroup.includes), scrollToTop: scrollToTop)
             Button { isShowingBatch = true } label: {
                 Label(L10n.text("批次調整", "Batch Edit"), systemImage: "checklist")
             }
@@ -1108,7 +1234,7 @@ private struct RulesHome: View {
     }
 
     private func requestPadGroupSwitch(_ group: PadGroup) {
-        guard group != padGroup || !path.isEmpty else { return }
+        guard deletingRuleOnThisDevice == nil, group != padGroup || !path.isEmpty else { return }
         let finish = {
             padGroup = group
             path.removeAll()
@@ -1278,6 +1404,20 @@ private struct RulesHome: View {
         return true
     }
 
+    private func deleteRuleFromEditor(_ id: UUID, _ expected: BatchRemovalPreview) async throws {
+        let state = deletionAvailability
+        guard state == .ready else { throw RuleDeletionNotReady(availability: state) }
+        // The cloud ledger updates before the delete call returns. Keep the current
+        // editor and its confirmation alive until this device gets the result.
+        deletingRuleOnThisDevice = id
+        defer { deletingRuleOnThisDevice = nil }
+        try await removeSelected([id], expected, allowChild: true)
+        if case let .edit(rule, _) = path.last, rule.id == id {
+            path.removeLast()
+            if usesPadLayout && path.isEmpty { normalizePadGroup() }
+        }
+    }
+
     private func returnAfterApply() {
         guard !path.isEmpty else { return }
         path.removeLast()
@@ -1289,7 +1429,7 @@ private struct RulesHome: View {
         guard let url = URL(string: "calshow:") else { return }
         openURL(url) { accepted in
             if !accepted {
-                toolbarError = L10n.text("此裝置無法開啟 Apple 行事曆。請手動開啟「行事曆」App。", "This device could not open Apple Calendar. Please open Calendar manually.")
+                toolbarError = L10n.text("無法開啟「行事曆」。請確認 Apple 的「行事曆」App 已安裝，再試一次。", "Couldn’t open Apple Calendar. Make sure the Calendar app is installed, then try again.")
             }
         }
     }
@@ -1317,6 +1457,7 @@ private struct RulesHome: View {
                 if try LocalRuleWriteJournal.read(localOnly: hasCloudAccount) != nil {
                     throw RuleOperationError(L10n.text("有尚未確認的本機寫入，請先完成原本機狀態的復原，再啟用 iCloud 規則同步。", "A local calendar update has not been verified. Recover it in the original local mode before enabling rule sync."))
                 }
+                let canSeedOrder = accountsSeen == [session.accountID]
                 recordAccountSeen(session.accountID)
                 if let preceding = cloudSession, preceding.accountID != session.accountID {
                     snapshot = RuleSnapshot()
@@ -1335,14 +1476,13 @@ private struct RulesHome: View {
                         let alreadyCloud = Set(session.ledger.rules.map(\.id)).union(session.ledger.tombstones)
                         let knownBindings = bindings(session.accountID)
                         let seedRules = legacy.rules.filter {
-                            (!$0.target.isEmpty || $0.birthdaySource != nil) && !alreadyCloud.contains($0.id)
+                            !$0.target.isEmpty && !alreadyCloud.contains($0.id)
                         }
                         let seeds = Dictionary(uniqueKeysWithValues: seedRules
                             .filter { !$0.target.isEmpty && knownBindings[$0.id] == nil }.map { ($0.id, $0.target) })
                         do {
                             // Keep known local identities even if the server response is lost.
                             mergeBindings(seeds, account: session.accountID)
-                            rememberBirthdaySources(seedRules, account: session.accountID)
                             try saveAppearances(legacy.groupAppearances, account: session.accountID, replacing: false)
                             session = try await cloud.migrate(envelope, in: session)
                         } catch CloudRuleError.legacyAccountMismatch {
@@ -1358,15 +1498,37 @@ private struct RulesHome: View {
                 cloudReady = true
                 cloudReadError = nil
                 await recoverCloud(session)
+                if let active = cloudSession, !cloudResetPending, !cloudBusy,
+                   let pruned = try? await cloud.pruneRecentCompletions(in: active),
+                   pruned.version != active.version, !cloudResetPending, cloudSession?.accountID == pruned.accountID {
+                    restoreCloud(pruned)
+                }
+                let account = session.accountID
+                let ruleGroups = Set(snapshot.rules.filter { $0.parent == nil }.flatMap { rule in
+                    [GroupAppearanceKey(category: rule.category)] + (rule.subcategory.isEmpty
+                        ? [] : [GroupAppearanceKey(category: rule.category, subcategory: rule.subcategory)])
+                })
+                let seed = canSeedOrder ? localListArrangement.order.filter(ruleGroups.contains) : []
+                Task { await refreshGroupOrder(for: account, seed: seed) }
             } else {
                 // An explicit no-account response is not an empty cloud ledger.
                 guard !cloudResetPending else { throw CloudRuleError.accountChanged }
                 cloudSession = nil
+                savedCloudOrder = nil
+                groupOrderGeneration = UUID()
                 pendingWait = CloudPendingWait()
                 pendingWaitAccount = nil
                 knownDestinations = [:]
                 directFrozen = [:]
                 snapshot = try RuleSnapshot.read(localOnly: hasCloudAccount)
+                if let history = snapshot.recentCompletions {
+                    let retained = RuleCompletion.recent(history)
+                    if retained != history {
+                        var pruned = snapshot
+                        pruned.recentCompletions = retained
+                        if (try? pruned.write(localOnly: hasCloudAccount)) != nil { snapshot = pruned }
+                    }
+                }
                 cloudReady = true
                 cloudReadError = nil
                 await recoverLocal()
@@ -1423,26 +1585,10 @@ private struct RulesHome: View {
         return UserDefaults.standard.data(forKey: key).flatMap { try? JSONDecoder().decode([GroupAppearance].self, from: $0) }
     }
 
-    private func birthdaySources(_ account: String) -> [UUID: BirthdayImportSource] {
-        let key = cloudLocalKey("rules.localBirthdaySources." + account)
-        return UserDefaults.standard.data(forKey: key).flatMap { try? JSONDecoder().decode([UUID: BirthdayImportSource].self, from: $0) } ?? [:]
-    }
-
-    private func rememberBirthdaySources(_ rules: [Rule], account: String) {
-        var values = birthdaySources(account)
-        for rule in rules {
-            if let source = rule.birthdaySource { values[rule.id] = source }
-        }
-        if let data = try? JSONEncoder().encode(values) {
-            UserDefaults.standard.set(data, forKey: cloudLocalKey("rules.localBirthdaySources." + account))
-        }
-    }
-
     private func restoreCloud(_ session: CloudRuleSession) {
         cloudSession = session
         let remembered = bindings(session.accountID)
         let verified = verifiedBindings(session.accountID)
-        let contactOrigins = birthdaySources(session.accountID)
         var known: [UUID: String] = [:]
         var frozen: [UUID: String] = [:]
         var rules: [Rule] = []
@@ -1452,7 +1598,6 @@ private struct RulesHome: View {
         for entry in session.ledger.rules + placeholders {
             var rule = entry.rule
             if !committed.contains(rule.id) { rule.hasApplied = false }
-            rule.birthdaySource = contactOrigins[rule.id]
             if let binding = verified[rule.id],
                (binding.evidence == CloudDestinationEvidence(entry)
                  || (binding.evidence == nil && binding.descriptor == entry.destination)),
@@ -1460,7 +1605,7 @@ private struct RulesHome: View {
                 rule.target = binding.id
             } else if let destination = entry.destination {
                 if let owner = destination.localOwner, owner != cloud.deviceID {
-                    frozen[rule.id] = L10n.text("這是原 iPhone 的本機行事曆，請回該裝置操作。", "This calendar is local to the original iPhone. Use that device for changes.")
+                    frozen[rule.id] = L10n.text("這本行事曆只存在於原裝置，請回到原裝置操作。", "This calendar is only available on the original device. Use that device to make changes.")
                 } else {
                 do {
                     rule.target = try calendar.resolveSyncDestination(destination, rememberedID: remembered[rule.id], deviceID: cloud.deviceID)
@@ -1563,12 +1708,6 @@ private struct RulesHome: View {
         UserDefaults.standard.set(Array(accountsSeen.union([account])).sorted(), forKey: cloudLocalKey("rules.cloudAccountsSeen"))
     }
 
-    private func orphanProtectedIDs() throws -> Set<UUID> {
-        // Existing EventKit markers are shared across devices and don't encode
-        // either the CloudKit environment or the iCloud account. A missing ID
-        // here is not evidence that the event is safe to remove.
-        throw RuleOperationError(L10n.text("目前無法從事件標記判定同步環境或帳號，因此暫停清除遺留事件。仍可從規則移除其事件。", "Event markers do not identify their sync environment or account, so leftover cleanup is paused. You can still remove events through their rules."))
-    }
 
     private func saveDraft(_ rule: Rule, account: String) {
         if let data = try? JSONEncoder().encode(rule) {
@@ -1579,7 +1718,8 @@ private struct RulesHome: View {
     /// The sole EventKit mutation entry point for user-initiated rule changes.
     private func performMutation(_ proposed: RuleSnapshot, scope: Set<UUID>,
                                  desired: [PlannedOccurrence] = [], previous: [PlannedOccurrence] = [],
-                                 eventRuleIDs: Set<UUID> = [], removal: [CalendarRemovalEvent]? = nil) async throws {
+                                 eventRuleIDs: Set<UUID> = [], removal: [CalendarRemovalEvent]? = nil,
+                                 moves: [UUID: CalendarMove] = [:], legacyBirthdayMatches: Set<String> = []) async throws {
         guard !cloudBusy, !cloudRefreshing else {
             throw RuleDeletionNotReady(availability: .checking)
         }
@@ -1604,7 +1744,7 @@ private struct RulesHome: View {
         let eventPlan: CalendarSyncPlan?
         do {
             eventPlan = try eventRuleIDs.isEmpty ? nil : calendar.prepareSyncPlan(
-                desired: desired, previous: previous, ruleIDs: eventRuleIDs, attemptID: attemptID, matchingRemoval: removal
+                desired: desired, previous: previous, ruleIDs: eventRuleIDs, attemptID: attemptID, matchingRemoval: removal, moves: moves
             )
         } catch CalendarIntegrationError.missingEvent where cloudSession != nil {
             throw RuleOperationError(L10n.text("正在等待行事曆同步，請在舊事件可見後重試。未更動行事曆。", "Wait for Calendar to sync the existing events and try again. No calendar events changed."))
@@ -1612,25 +1752,35 @@ private struct RulesHome: View {
         let before = Dictionary(uniqueKeysWithValues: snapshot.rules.map { ($0.id, $0.target) })
         let after = Dictionary(uniqueKeysWithValues: proposed.rules.map { ($0.id, $0.target) })
         let locations = before.merging(after) { _, new in new }
-        let removalGuard = try eventPlan.map { try calendar.syncRemovalGuard(for: $0, destinations: locations) }
+        let moveSources = moves.mapValues(\.source)
+        let removalGuard = try eventPlan.map {
+            try calendar.syncRemovalGuard(for: $0, destinations: locations.merging(moveSources) { _, source in source })
+        }
         if let session = cloudSession {
             let deletion = scope.subtracting(Set(proposed.rules.map(\.id)))
             let old = Dictionary(uniqueKeysWithValues: session.ledger.rules.map { ($0.rule.id, $0) })
             let envelopes = try proposed.rules.filter { scope.contains($0.id) }.map { rule in
                 let destination = rule.target.isEmpty ? old[rule.id]?.destination :
                     try calendar.syncDestination(id: rule.target, deviceID: cloud.deviceID)
+                if moves[rule.id] != nil, let destination, destination.localOwner == nil {
+                    guard try calendar.resolveSyncDestination(destination, rememberedID: nil, deviceID: cloud.deviceID) == rule.target else {
+                        throw CalendarIntegrationError.conflictingDestination
+                    }
+                }
                 let prior: [PlannedOccurrence]? = eventRuleIDs.contains(rule.id)
                     ? eventPlan?.result.filter { $0.ruleID == rule.id } : (old[rule.id]?.prior ?? (rule.hasApplied ? nil : []))
                 return portable(rule, destination: destination, prior: prior)
             }
             let operation = CloudRuleOperation(id: attemptID, owner: cloud.deviceID, scope: lockScope,
                                                upserts: envelopes, deletions: deletion, plan: eventPlan)
-            mergeBindings(locations.filter { scope.contains($0.key) && !$0.value.isEmpty }, account: session.accountID)
-            rememberBirthdaySources(proposed.rules.filter { scope.contains($0.id) }, account: session.accountID)
+            mergeBindings(locations.filter { scope.contains($0.key) && !$0.value.isEmpty && moves[$0.key] == nil },
+                          account: session.accountID)
             do {
                 let localLocations = locations.filter { scope.contains($0.key) && !$0.value.isEmpty }
                 let claimed = try await cloud.claim(operation, localBefore: previous, localAfter: desired,
-                                                    localPlan: try JSONEncoder().encode(CloudLocalWritePlan(destinations: localLocations, removalGuard: removalGuard)), in: session)
+                                                    localPlan: try JSONEncoder().encode(CloudLocalWritePlan(destinations: localLocations, removalGuard: removalGuard,
+                                                                                                            moveSources: moveSources.isEmpty ? nil : moveSources)),
+                                                    legacyBirthdayMatches: legacyBirthdayMatches, in: session)
                 restoreCloud(claimed)
                 let current = try await cloud.verifyOwnership(attemptID, in: claimed)
                 guard !cloudResetPending else { throw CloudRuleError.accountChanged }
@@ -1638,14 +1788,22 @@ private struct RulesHome: View {
                     let currentRemoval = try calendar.previewRemoval(previous: previous, ruleIDs: eventRuleIDs)
                     guard currentRemoval == removal else { throw CalendarIntegrationError.removalSelectionChanged }
                 }
-                if let eventPlan { _ = try calendar.applySyncPlan(eventPlan, destinations: localLocations, removalGuard: removalGuard) }
+                if let eventPlan { _ = try calendar.applySyncPlan(eventPlan, destinations: localLocations, removalGuard: removalGuard, moveSources: moveSources) }
                 try cloud.recordEventKitComplete(attemptID, in: current)
-                let completed = try await cloud.finish(attemptID, in: current)
+                let completed = try await cloud.finish(attemptID, in: current) { verified in
+                    mergeBindings(locations.filter { moves[$0.key] != nil }, account: verified.accountID)
+                }
                 restoreCloud(completed)
             } catch {
                 if let refreshed = try? await cloud.refresh() {
                     if refreshed.accountID == session.accountID {
-                        restoreCloud(refreshed)
+                        if !moveSources.isEmpty, error is CalendarIntegrationError,
+                           refreshed.ledger.pendingOperation(attemptID)?.owner == cloud.deviceID {
+                            cloud.endLocalExecution(attemptID)
+                            restoreCloud((try? await cloud.markInterrupted(attemptID, in: refreshed)) ?? refreshed)
+                        } else {
+                            restoreCloud(refreshed)
+                        }
                     } else {
                         cloudResetPending = true
                         cloudReady = false
@@ -1661,10 +1819,10 @@ private struct RulesHome: View {
             }
             if let eventPlan {
                 var journal = LocalRuleWriteJournal(plan: eventPlan, destinations: locations, proposed: proposed,
-                                                    removalGuard: removalGuard)
+                                                    removalGuard: removalGuard, moveSources: moveSources.isEmpty ? nil : moveSources)
                 try journal.write(localOnly: hasCloudAccount)
                 awaitingLocalRecovery = true
-                let result = try calendar.applySyncPlan(eventPlan, destinations: locations, removalGuard: removalGuard)
+                let result = try calendar.applySyncPlan(eventPlan, destinations: locations, removalGuard: removalGuard, moveSources: moveSources)
                 try finishLocal(&journal, occurrences: result)
             } else {
                 try proposed.write(localOnly: hasCloudAccount)
@@ -1685,6 +1843,16 @@ private struct RulesHome: View {
             scope.contains($0.id) && $0.hasApplied && !nonempty.contains($0.id)
         }.map(\.id))
         result.knownEmptyRuleIDs = zeros
+        if !(result.recentCompletions ?? []).contains(where: { $0.id == journal.plan.attemptID }) {
+            let oldRules = Set(snapshot.rules.map(\.id))
+            let newRules = Set(result.rules.map(\.id))
+            let newIDs = scope.intersection(newRules)
+            var history = RuleCompletion.recent(result.recentCompletions ?? [])
+            history.append(.init(id: journal.plan.attemptID, added: newIDs.subtracting(oldRules),
+                                 modified: newIDs.intersection(oldRules), deleted: scope.subtracting(newRules),
+                                 plan: journal.plan))
+            result.recentCompletions = history
+        }
         // Persist confirmation before any further disk operation. If saving the rules
         // fails we can redo only that part without replaying EventKit.
         journal.proposed = result
@@ -1708,7 +1876,7 @@ private struct RulesHome: View {
                 try finishLocal(&journal, occurrences: journal.proposed.occurrences.filter { journal.plan.ruleIDs.contains($0.ruleID) })
             } else {
                 let result = try calendar.applySyncPlan(journal.plan, destinations: journal.destinations,
-                                                       recovering: true, removalGuard: journal.removalGuard)
+                                                       recovering: true, removalGuard: journal.removalGuard, moveSources: journal.moveSources ?? [:])
                 try finishLocal(&journal, occurrences: result)
             }
         } catch {
@@ -1722,41 +1890,54 @@ private struct RulesHome: View {
         cloudBusy = true
         defer { cloudBusy = false }
         do {
-            let reconciled = try await cloud.resolveAcquiringJournal(in: session)
-            restoreCloud(reconciled)
-            guard let active = cloud.recoverableJournal(in: reconciled) else { return }
-            if reconciled.ledger.completed.contains(active.operation.id) {
-                let complete = try await cloud.finish(active.operation.id, in: reconciled)
+            let localWrite = try journal.localPlan.map { try JSONDecoder().decode(CloudLocalWritePlan.self, from: $0) }
+            func rememberMovedDestinations(_ confirmed: CloudRuleSession) {
+                if let localWrite, let sources = localWrite.moveSources {
+                    mergeBindings(localWrite.destinations.filter { sources[$0.key] != nil }, account: confirmed.accountID)
+                }
+            }
+            if session.ledger.completed.contains(journal.operation.id) {
+                let complete = try await cloud.finish(journal.operation.id, in: session,
+                                                      beforeClearingJournal: rememberMovedDestinations)
                 restoreCloud(complete)
                 return
             }
+            let reconciled = try await cloud.resolveAcquiringJournal(in: session)
+            if reconciled.ledger.completed.contains(journal.operation.id) {
+                rememberMovedDestinations(reconciled)
+            }
+            restoreCloud(reconciled)
+            guard let active = cloud.recoverableJournal(in: reconciled) else { return }
             try cloud.clearSupersededJournal(in: reconciled)
             guard let operation = reconciled.ledger.pending.first(where: { $0.id == active.operation.id }),
                   operation.owner == cloud.deviceID, !cloudResetPending else { return }
             if operation.interrupted {
                 guard active.stage == .eventKitComplete else { return }
                 // Only publish an already verified result; never resume EventKit while frozen.
-                restoreCloud(try await cloud.finish(operation.id, in: reconciled))
+                let complete = try await cloud.finish(operation.id, in: reconciled,
+                                                      beforeClearingJournal: rememberMovedDestinations)
+                restoreCloud(complete)
                 return
             }
             let latest = try await cloud.verifyOwnership(operation.id, in: reconciled)
             guard !cloudResetPending else { throw CloudRuleError.accountChanged }
             if active.stage != .eventKitComplete {
                 if let plan = operation.plan {
-                    guard let data = active.localPlan else { throw CalendarIntegrationError.invalidPlan }
-                    let local = try JSONDecoder().decode(CloudLocalWritePlan.self, from: data)
-                    _ = try calendar.applySyncPlan(plan, destinations: local.destinations,
-                                                   recovering: true, removalGuard: local.removalGuard)
+                    guard let localWrite else { throw CalendarIntegrationError.invalidPlan }
+                    _ = try calendar.applySyncPlan(plan, destinations: localWrite.destinations,
+                                                   recovering: true, removalGuard: localWrite.removalGuard,
+                                                   moveSources: localWrite.moveSources ?? [:])
                 }
                 try cloud.recordEventKitComplete(operation.id, in: latest)
             }
-            let complete = try await cloud.finish(operation.id, in: latest)
+            let complete = try await cloud.finish(operation.id, in: latest,
+                                                  beforeClearingJournal: rememberMovedDestinations)
             restoreCloud(complete)
         } catch {
             // Unknown cloud outcomes stay pending. Only a verified owner with an EventKit
             // recovery failure can mark this attempt interrupted.
             if let eventError = error as? CalendarIntegrationError,
-               eventError.requiresManualRecovery,
+               (eventError.requiresManualRecovery || journal.operation.plan?.movedRuleIDs != nil),
                let latest = try? await cloud.refresh(), latest.accountID == session.accountID,
                latest.ledger.pending.contains(where: { $0.id == journal.operation.id && $0.owner == cloud.deviceID }),
                let frozen = try? await cloud.markInterrupted(journal.operation.id, in: latest) {
@@ -1772,13 +1953,38 @@ private struct RulesHome: View {
             ? L10n.text("待完成", "Pending") : nil
     }
 
-    private func refreshBeforeOrphans() async throws {
+    private func checkedOrphanProtection() async throws -> OrphanProtection {
         try requireCalendarMaintenance()
+        guard loaded, cloudReady, !cloudResetPending, !awaitingLocalRecovery else { throw CloudRuleError.unavailable }
+        let expectedAccount = cloudSession?.accountID
+        let latest = try await cloud.refresh()
+        guard latest?.accountID == expectedAccount, !cloudResetPending else { throw CloudRuleError.accountChanged }
+        if let latest {
+            let protection = latest.orphanProtection()
+            guard !protection.waitingForOlderWriter else {
+                throw RuleOperationError(L10n.text("最近 2 小時有變更尚無完整紀錄，暫不列出遺留事件。", "Some changes in the last two hours have no complete log. Try scanning for leftover events later."))
+            }
+            return protection
+        }
+        // A signed-out device that used cloud sync cannot treat that account's rules as missing.
+        guard !hasCloudAccount else { throw CloudRuleError.unavailable }
+        return .init(accountID: nil, ruleIDs: Set(snapshot.rules.map(\.id)),
+                     occurrenceIDs: Set(RuleCompletion.recent(snapshot.recentCompletions ?? []).flatMap(\.removedOccurrences)))
+    }
+
+    private func refreshOrphanProtection() async throws -> OrphanProtection {
         guard !cloudBusy, !cloudRefreshing else { throw CloudRuleError.reserved }
-        let priorAccount = cloudSession?.accountID
-        await load()
-        guard cloudSession?.accountID == priorAccount else { throw CloudRuleError.accountChanged }
-        _ = try orphanProtectedIDs()
+        cloudBusy = true
+        defer { cloudBusy = false; if cloudResetPending { Task { await load() } } }
+        return try await checkedOrphanProtection()
+    }
+
+    private func removeOrphanSelection(_ items: [CalendarOrphanEvent], _ preview: CalendarOrphanPreview) async throws {
+        guard !cloudBusy, !cloudRefreshing else { throw CloudRuleError.reserved }
+        cloudBusy = true
+        defer { cloudBusy = false; if cloudResetPending { Task { await load() } } }
+        let protection = try await checkedOrphanProtection()
+        try calendar.removeOrphans(items, from: preview, protection: protection)
     }
 
     private func verifiedBindings(_ account: String) -> [UUID: VerifiedCalendarBinding] {
@@ -1862,6 +2068,20 @@ private struct RulesHome: View {
             }
         }
         let plan = operation?.plan
+        if let operation, let plan, let moving = plan.movedRuleIDs {
+            let ownPlan = cloud.recoverableJournal(in: session)?.localPlan.flatMap {
+                try? JSONDecoder().decode(CloudLocalWritePlan.self, from: $0)
+            }
+            var targetIDs: [UUID: String] = [:]
+            for id in moving {
+                guard let destination = operation.upserts.first(where: { $0.id == id })?.destination else {
+                    throw CalendarIntegrationError.noDestination
+                }
+                targetIDs[id] = try calendar.resolveSyncDestination(destination, rememberedID: ownPlan?.destinations[id],
+                                                                      deviceID: cloud.deviceID)
+            }
+            try calendar.verifyMoveDestinationsForUnfreeze(plan: plan, destinations: targetIDs)
+        }
         var attempted = (plan?.previous ?? []) + (plan?.desired ?? []) + (plan?.result ?? [])
         if let plan { attempted += plan.mutations.flatMap { [$0.old, $0.new].compactMap { $0 } } }
         let observed = try calendar.verifyOriginalForUnfreeze(previous: previous, attempted: attempted, locations: locations)
@@ -1902,7 +2122,7 @@ private struct RulesHome: View {
         try clearWait(current)
     }
 
-    private func resolve(_ input: Rule, allowingVerifiedRebinding: Bool = false) throws -> RuleReconciliation {
+    private func resolve(_ input: Rule, mayMoveCalendar: Bool = false) throws -> RuleReconciliation {
         guard loaded else { throw RuleOperationError(L10n.text("規則尚未讀取，請返回列表後重試。", "Rules have not loaded yet. Return to the list and try again.")) }
         var rule = input
         rule.name = rule.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1916,16 +2136,15 @@ private struct RulesHome: View {
         }
         if let parent = snapshot.rules.first(where: { $0.id == rule.parent }) {
             guard parent.hasApplied else { throw RuleOperationError(L10n.text("請先套用依據規則。", "Apply the parent rule first.")) }
-            if !allowingVerifiedRebinding {
-                let existing = snapshot.rules.first { $0.id == rule.id }
-                rule.target = existing?.hasApplied == true ? (existing?.target ?? "") : parent.target
-            }
+            let existing = snapshot.rules.first { $0.id == rule.id }
+            rule.target = existing?.hasApplied == true ? (existing?.target ?? "") : parent.target
             rule.category = parent.category
             rule.subcategory = parent.subcategory
         }
         guard !rule.target.isEmpty else { throw RuleOperationError(L10n.text("目的行事曆為必填。請返回規則主頁，先連接行事曆並選擇目的地。", "A destination calendar is required. Return to the rule, connect Calendar, and choose a destination.")) }
-        if let saved = snapshot.rules.first(where: { $0.id == rule.id }),
-           saved.hasApplied && saved.target != rule.target && !allowingVerifiedRebinding {
+        let saved = snapshot.rules.first { $0.id == rule.id }
+        let movingCalendar = saved?.hasApplied == true && saved?.target != rule.target
+        if movingCalendar && (!mayMoveCalendar || rule.parent != nil) {
             throw RuleOperationError(L10n.text("這條規則已套用，不能更換目的行事曆。", "This rule has already been applied. Its destination calendar cannot be changed."))
         }
         rule.hasApplied = true
@@ -1943,9 +2162,18 @@ private struct RulesHome: View {
                 pending.append(child.id)
             }
         }
+        var moves: [UUID: CalendarMove] = [:]
+        if movingCalendar { try assertWritable(branchIDs, eventRuleIDs: branchIDs) }
+        let baseline = Dictionary(uniqueKeysWithValues: snapshot.rules.map { ($0.id, $0) })
         for index in rules.indices where branchIDs.contains(rules[index].id) {
             rules[index].category = rule.category
             rules[index].subcategory = rule.subcategory
+            if movingCalendar {
+                if let old = baseline[rules[index].id], old.hasApplied, old.target != rule.target {
+                    moves[old.id] = .init(source: old.target, destination: rule.target)
+                }
+                rules[index].target = rule.target
+            }
         }
 
         var root = rule
@@ -1963,7 +2191,7 @@ private struct RulesHome: View {
         let available = rules.filter { included.contains($0.id) && $0.hasApplied }
         let desired = try RuleEngine.plan(root: root, rules: available).filter { branchIDs.contains($0.ruleID) }
         let previous = snapshot.occurrences.filter { branchIDs.contains($0.ruleID) }
-        return RuleReconciliation(desired: desired, previous: previous, ruleIDs: branchIDs, rules: rules)
+        return RuleReconciliation(desired: desired, previous: previous, ruleIDs: branchIDs, rules: rules, moves: moves)
     }
 
     private func preview(_ rule: Rule) throws -> RuleEventPreviewResult {
@@ -1972,8 +2200,9 @@ private struct RulesHome: View {
         rules.append(rule)
         let tree = ruleTreeRows(roots: [rule], rules: rules)
         do {
-            let plan = try resolve(rule)
-            let events = try calendar.previewEvents(ruleIDs: plan.ruleIDs, desired: plan.desired, previous: plan.previous)
+            let plan = try resolve(rule, mayMoveCalendar: true)
+            let events = try calendar.previewEvents(ruleIDs: plan.ruleIDs, desired: plan.desired, previous: plan.previous,
+                                                    moves: plan.moves)
             return RuleEventPreviewResult(rules: tree, events: events, warning: nil)
         } catch {
             let ids = Set(tree.map(\.id))
@@ -2001,11 +2230,11 @@ private struct RulesHome: View {
             guard snapshot.rules.first(where: { $0.id == rule.id }) == expected else {
                 throw CloudRuleError.conflict
             }
-            let plan = try resolve(rule)
+            let plan = try resolve(rule, mayMoveCalendar: true)
             var updated = snapshot
             updated.rules = plan.rules
             try await performMutation(updated, scope: plan.ruleIDs, desired: plan.desired,
-                                      previous: plan.previous, eventRuleIDs: plan.ruleIDs)
+                                      previous: plan.previous, eventRuleIDs: plan.ruleIDs, moves: plan.moves)
             if let account { UserDefaults.standard.removeObject(forKey: cloudLocalKey("rules.cloudDraft.\(account).\(rule.id)")) }
             return snapshot.rules.first { $0.id == rule.id } ?? rule
         } catch {
@@ -2176,16 +2405,16 @@ private struct RulesHome: View {
     }
 
     private func birthdayStatus(_ candidate: BirthdayCandidate) -> BirthdayDuplicateStatus {
-        let sameContact = rootRules.filter {
-            $0.birthdaySource?.contactID == candidate.source.contactID &&
-            $0.birthdaySource?.isLunar == candidate.source.isLunar
-        }
-        if sameContact.contains(where: { $0.birthdaySource == candidate.source }) { return .imported }
-        if !sameContact.isEmpty { return .changed }
+        let account = cloudSession?.accountID
+        let tokens: Set<String> = [candidate.matchingToken(accountID: account),
+                                   candidate.legacyMatchingToken(accountID: account)]
+        if cloudSession?.ledger.pending.contains(where: { operation in
+            operation.upserts.contains { $0.rule.birthdayMatchToken.map(tokens.contains) == true }
+        }) == true { return .pending }
+        if rootRules.contains(where: { $0.birthdayMatchToken.map(tokens.contains) == true }) { return .imported }
         let possibleTitles = candidate.duplicateTitles
         if rootRules.contains(where: { rule in
-            guard rule.birthdaySource == nil,
-                  possibleTitles.contains(rule.name.trimmingCharacters(in: .whitespacesAndNewlines)),
+            guard possibleTitles.contains(rule.name.trimmingCharacters(in: .whitespacesAndNewlines)),
                   rule.period == .year, rule.weekdayPattern == nil else { return false }
             if candidate.isLunar {
                 return rule.kind == .lunar && rule.lunarMonth == candidate.month &&
@@ -2198,7 +2427,7 @@ private struct RulesHome: View {
         return .available
     }
 
-    private func importBirthdays(_ candidates: [BirthdayCandidate], years: Int, target: String, applyNow: Bool,
+    private func importBirthdays(_ candidates: [BirthdayCandidate], years: Int, target: String,
                                  category: String, subcategory: String, preferNickname: Bool) async throws {
         try requireCalendarMaintenance()
         guard loaded, (1...999).contains(years), !candidates.isEmpty else {
@@ -2213,21 +2442,25 @@ private struct RulesHome: View {
         var updated = snapshot
         var imported: [Rule] = []
         var planned: [PlannedOccurrence] = []
-        guard Set(candidates.map(\.id)).count == candidates.count else {
+        let account = cloudSession?.accountID
+        let matchTokens = candidates.map { $0.matchingToken(accountID: account) }
+        guard Set(matchTokens).count == candidates.count else {
             throw RuleOperationError(L10n.text("選取清單有重複的生日，請返回確認。", "The selection contains duplicate birthdays. Go back and review it."))
         }
-        for candidate in candidates {
+        for (candidate, token) in zip(candidates, matchTokens) {
             switch birthdayStatus(candidate) {
             case .imported:
                 throw RuleOperationError(L10n.text("「\(candidate.name)」已匯入，請重新選擇。", "\(candidate.name) has already been imported. Choose a different entry."))
-            case .available, .possibleDuplicate, .changed:
+            case .pending:
+                throw CloudRuleError.birthdayAlreadyMatched
+            case .available, .possibleDuplicate:
                 break
             }
             var rule = Rule(name: candidate.eventTitle(preferNickname: preferNickname), kind: candidate.isLunar ? .lunar : .gregorian,
                             date: "", lunarMonth: candidate.month, lunarDay: candidate.day,
                             lunarIsLeap: candidate.isLeapMonth,
                             category: category, subcategory: subcategory)
-            rule.birthdaySource = candidate.source
+            rule.birthdayMatchToken = token
             rule.endMode = .duration
             rule.endCount = years
             rule.endUnit = .year
@@ -2252,26 +2485,23 @@ private struct RulesHome: View {
                 rule.monthEnd = false
             }
             rule.target = target
-            if applyNow {
-                rule.hasApplied = true
-                do {
-                    planned += try RuleEngine.plan(root: rule, rules: [rule])
-                } catch {
-                    throw RuleOperationError(L10n.text("「\(candidate.name)」：\(error.localizedDescription)", "\(candidate.name): \(error.localizedDescription)"))
-                }
+            rule.hasApplied = true
+            do {
+                planned += try RuleEngine.plan(root: rule, rules: [rule])
+            } catch {
+                throw RuleOperationError(L10n.text("「\(candidate.name)」：\(error.localizedDescription)", "\(candidate.name): \(error.localizedDescription)"))
             }
             imported.append(rule)
         }
         updated.rules.append(contentsOf: imported)
         let ids = Set(imported.map(\.id))
-        try await performMutation(updated, scope: ids, desired: planned, eventRuleIDs: applyNow ? ids : [])
-        if !applyNow, imported.count == 1, let only = imported.first {
-            path.append(.edit(only, isNew: true))
-        }
+        try await performMutation(updated, scope: ids, desired: planned, eventRuleIDs: ids,
+                                  legacyBirthdayMatches: Set(candidates.map { $0.legacyMatchingToken(accountID: account) }))
     }
 
-    private var toolsRow: some View {
+    private func toolsRow(scrollToTop: @escaping () -> Void) -> some View {
         HStack {
+            groupExpansionButton(for: visibleRootRules, scrollToTop: scrollToTop)
             Button {
                 isShowingBatch = true
             } label: {
@@ -2295,6 +2525,33 @@ private struct RulesHome: View {
         .font(.subheadline.weight(.semibold))
     }
 
+    private func groupExpansionButton(for rules: [Rule], scrollToTop: @escaping () -> Void) -> some View {
+        let groups = Set(rules.flatMap { rule -> [GroupAppearanceKey] in
+            let category = GroupAppearanceKey(category: rule.category)
+            if rule.subcategory.isEmpty { return [category] }
+            return [category, .init(category: rule.category, subcategory: rule.subcategory)]
+        })
+        // A collapsed category already hides its subcategories, even if each
+        // subcategory still remembers its own last expansion state.
+        let categories = groups.filter { $0.subcategory == nil }
+        let expanded = !categories.isSubset(of: listArrangement.collapsed)
+        let title = expanded ? L10n.text("全部收合", "Collapse All") : L10n.text("全部展開", "Expand All")
+        return Button {
+            withAnimation {
+                updateListArrangement {
+                    if expanded { $0.collapsed.formUnion(groups) }
+                    else { $0.collapsed.subtract(groups) }
+                }
+                if expanded { scrollToTop() }
+            }
+        } label: {
+            Label(title, systemImage: expanded ? "rectangle.compress.vertical" : "rectangle.expand.vertical")
+                .frame(minHeight: 44)
+        }
+        .disabled(groups.isEmpty)
+        .accessibilityIdentifier("toggle-all-rule-groups")
+    }
+
     private var intro: some View {
         Label(L10n.text("在這裡訂規則，在原本的行事曆看結果。", "Set up rules here and see the events in the calendar you already use."), systemImage: "point.3.connected.trianglepath.dotted")
             .font(.subheadline)
@@ -2305,15 +2562,12 @@ private struct RulesHome: View {
     }
 
     private var emptyState: some View {
-        VStack(alignment: .trailing, spacing: 0) {
-            addRuleButton
-            ContentUnavailableView {
-                Label(L10n.text("還沒有規則", "No Rules Yet"), systemImage: "calendar.badge.plus")
-            } description: {
-                Text(L10n.text("新增一條日期規則，或從通訊錄選擇生日匯入。", "Add a rule or import birthdays from Contacts."))
-            }
-            .frame(maxWidth: .infinity)
+        ContentUnavailableView {
+            Label(L10n.text("還沒有規則", "No Rules Yet"), systemImage: "calendar.badge.plus")
+        } description: {
+            Text(L10n.text("新增一條日期規則，或從通訊錄選擇生日匯入。", "Add a rule or import birthdays from Contacts."))
         }
+        .frame(maxWidth: .infinity)
     }
 
     private var addRuleButton: some View {
@@ -2328,41 +2582,169 @@ private struct RulesHome: View {
         .accessibilityIdentifier("add-rule")
     }
 
-    private func category(_ title: String, rules: [Rule], isFirst: Bool) -> some View {
+    private func categoryKeys(_ rules: [Rule]) -> [GroupAppearanceKey] {
+        listArrangement.sorted(uniqueNames(rules.map(\.category)).map { .init(category: $0) })
+    }
+
+    private func subcategoryKeys(_ category: String, _ rules: [Rule]) -> [GroupAppearanceKey] {
+        listArrangement.sorted(uniqueNames(rules.map(\.subcategory).filter { !$0.isEmpty })
+            .map { .init(category: category, subcategory: $0) })
+    }
+
+    private func upcomingOccurrences() -> [UUID: PlannedOccurrence] {
+        let now = Date()
+        return snapshot.occurrences.reduce(into: [:]) { next, event in
+            guard event.start > now else { return }
+            if let previous = next[event.ruleID], previous.start <= event.start { return }
+            next[event.ruleID] = event
+        }
+    }
+
+    private func category(_ key: GroupAppearanceKey, rules: [Rule], next: [UUID: PlannedOccurrence],
+                          canReorder: Bool) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                groupLabel(.init(category: title))
-                    .padding(.leading, 3)
-                if isFirst { addRuleButton }
-            }
-            let subcategories = uniqueNames(rules.map(\.subcategory).filter { !$0.isEmpty })
-            let groupOrder = subcategories + (rules.contains { $0.subcategory.isEmpty } ? [""] : [])
-            ForEach(groupOrder, id: \.self) { subcategory in
-                let group = rules.filter { $0.subcategory == subcategory }
-                VStack(alignment: .leading, spacing: 0) {
-                    if !subcategory.isEmpty {
-                        groupLabel(.init(category: title, subcategory: subcategory))
-                            .padding(.horizontal, 8)
-                            .accessibilityAddTraits(.isHeader)
-                    }
-                    ForEach(group) { rule in
-                        if !subcategory.isEmpty || rule.id != group.first?.id {
-                            Divider().padding(.leading, 15)
+            groupLabel(key, canReorder: canReorder)
+                .padding(.leading, 3)
+            if !listArrangement.collapsed.contains(key) {
+                let subcategories = subcategoryKeys(key.category, rules)
+                let groupOrder = subcategories + (rules.contains { $0.subcategory.isEmpty }
+                    ? [.init(category: key.category, subcategory: "")] : [])
+                ForEach(groupOrder) { subkey in
+                    let subcategory = subkey.subcategory ?? ""
+                    let group = rules.filter { $0.subcategory == subcategory }
+                    let sorted = group.enumerated().sorted { lhs, rhs in
+                        let left = next[lhs.element.id]?.start ?? .distantFuture
+                        let right = next[rhs.element.id]?.start ?? .distantFuture
+                        return left == right ? lhs.offset < rhs.offset : left < right
+                    }.map(\.element)
+                    VStack(alignment: .leading, spacing: 0) {
+                        if !subcategory.isEmpty {
+                            groupLabel(subkey, canReorder: subcategories.count > 1)
+                                .padding(.horizontal, 8)
                         }
-                        NavigationLink(value: Route.edit(rule, isNew: !rule.hasApplied)) {
-                            ruleRow(rule)
+                        if subcategory.isEmpty || !listArrangement.collapsed.contains(subkey) {
+                            ForEach(sorted) { rule in
+                                if !subcategory.isEmpty || rule.id != sorted.first?.id {
+                                    Divider().padding(.leading, 15)
+                                }
+                                NavigationLink(value: Route.edit(rule, isNew: !rule.hasApplied)) {
+                                    ruleRow(rule, next: next[rule.id])
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
-                        .buttonStyle(.plain)
                     }
+                    .background(card, in: RoundedRectangle(cornerRadius: 18))
+                    .padding(.leading, PadRuleColumn.groupIndent)
                 }
-                .background(card, in: RoundedRectangle(cornerRadius: 18))
-                .padding(.leading, 22)
             }
         }
     }
 
-    private func groupLabel(_ key: GroupAppearanceKey) -> some View {
+    private func updateListArrangement(_ update: (inout RuleListArrangement) -> Void) {
+        var arrangement = localListArrangement
+        update(&arrangement)
+        if let data = try? JSONEncoder().encode(arrangement) {
+            listArrangementData = data
+        }
+    }
+
+    private func siblingGroups(_ key: GroupAppearanceKey) -> [GroupAppearanceKey] {
+        if key.subcategory == nil { return categoryKeys(rootRules) }
+        return subcategoryKeys(key.category, rootRules.filter { $0.category == key.category })
+    }
+
+    private func reorderTarget(near y: CGFloat, for source: GroupAppearanceKey) -> GroupAppearanceKey? {
+        siblingGroups(source).first { key in
+            guard key != source, let frame = ruleGroupFrames[key] else { return false }
+            return y >= frame.minY && y <= frame.maxY
+        }
+    }
+
+    private func refreshGroupOrder(for account: String, seed: [GroupAppearanceKey]) async {
+        guard !savingCloudOrder, !cloudResetPending, cloudSession?.accountID == account else { return }
+        let generation = UUID()
+        groupOrderGeneration = generation
+        do {
+            let order = try await cloud.groupOrder(accountID: account, seed: seed)
+            guard groupOrderGeneration == generation, !savingCloudOrder, !cloudResetPending,
+                  cloudSession?.accountID == account else { return }
+            savedCloudOrder = (account, order)
+        } catch {
+            // Keep last known ordering if this independent record is unreachable.
+        }
+    }
+
+    private func reorderGroup(_ source: GroupAppearanceKey, to target: GroupAppearanceKey) {
+        let siblings = siblingGroups(target)
+        guard source != target, siblings.contains(source), siblings.contains(target),
+              localListArrangement.collapsed.contains(source), !savingCloudOrder else { return }
+        guard let account = cloudSession?.accountID else {
+            guard cloudReady, !cloudResetPending else {
+                toolbarError = L10n.text("無法確認 iCloud 帳號，請稍後再試。", "Could not verify the iCloud account. Try again later.")
+                return
+            }
+            withAnimation { updateListArrangement { $0.move(source, to: target, among: siblings) } }
+            return
+        }
+        guard !cloudResetPending else { return }
+        var proposal = listArrangement
+        proposal.move(source, to: target, among: siblings)
+        let moved = proposal.sorted(siblings)
+        let generation = UUID()
+        groupOrderGeneration = generation
+        savingCloudOrder = true
+        Task { @MainActor in
+            defer { savingCloudOrder = false }
+            do {
+                let order = try await cloud.saveGroupOrder(moved, accountID: account)
+                guard groupOrderGeneration == generation, !cloudResetPending,
+                      cloudSession?.accountID == account else { return }
+                withAnimation { savedCloudOrder = (account, order) }
+            } catch {
+                guard groupOrderGeneration == generation, !cloudResetPending,
+                      cloudSession?.accountID == account else { return }
+                toolbarError = L10n.text("無法將排序存入 iCloud，請稍後再試。", "Could not save the order to iCloud. Try again later.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func groupDragHandle(_ key: GroupAppearanceKey) -> some View {
+        let siblings = siblingGroups(key)
+        if let index = siblings.firstIndex(of: key) {
+            Image(systemName: "line.3.horizontal")
+                .foregroundStyle(.secondary)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+                .highPriorityGesture(
+                    DragGesture(minimumDistance: 5, coordinateSpace: .global)
+                        .updating($reorderHover) { value, hover, _ in
+                            hover = reorderTarget(near: value.location.y, for: key)
+                        }
+                        .onEnded { value in
+                            if let target = reorderTarget(near: value.location.y, for: key) {
+                                reorderGroup(key, to: target)
+                            }
+                        }
+                )
+                .accessibilityLabel(L10n.text("重新排序：\(key.title)", "Reorder \(key.title)"))
+                .accessibilityIdentifier("drag-rule-group-\(key.category)-\(key.subcategory ?? "")")
+                .accessibilityAdjustableAction { direction in
+                    let destination: Int
+                    switch direction {
+                    case .decrement: destination = index - 1
+                    case .increment: destination = index + 1
+                    @unknown default: return
+                    }
+                    if siblings.indices.contains(destination) { reorderGroup(key, to: siblings[destination]) }
+                }
+        }
+    }
+
+    private func groupLabel(_ key: GroupAppearanceKey, canReorder: Bool) -> some View {
         let appearance = groupAppearance(key)
+        let collapsed = listArrangement.collapsed.contains(key)
         return HStack(spacing: 6) {
             Button {
                 appearanceGroup = key
@@ -2377,23 +2759,49 @@ private struct RulesHome: View {
             .disabled(!calendar.hasFullAccess)
             .accessibilityLabel(L10n.text("調整\(key.title)圖示與顏色", "Change icon and color for \(key.title)"))
             .accessibilityIdentifier(key.subcategory == nil ? "category-appearance" : "subcategory-appearance")
-            Text(key.title)
-                .font(key.subcategory == nil ? .headline : .footnote.weight(.semibold))
-                .foregroundStyle(key.subcategory == nil ? .primary : .secondary)
-                .accessibilityAddTraits(.isHeader)
-            Spacer()
+            Button {
+                withAnimation {
+                    updateListArrangement {
+                        if collapsed { $0.collapsed.remove(key) } else { $0.collapsed.insert(key) }
+                    }
+                }
+            } label: {
+                HStack(spacing: 7) {
+                    Text(key.title)
+                        .font(key.subcategory == nil ? .headline : .footnote.weight(.semibold))
+                    Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    Spacer(minLength: 0)
+                }
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(key.subcategory == nil ? .primary : .secondary)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityValue(collapsed ? L10n.text("已收合", "Collapsed") : L10n.text("已展開", "Expanded"))
+            .accessibilityIdentifier("toggle-rule-group-\(key.category)-\(key.subcategory ?? "")")
+            if collapsed && canReorder { groupDragHandle(key) }
         }
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: RuleGroupFrames.self, value: [key: proxy.frame(in: .global)])
+            }
+        }
+        .background(reorderHover == key ? slate.opacity(0.14) : .clear,
+                    in: RoundedRectangle(cornerRadius: 9))
     }
 
-    private func ruleRow(_ rule: Rule) -> some View {
+    private func ruleRow(_ rule: Rule, next: PlannedOccurrence?) -> some View {
         HStack(spacing: 11) {
             Image(systemName: rule.displayAppearance.symbol(or: rule.defaultSymbol))
-                .foregroundStyle(rule.displayAppearance.tint(or: slate))
+                .foregroundStyle(rule.displayAppearance.iconTint(defaultSymbol: rule.defaultSymbol, baseColor: slate))
                 .font(.subheadline.weight(.semibold))
                 .frame(width: 34, height: 34)
                 .background(rule.displayAppearance.tint(or: slate).opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
                 .accessibilityHidden(true)
-            let next = snapshot.occurrences.lazy.filter { $0.ruleID == rule.id && $0.start > Date() }.min { $0.start < $1.start }
             let status = freezeReason(rule.id).map { L10n.text("凍結：", "Frozen: ") + $0 }
                 ?? pendingReason(rule.id)
                 ?? (rule.hasApplied
@@ -2547,6 +2955,7 @@ private struct PadExitRequest {
 private struct RuleEditor: View {
     @State private var rule: Rule
     @State private var baseline: Rule?
+    @State private var eventPreviewExpanded = false
     @State private var emptyCutoffSchedule: Rule?
     @State private var exitBaseline: Rule
     @State private var pendingDiscard = false
@@ -2560,7 +2969,6 @@ private struct RuleEditor: View {
     @State private var collapsedBranches: Set<UUID> = []
     @State private var editingAppearance = false
     @State private var showingDeletion = false
-    @State private var didDelete = false
     @State private var followsSuggestedTitle: Bool
     @State private var followsSuggestedCategory: Bool
     @State private var followsCategoryDestination: Bool
@@ -2569,6 +2977,7 @@ private struct RuleEditor: View {
     let parent: Rule?
     let allRules: [Rule]
     private let isFreshRule: Bool
+    private let prefilledCategory: String
     @ObservedObject var calendar: CalendarIntegration
     let preview: (Rule) throws -> RuleEventPreviewResult
     let onApply: (Rule, Rule?) async throws -> Rule
@@ -2578,7 +2987,6 @@ private struct RuleEditor: View {
     let currentDeletionAvailability: () -> RuleDeletionAvailability
     let rereadDeletion: () async -> Void
     let onDelete: (UUID, BatchRemovalPreview) async throws -> Void
-    let onDeleted: () -> Void
     let onSaveAppearance: (UUID, RuleAppearance) async throws -> Bool
     let frozenReason: String?
     let thawTitle: String?
@@ -2596,17 +3004,19 @@ private struct RuleEditor: View {
          currentDeletionAvailability: @escaping () -> RuleDeletionAvailability,
          rereadDeletion: @escaping () async -> Void,
          onDelete: @escaping (UUID, BatchRemovalPreview) async throws -> Void,
-         onDeleted: @escaping () -> Void,
          onSaveAppearance: @escaping (UUID, RuleAppearance) async throws -> Bool,
          frozenReason: String?, hiddenRuleIDs: Set<UUID>, padExitRequests: PassthroughSubject<PadExitRequest, Never>? = nil, thawTitle: String?, onThaw: (() -> Void)?,
          onOpenChild: @escaping (Rule, Bool) -> Void) {
         let isFresh = isNew && !allRules.contains { $0.id == initial.id }
         self.isFreshRule = isFresh
         let shouldSuggest = isFresh && initial.name.isEmpty
-        let shouldSuggestCategory = isFresh && initial.category.isEmpty
+        let shouldSuggestCategory = isFresh && parent == nil
+        prefilledCategory = initial.category
         var startingRule = initial
         if shouldSuggest, let suggestion = startingRule.suggestedTitle { startingRule.name = suggestion }
-        if shouldSuggestCategory, let suggestion = startingRule.suggestedCategory { startingRule.category = suggestion }
+        if shouldSuggestCategory, let suggestion = startingRule.suggestedCategory(prefill: initial.category) {
+            startingRule.category = suggestion
+        }
         _followsSuggestedTitle = State(initialValue: shouldSuggest)
         _followsSuggestedCategory = State(initialValue: shouldSuggestCategory)
         _followsCategoryDestination = State(initialValue: isFresh && parent == nil && initial.target.isEmpty)
@@ -2614,6 +3024,7 @@ private struct RuleEditor: View {
         _baseline = State(initialValue: isNew ? nil : initial)
         _compareBaseline = State(initialValue: isFresh ? nil : initial)
         _exitBaseline = State(initialValue: startingRule)
+        _eventPreviewExpanded = State(initialValue: isNew)
         self.parent = parent
         self.allRules = allRules
         self.calendar = calendar
@@ -2625,7 +3036,6 @@ private struct RuleEditor: View {
         self.currentDeletionAvailability = currentDeletionAvailability
         self.rereadDeletion = rereadDeletion
         self.onDelete = onDelete
-        self.onDeleted = onDeleted
         self.onSaveAppearance = onSaveAppearance
         self.frozenReason = frozenReason
         self.thawTitle = thawTitle
@@ -2685,7 +3095,7 @@ private struct RuleEditor: View {
     }
     private var hasDestination: Bool { calendar.destinations.contains { $0.id == destinationID && $0.isWritable } }
     private var canApply: Bool { frozenReason == nil && !applying && hasTitle && (parent != nil || !trimmedCategory.isEmpty) && hasDestination }
-    private var isDestinationLocked: Bool { parent != nil || baseline?.hasApplied == true }
+    private var isDestinationLocked: Bool { parent != nil }
     private var chosenDestination: String {
         let id = destinationID
         if let destination = calendar.destinations.first(where: { $0.id == id }) {
@@ -2713,7 +3123,20 @@ private struct RuleEditor: View {
         gregorianCalendar.component(.day, from: rule.start) == gregorianCalendar.range(of: .day, in: .month, for: rule.start)?.last
     }
 
-    var body: some View {
+    private var editorTitle: String {
+        let isNew = baseline == nil
+        let defaultTitle = isNew ? L10n.text("新增規則", "New Rule") : L10n.text("編輯規則", "Edit Rule")
+        guard !isNew || hasUnsavedChanges else { return defaultTitle }
+        guard rule.interval > 0 else { return defaultTitle }
+        if rule.parent != nil {
+            guard parent != nil else { return defaultTitle }
+        } else if rule.kind == .solar {
+            guard SolarTerms.names.contains(rule.date) else { return defaultTitle }
+        }
+        return rule.homeRecurrenceCaption
+    }
+
+    private var editorForm: some View {
         Form {
             Group {
             if let parent {
@@ -2736,7 +3159,7 @@ private struct RuleEditor: View {
                         editingAppearance = true
                     } label: {
                         Image(systemName: rule.displayAppearance.symbol(or: rule.defaultSymbol))
-                            .foregroundStyle(rule.displayAppearance.tint(or: slate))
+                            .foregroundStyle(rule.displayAppearance.iconTint(defaultSymbol: rule.defaultSymbol, baseColor: slate))
                             .frame(width: 44, height: 44)
                             .background(rule.displayAppearance.tint(or: slate).opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
                     }
@@ -2821,7 +3244,8 @@ private struct RuleEditor: View {
             } header: { Text(L10n.text("子規則", "Child Rules")) }
               footer: { Text(baseline == nil ? L10n.text("先套用這條規則，才能新增它的子規則。", "Apply this rule before adding child rules.") : L10n.text("可編輯直接子規則；縮排的下游項目僅供查看。", "You can edit direct child rules here. Deeper levels are shown for reference.")) }
             if calendar.hasFullAccess {
-                EventPreview(rule: previewRule, savedRules: allRules, civilCalendar: ruleCalendar, load: preview)
+                EventPreview(rule: previewRule, expanded: $eventPreviewExpanded,
+                             savedRules: allRules, civilCalendar: ruleCalendar, load: preview)
             }
             if !isFreshRule && frozenReason == nil {
                 Section {
@@ -2833,10 +3257,20 @@ private struct RuleEditor: View {
                 }
             }
         }
+    }
+
+    var body: some View {
+        Group {
+            if padExitRequests != nil {
+                PadRuleColumn.centered(editorForm)
+            } else {
+                editorForm
+            }
+        }
         .onChange(of: rule.suggestedTitle) { _, suggestion in
             if followsSuggestedTitle { rule.name = suggestion ?? "" }
         }
-        .onChange(of: rule.suggestedCategory) { _, suggestion in
+        .onChange(of: rule.suggestedCategory(prefill: prefilledCategory)) { _, suggestion in
             if followsSuggestedCategory { rule.category = suggestion ?? "" }
         }
         .disabled(applying)
@@ -2851,7 +3285,10 @@ private struct RuleEditor: View {
                 }.font(.footnote).padding().background(.regularMaterial)
             }
         }
-        .navigationTitle(baseline == nil ? L10n.text("新增規則", "New Rule") : L10n.text("編輯規則", "Edit Rule"))
+        .navigationTitle(editorTitle)
+        .onChange(of: rule) { _, _ in
+            if hasUnsavedChanges { eventPreviewExpanded = true }
+        }
         .sheet(isPresented: $editingAppearance) {
             AppearanceEditSheet(title: rule.displayName, initial: rule.displayAppearance,
                                 defaultSymbol: rule.defaultSymbol) { appearance in
@@ -2880,9 +3317,13 @@ private struct RuleEditor: View {
         .toolbar {
             if hasUnsavedChanges {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button { pendingDiscard = true } label: {
+                    Button {
+                        guard !applying, !showingDeletion, !pendingDiscard else { return }
+                        pendingDiscard = true
+                    } label: {
                         Label(L10n.text("返回", "Back"), systemImage: "chevron.left")
                     }
+                    .disabled(applying)
                     .accessibilityIdentifier("guarded-back")
                 }
             }
@@ -2895,17 +3336,11 @@ private struct RuleEditor: View {
                 }
             }
         }
-        .sheet(isPresented: $showingDeletion, onDismiss: {
-            if didDelete {
-                didDelete = false
-                onDeleted()
-            }
-        }) {
+        .sheet(isPresented: $showingDeletion) {
             RuleDeletionPreview(civilCalendar: ruleCalendar, hasUnsavedChanges: hasUnsavedChanges,
                                 availability: deletionAvailability, currentAvailability: currentDeletionAvailability,
                                 reread: rereadDeletion, load: { try previewDeletion(rule.id) }) { expected in
                 try await onDelete(rule.id, expected)
-                didDelete = true
                 showingDeletion = false
             }
         }
@@ -2998,10 +3433,12 @@ private struct RuleEditor: View {
     }
 
     private func applyAndReturn() {
+        guard !pendingDiscard, !showingDeletion else { return }
         applyAndReturn(then: nil)
     }
 
     private func applyAndReturn(then finish: (() -> Void)?, returns: Bool = true) {
+        guard !applying else { return }
         guard canApply else {
             operationError = frozenReason ?? missingRequiredPrompt
             return
@@ -3133,7 +3570,7 @@ private struct RuleEditor: View {
     private func treeLabel(_ row: TreeRow) -> some View {
         HStack(spacing: 8) {
             Image(systemName: row.item.displayAppearance.symbol(or: row.item.defaultSymbol))
-                .foregroundStyle(row.item.displayAppearance.tint(or: slate))
+                .foregroundStyle(row.item.displayAppearance.iconTint(defaultSymbol: row.item.defaultSymbol, baseColor: slate))
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 Text(row.item.displayName)
@@ -3404,10 +3841,10 @@ private struct RuleEventPreviewResult {
 
 private struct EventPreview: View {
     let rule: Rule
+    @Binding var expanded: Bool
     let savedRules: [Rule]
     let civilCalendar: Calendar
     let load: (Rule) throws -> RuleEventPreviewResult
-    @State private var expanded = false
     @State private var loadedRule: Rule?
     @State private var result: Result<RuleEventPreviewResult, Error>?
 
@@ -3451,10 +3888,11 @@ private struct EventPreview: View {
         } footer: {
             if expanded {
                 Text(L10n.text("這裡列出本規則及子規則已寫入行事曆的事件，以及尚未套用的變更。按「套用」後才會更新行事曆。", "This preview shows saved events and unapplied changes for this rule and its child rules. Your calendar is updated only when you tap Apply."))
+                    .accessibilityIdentifier("preview-expanded-explanation")
             }
         }
-        .onChange(of: expanded) { _, open in
-            if open, loadedRule != rule { refresh() }
+        .task(id: expanded) {
+            if expanded, loadedRule != rule { refresh() }
         }
         .onChange(of: rule) { _, _ in invalidate() }
         .onChange(of: savedRules) { _, _ in invalidate() }
@@ -3722,10 +4160,11 @@ private struct RulePreviewEventRow: View {
         case .unchanged: nil
         case .insert: (L10n.text("將新增", "To Add"), readableTint(light: 0x456B52, dark: 0x91AA98))
         case .update: (L10n.text("將修改", "To Update"), readableTint(light: 0x536780, dark: 0x98A9BF))
+        case .move: (L10n.text("將移動", "To Move"), readableTint(light: 0x536780, dark: 0x98A9BF))
         case .remove: (L10n.text("將移除", "To Remove"), requiredFieldTint)
         }
         let revisedTime: Bool
-        if case .update = event.kind, let oldStart = event.previousStart {
+        if (event.kind == .update || event.kind == .move), let oldStart = event.previousStart {
             revisedTime = oldStart != event.start || event.previousEnd != event.end || event.previousIsAllDay != event.isAllDay
         } else {
             revisedTime = false
@@ -3733,6 +4172,11 @@ private struct RulePreviewEventRow: View {
         return HStack(alignment: .firstTextBaseline, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(event.title).font(.subheadline.weight(.semibold))
+                if let source = event.previousCalendarTitle, let destination = event.destinationCalendarTitle {
+                    Text("\(source) → \(destination)").font(.caption).foregroundStyle(.secondary)
+                } else if let calendar = event.previousCalendarTitle ?? event.destinationCalendarTitle {
+                    Text(calendar).font(.caption).foregroundStyle(.secondary)
+                }
                 if revisedTime, let oldStart = event.previousStart {
                     Text(L10n.text("原：\(eventTime(start: oldStart, end: event.previousEnd ?? oldStart, allDay: event.previousIsAllDay ?? event.isAllDay))", "Before: \(eventTime(start: oldStart, end: event.previousEnd ?? oldStart, allDay: event.previousIsAllDay ?? event.isAllDay))"))
                         .font(.caption)
@@ -3833,6 +4277,8 @@ struct CalendarDestinationField: View {
 
 private struct CalStitchSettingsView: View {
     @Binding var hideFrozen: Bool
+    let usesPadLayout: Bool
+    let noFrozenRules: Bool
     @AppStorage("settings.defaultTimeZoneIdentifier") private var overrideIdentifier = ""
 
     private var installedVersion: String {
@@ -3852,7 +4298,7 @@ private struct CalStitchSettingsView: View {
         return language.appendingPathComponent(page)
     }
 
-    var body: some View {
+    private var settingsForm: some View {
         Form {
             Section {
                 LabeledContent {
@@ -3865,6 +4311,11 @@ private struct CalStitchSettingsView: View {
 
             Section {
                 Toggle(L10n.text("隱藏凍結的規則", "Hide Frozen Rules"), isOn: $hideFrozen)
+            } footer: {
+                if noFrozenRules {
+                    Text(L10n.text("目前沒有凍結的規則。", "There are no frozen rules."))
+                        .accessibilityIdentifier("settings-no-frozen-rules")
+                }
             }
 
             Section {
@@ -3897,6 +4348,16 @@ private struct CalStitchSettingsView: View {
                     Label(L10n.text("支援", "Support"), systemImage: "questionmark.circle")
                 }
                 .accessibilityIdentifier("support")
+            }
+        }
+    }
+
+    var body: some View {
+        Group {
+            if usesPadLayout {
+                PadRuleColumn.centered(settingsForm)
+            } else {
+                settingsForm
             }
         }
         .navigationTitle(L10n.text("設定", "Settings"))
@@ -4092,8 +4553,9 @@ struct SelectionMark: View {
 
 private struct OrphanCleanupView: View {
     @ObservedObject var calendar: CalendarIntegration
-    let existingRuleIDs: () throws -> Set<UUID>
-    let beforeRemove: () async throws -> Void
+    let protection: () async throws -> OrphanProtection
+    let remove: ([CalendarOrphanEvent], CalendarOrphanPreview) async throws -> Void
+    @State private var scanning = false
     @State private var removing = false
     @Environment(\.dismiss) private var dismiss
     @State private var preview: CalendarOrphanPreview?
@@ -4111,7 +4573,7 @@ private struct OrphanCleanupView: View {
         NavigationStack {
             List {
                 Section {
-                    Text(L10n.text("只顯示有 CalStitch 標記，但在這台裝置找不到原規則的事件。若事件來自另一台裝置，請先確認不再需要。", "Only events tagged by CalStitch that have no matching rule on this device are shown. If an event came from another device, make sure it is no longer needed."))
+                    Text(L10n.text("只列出有 CalStitch 標記、找不到規則且不在待完成操作中的事件。最近 2 小時已移除的事件不列入。請只勾選你確定不再需要的事件。", "This lists tagged events with no matching rule or pending operation. Removals in the last two hours are excluded. Select only events you know you no longer need."))
                         .font(.footnote)
                     if let preview {
                         Text(L10n.text("搜尋範圍：\(dateCaption(preview.start)) 至 \(dateCaption(preview.through))", "Search range: \(dateCaption(preview.start)) to \(dateCaption(preview.through))"))
@@ -4120,6 +4582,9 @@ private struct OrphanCleanupView: View {
                     }
                     if let removedCount {
                         Text(L10n.text("已刪除 \(removedCount) 筆事件", "Deleted \(removedCount) \(removedCount == 1 ? "event" : "events")"))
+                    }
+                    if scanning {
+                        ProgressView(L10n.text("正在核對規則與事件…", "Checking rules and events…"))
                     }
                     if let failure {
                         Text(failure).foregroundStyle(.red)
@@ -4131,7 +4596,7 @@ private struct OrphanCleanupView: View {
                                 defer { connecting = false }
                                 do {
                                     try await calendar.connectCalendars()
-                                    refresh()
+                                    await refresh()
                                 } catch { failure = error.localizedDescription }
                             }
                         } label: {
@@ -4140,7 +4605,8 @@ private struct OrphanCleanupView: View {
                         }
                         .disabled(connecting)
                     } else if failure != nil {
-                        Button(L10n.text("重試", "Retry"), action: refresh)
+                        Button(L10n.text("重試", "Retry")) { Task { await refresh() } }
+                            .disabled(scanning || removing)
                     }
                 }
                 if let preview {
@@ -4152,7 +4618,7 @@ private struct OrphanCleanupView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button(L10n.text("關閉", "Close")) { dismiss() } }
-                if !selected.isEmpty {
+                if !selected.isEmpty && !scanning && !removing {
                     ToolbarItem(placement: .confirmationAction) {
                         Button(role: .destructive) { confirmation = true } label: {
                             Text(L10n.text("刪除（\(selected.count)）", "Delete (\(selected.count))")).foregroundStyle(.red)
@@ -4161,8 +4627,8 @@ private struct OrphanCleanupView: View {
                     }
                 }
             }
-            .task { if calendar.hasFullAccess { refresh() } }
-            .refreshable { if calendar.hasFullAccess { refresh() } }
+            .task { if calendar.hasFullAccess { await refresh() } }
+            .refreshable { if calendar.hasFullAccess { await refresh() } }
             .alert(L10n.text("刪除 \(selected.count) 筆遺留事件？", "Delete \(selected.count) leftover \(selected.count == 1 ? "event" : "events")?"), isPresented: $confirmation) {
                 Button(L10n.text("取消", "Cancel"), role: .cancel) {}
                 Button(L10n.text("刪除", "Delete"), role: .destructive, action: removeSelected)
@@ -4215,35 +4681,38 @@ private struct OrphanCleanupView: View {
         } header: { Text(title) }
     }
 
-    private func refresh() {
+    private func refresh() async {
+        guard !scanning else { return }
+        scanning = true
+        defer { scanning = false }
         selection.removeAll()
+        preview = nil
         failure = nil
         do {
-            preview = try calendar.previewOrphans(existingRuleIDs: existingRuleIDs())
+            let checked = try await protection()
+            guard !Task.isCancelled else { return }
+            preview = try calendar.previewOrphans(protection: checked)
         } catch {
-            preview = nil
             failure = error.localizedDescription
         }
     }
 
     private func removeSelected() {
-        guard let preview, !selected.isEmpty else { return }
+        guard let preview, !selected.isEmpty, !removing, !scanning else { return }
         let items = selected
-        guard !removing else { return }
         removing = true
         Task { @MainActor in
             defer { removing = false }
             do {
-                try await beforeRemove()
-            try calendar.removeOrphans(items, from: preview, existingRuleIDs: existingRuleIDs())
-            removedCount = items.count
-            refresh()
-        } catch {
-            removedCount = nil
-            refresh()
-            failure = error.localizedDescription
+                try await remove(items, preview)
+                removedCount = items.count
+                await refresh()
+            } catch {
+                removedCount = nil
+                await refresh()
+                failure = error.localizedDescription
+            }
         }
-    }
     }
 }
 

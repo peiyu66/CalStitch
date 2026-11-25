@@ -7,8 +7,10 @@ trap 'rm -rf "$temporary"' EXIT
 # linking the iOS UIKit/SwiftUI app into this macOS-only contract executable.
 {
     echo 'import Foundation'
+    echo 'import CryptoKit'
+    echo 'import Contacts'
     echo 'struct RuleAppearance: Codable, Hashable {}'
-    sed -n '/^struct BirthdayImportSource:/,/^}/p' CalStitch/BirthdayImportView.swift
+    sed -n '/^struct BirthdayImportSource:/,/^}/p; /^enum BirthdayMatchToken {/,/^}/p; /^enum BirthdayDuplicateStatus:/,/^}/p; /^struct BirthdayCandidate:/,/^}/p' CalStitch/BirthdayImportView.swift
     sed -n '/^private let ruleZone/,/^func categoryCalendarPresets/{ /^func categoryCalendarPresets/!p; }' CalStitch/CalStitchApp.swift
     sed -n '/^struct CalendarSyncDestination:/,/^struct CalendarChange:/{ /^struct CalendarChange:/!p; }' CalStitch/CalendarIntegration.swift
 } > "$temporary/Models.swift"

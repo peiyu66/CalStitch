@@ -1,3 +1,4 @@
+import Contacts
 import Foundation
 
 @MainActor final class MemoryTransport: CloudRuleTransport {
@@ -24,11 +25,71 @@ import Foundation
     }
 }
 
+// Wire fields understood by the previously shipped iCloud-capable code.
+private struct LegacyRuleLedger: Codable {
+    var schema: Int
+    var rules: [CloudRuleEnvelope]
+    var pending: [CloudRuleOperation]
+    var tombstones: Set<UUID>
+    var completed: Set<UUID>
+    var retired: Set<UUID>?
+}
+
 @main struct Harness {
     @MainActor static func main() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("CalStitchCloudFixture-\(UUID())")
         defer { try? FileManager.default.removeItem(at: directory) }
+        // Retired Development must fail closed before account lookup (nil would allow EventKit fallback).
+        let retired = RuleCloudSync(environment: .development, stateDirectory: directory)
+        do {
+            _ = try await retired.refresh()
+            fatalError("Retired development rule transport reached CloudKit or signed-out fallback")
+        } catch CloudRuleError.developmentRetired {}
+        do {
+            _ = try await retired.groupOrder(accountID: "A")
+            fatalError("Retired development order transport reached CloudKit")
+        } catch CloudRuleError.developmentRetired {}
         let transport = MemoryTransport()
+        let orderTransport = MemoryTransport()
+        let orderA = RuleCloudSync(transport: transport, stateURL: directory.appendingPathComponent("order-a"),
+                                   groupOrderTransport: orderTransport)
+        let orderB = RuleCloudSync(transport: transport, stateURL: directory.appendingPathComponent("order-b"),
+                                   groupOrderTransport: orderTransport)
+        let birthday = RuleGroupOrderKey(category: "Birthday")
+        let holiday = RuleGroupOrderKey(category: "Holiday")
+        let family = RuleGroupOrderKey(category: "Birthday", subcategory: "Family")
+        let friends = RuleGroupOrderKey(category: "Birthday", subcategory: "Friends")
+        let absentOrder = try await orderA.groupOrder(accountID: "A")
+        precondition(absentOrder.isEmpty && orderTransport.serial == 0)
+        let migratedOrder = try await orderA.groupOrder(accountID: "A", seed: [holiday, birthday])
+        precondition(migratedOrder == [holiday, birthday])
+        let peerOrder = try await orderB.groupOrder(accountID: "A", seed: [birthday, holiday])
+        precondition(peerOrder == migratedOrder, "A later legacy seed cannot overwrite a confirmed order")
+        let subgroups = try await orderB.saveGroupOrder([friends, family], accountID: "A")
+        precondition(subgroups == [holiday, birthday, friends, family])
+        orderTransport.nextFailure = .staleCAS
+        let updatedOrder = try await orderA.saveGroupOrder([birthday, holiday], accountID: "A")
+        precondition(updatedOrder == [birthday, holiday, friends, family])
+        let updatedPeerOrder = try await orderB.groupOrder(accountID: "A")
+        precondition(updatedPeerOrder == updatedOrder && transport.serial == 0)
+        let work = RuleGroupOrderKey(category: "Work")
+        _ = try await orderB.saveGroupOrder([birthday, work, holiday], accountID: "A")
+        let laggingOrder = try await orderA.saveGroupOrder([holiday, birthday], accountID: "A")
+        precondition(laggingOrder.filter { $0.subcategory == nil } == [holiday, work, birthday])
+        let orderPayload = try JSONEncoder().encode(orderTransport.accounts["A"]!.ledger)
+        precondition(!String(decoding: orderPayload, as: UTF8.self).contains("collapsed"))
+        do {
+            _ = try await orderA.saveGroupOrder([birthday, family], accountID: "A")
+            fatalError("Cross-level group reorder accepted")
+        } catch CloudRuleError.invalidLedger {}
+        orderTransport.active = "B"
+        do {
+            _ = try await orderA.groupOrder(accountID: "A")
+            fatalError("Read another account’s group order")
+        } catch CloudRuleError.accountChanged {}
+        let otherAccountOrder = try await orderB.groupOrder(accountID: "B")
+        precondition(otherAccountOrder.isEmpty)
+        orderTransport.active = "A"
         let aURL = directory.appendingPathComponent("a")
         let a = RuleCloudSync(transport: transport, stateURL: aURL)
         let b = RuleCloudSync(transport: transport, stateURL: directory.appendingPathComponent("b"))
@@ -53,11 +114,21 @@ import Foundation
         let wire = String(decoding: try JSONEncoder().encode(seeded.ledger), as: UTF8.self)
         precondition(!wire.contains("LOCAL_EVENTKIT_IDENTIFIER") && !wire.contains("LOCAL_CONTACT_ID"))
         precondition(seeded.ledger.rules.first?.destination?.localOwner == a.deviceID)
+        // An older writer posts the entire rules asset after decoding with its
+        // own schema. That rewrite must leave the separate order asset alone.
+        let oldOrderVersion = orderTransport.accounts["A"]?.version
+        var legacyLedger = try JSONDecoder().decode(LegacyRuleLedger.self, from: Data(wire.utf8))
+        legacyLedger.rules[0].rule.name = "Edited by an older client"
+        let legacyRewrite = try JSONDecoder().decode(CloudRuleLedger.self, from: JSONEncoder().encode(legacyLedger))
+        precondition(legacyRewrite.groupOrder == nil)
+        let legacySaved = try await transport.compareAndSwap(legacyRewrite, from: seeded)
+        let orderAfterLegacySave = try await orderB.groupOrder(accountID: "A")
+        precondition(orderAfterLegacySave == laggingOrder && orderTransport.accounts["A"]?.version == oldOrderVersion)
         let bStale = try await b.refresh()!
         envelope.rule.name = "winner"
         let winner = CloudRuleOperation(owner: a.deviceID, scope: [rule.id], upserts: [envelope], deletions: [])
         transport.nextFailure = .loseResponse
-        let won = try await a.claim(winner, localBefore: [], localAfter: [], in: seeded)
+        let won = try await a.claim(winner, localBefore: [], localAfter: [], in: legacySaved)
         precondition(won.ledger.pendingOperation(winner.id) != nil)
         let loser = CloudRuleOperation(owner: b.deviceID, scope: [rule.id], upserts: [envelope], deletions: [])
         do { _ = try await b.claim(loser, localBefore: [], localAfter: [], in: bStale); fatalError("stale claim won") }
@@ -302,6 +373,147 @@ import Foundation
         let ordinaryDelete = CloudRuleOperation(owner: reviewer.deviceID, scope: [rule.id], upserts: [], deletions: [rule.id])
         let explicit = try await reviewer.claim(ordinaryDelete, localBefore: [], localAfter: [], in: unlocked)
         precondition(explicit.ledger.pendingOperation(ordinaryDelete.id)?.owner == reviewer.deviceID)
+        // A pending relocation must not be silently rewritten by an older writer.
+        let moveTransport = MemoryTransport()
+        let mover = RuleCloudSync(transport: moveTransport, stateURL: directory.appendingPathComponent("mover"))
+        let moveSeed = try await mover.migrate([envelope], in: mover.refresh()!)
+        var newEnvelope = envelope
+        newEnvelope.destination = .init(title: "Destination", sourceTitle: "", sourceType: 0, localOwner: mover.deviceID)
+        let moveID = UUID()
+        let movingPlan = CalendarSyncPlan(attemptID: moveID, ruleIDs: [rule.id], desired: [], previous: [],
+                                          result: [], mutations: [], movedRuleIDs: [rule.id])
+        let moving = CloudRuleOperation(id: moveID, owner: mover.deviceID, scope: [rule.id],
+                                        upserts: [newEnvelope], deletions: [], plan: movingPlan)
+        let moveClaim = try await mover.claim(moving, localBefore: [], localAfter: [], in: moveSeed)
+        precondition(moveClaim.ledger.schema == 2 && moveClaim.ledger.rules[0].destination == envelope.destination)
+        let wireMove = try JSONEncoder().encode(moveClaim.ledger)
+        let oldMoveReader = try JSONDecoder().decode(LegacyRuleLedger.self, from: wireMove)
+        precondition(oldMoveReader.schema != 1, "Older writers must reject the pending transfer instead of dropping its fields")
+        try mover.recordEventKitComplete(moveID, in: moveClaim)
+        var bindingCheckpoint = false
+        moveTransport.nextFailure = .loseResponse
+        let moved = try await mover.finish(moveID, in: moveClaim) { confirmed in
+            precondition(confirmed.ledger.completed.contains(moveID))
+            bindingCheckpoint = true
+        }
+        precondition(bindingCheckpoint && moved.ledger.schema == 1 && moved.ledger.rules[0].destination == newEnvelope.destination)
+        // Completed removals are logged after durable EventKit verification only.
+        let logTransport = MemoryTransport()
+        let logA = RuleCloudSync(transport: logTransport, stateURL: directory.appendingPathComponent("log-a"))
+        let logB = RuleCloudSync(transport: logTransport, stateURL: directory.appendingPathComponent("log-b"))
+        let logSeed = try await logA.migrate([envelope], in: logA.refresh()!)
+        let logID = UUID()
+        var redacted = occurrence
+        redacted.calendarID = ""
+        let deletingPlan = CalendarSyncPlan(attemptID: logID, ruleIDs: [rule.id], desired: [], previous: [redacted],
+                                            result: [], mutations: [.init(kind: .remove, old: redacted, new: nil)])
+        let logDelete = CloudRuleOperation(id: logID, owner: logA.deviceID, scope: [rule.id], upserts: [],
+                                           deletions: [rule.id], plan: deletingPlan)
+        let loggedPending = try await logA.claim(logDelete, localBefore: [], localAfter: [], in: logSeed)
+        precondition(loggedPending.ledger.recentCompletions == nil)
+        precondition(loggedPending.orphanProtection().includes(ruleID: rule.id, occurrence: occurrence.key))
+        try logA.recordEventKitComplete(logID, in: loggedPending)
+        let done = try await logA.finish(logID, in: loggedPending)
+        let observer = try await logB.refresh()!
+        let lastRemoval = observer.ledger.recentCompletions!.first!
+        precondition(lastRemoval.id == logID && lastRemoval.deleted == [rule.id] && lastRemoval.added.isEmpty)
+        let within = lastRemoval.at.addingTimeInterval(RuleCompletion.retention - 1)
+        let atLimit = lastRemoval.at.addingTimeInterval(RuleCompletion.retention)
+        precondition(observer.orphanProtection(at: within).includes(ruleID: rule.id, occurrence: occurrence.key))
+        precondition(!observer.orphanProtection(at: within).includes(ruleID: rule.id, occurrence: "another-key"))
+        precondition(!observer.orphanProtection(at: atLimit).includes(ruleID: rule.id, occurrence: occurrence.key))
+        let pruned = try await logB.pruneRecentCompletions(in: done, at: atLimit)
+        precondition(pruned.ledger.recentCompletions == [] && pruned.ledger.tombstones.contains(rule.id)
+                     && pruned.ledger.completed.contains(logID))
+        let legacyRead = try JSONDecoder().decode(LegacyRuleLedger.self, from: JSONEncoder().encode(done.ledger))
+        var legacyEdited = legacyRead
+        var legacyOther = newEnvelope
+        legacyOther.rule.id = UUID()
+        legacyEdited.rules.append(legacyOther)
+        let legacyReencoded = try JSONDecoder().decode(CloudRuleLedger.self, from: JSONEncoder().encode(legacyEdited))
+        precondition(legacyReencoded.recentCompletions == nil)
+        let legacyWindow = CloudRuleSession(accountID: "A", version: Data([1]), ledger: legacyReencoded,
+                                            modificationDate: lastRemoval.at)
+        precondition(legacyWindow.orphanProtection(at: within).waitingForOlderWriter)
+        precondition(!legacyWindow.orphanProtection(at: atLimit).waitingForOlderWriter)
+        var acknowledgments = legacyWindow.ledger
+        acknowledgments.olderWriterProtectionUntil = legacyWindow.olderWriterProtection(at: within)
+        acknowledgments.recentCompletions = []
+        let acknowledgingWriter = CloudRuleSession(accountID: "A", version: legacyWindow.version, ledger: acknowledgments)
+        precondition(acknowledgingWriter.orphanProtection(at: within).waitingForOlderWriter)
+        precondition(!acknowledgingWriter.orphanProtection(at: atLimit).waitingForOlderWriter)
+        // Two different devices produce the same account-scoped key from the same
+        // birthday, without a Contacts identifier or the raw name/date tuple in the key.
+        func birthdayToken(name: String = "鄭測試", nick: String? = "橘子", lunar: Bool = true,
+                           day: Int = 4, leap: Bool = false, year: Int? = 43, account: String? = "A") -> String {
+            BirthdayMatchToken.make(name: name, nickname: nick, isLunar: lunar, month: 3, day: day,
+                                    isLeapMonth: leap, year: year, accountID: account)
+        }
+        let match = birthdayToken()
+        precondition(BirthdayMatchToken.isCloudValue(match) && birthdayToken(name: " 鄭測試 ") == match)
+        precondition(!match.contains("鄭測試") && !match.contains("橘子"))
+        precondition(Set([match, birthdayToken(nick: nil), birthdayToken(lunar: false), birthdayToken(day: 5),
+                          birthdayToken(leap: true), birthdayToken(year: nil), birthdayToken(account: "B")]).count == 7)
+        precondition(BirthdayMatchToken.scoped(birthdayToken(account: nil), accountID: "A") == match)
+        let sampleContact = CNMutableContact()
+        sampleContact.givenName = "Jane"
+        sampleContact.familyName = "Lee"
+        sampleContact.birthday = .init(year: 2000, month: 2, day: 12)
+        let extracted = BirthdayCandidate.extract(from: sampleContact)[0]
+        precondition(extracted.nameFields == ["person", "Jane", "", "Lee"])
+        let alternate = BirthdayCandidate(contactID: "another-device-contact-id", name: "LeeJane", month: 2, day: 12,
+                                          isLunar: false, isLeapMonth: false, year: 2000, nameFields: extracted.nameFields)
+        precondition(extracted.name != alternate.name)
+        precondition(extracted.matchingToken(accountID: "A") == alternate.matchingToken(accountID: "A"))
+        precondition(extracted.legacyMatchingToken(accountID: "A") != alternate.legacyMatchingToken(accountID: "A"))
+        let splitDifferently = BirthdayCandidate(contactID: "different-card", name: alternate.name, month: 2, day: 12,
+                                                  isLunar: false, isLeapMonth: false, year: 2000,
+                                                  nameFields: ["person", "ane", "", "LeeJ"])
+        precondition(extracted.matchingToken(accountID: "A") != splitDifferently.matchingToken(accountID: "A"))
+        let v2 = BirthdayMatchToken.make(name: "Name formatted differently", nickname: "橘子", isLunar: true,
+                                         month: 3, day: 4, isLeapMonth: false, year: 43, accountID: "A",
+                                         nameFields: ["person", "測試", "", "鄭"])
+        precondition(v2 != match && BirthdayMatchToken.isCloudValue(v2))
+        let birthdayTransport = MemoryTransport()
+        let importerA = RuleCloudSync(transport: birthdayTransport, stateURL: directory.appendingPathComponent("birthday-a"))
+        let importerB = RuleCloudSync(transport: birthdayTransport, stateURL: directory.appendingPathComponent("birthday-b"))
+        let blankBirthdayCloud = try await importerA.refresh()!
+        var birthdayRule = Rule(name: "Fixture event title", kind: .lunar, date: "", category: "Birthday")
+        birthdayRule.birthdayMatchToken = match
+        birthdayRule.birthdaySource = .init(contactID: "PRIVATE-CARD-TOKEN", isLunar: true, month: 3, day: 4,
+                                            isLeapMonth: false, year: 43)
+        let birthdayEnvelope = CloudRuleEnvelope(rule: birthdayRule, destination: nil, prior: [])
+        let aBirthdayOperation = CloudRuleOperation(owner: importerA.deviceID, scope: [birthdayRule.id],
+                                                   upserts: [birthdayEnvelope], deletions: [])
+        let aPendingBirthday = try await importerA.claim(aBirthdayOperation, localBefore: [], localAfter: [], in: blankBirthdayCloud)
+        var copyBirthday = birthdayRule
+        copyBirthday.id = UUID()
+        copyBirthday.birthdayMatchToken = v2
+        let bBirthdayOperation = CloudRuleOperation(owner: importerB.deviceID, scope: [copyBirthday.id],
+                                                   upserts: [.init(rule: copyBirthday, destination: nil, prior: [])], deletions: [])
+        do {
+            _ = try await importerB.claim(bBirthdayOperation, localBefore: [], localAfter: [], legacyBirthdayMatches: [match], in: importerB.refresh()!)
+            fatalError("Two devices were authorized to import the same birthday")
+        } catch CloudRuleError.birthdayAlreadyMatched {}
+        try importerA.recordEventKitComplete(aBirthdayOperation.id, in: aPendingBirthday)
+        let confirmedBirthday = try await importerA.finish(aBirthdayOperation.id, in: aPendingBirthday)
+        let birthdayWire = try JSONEncoder().encode(confirmedBirthday.ledger)
+        let birthdayJSON = String(decoding: birthdayWire, as: UTF8.self)
+        precondition(birthdayJSON.contains(match) && !birthdayJSON.contains("PRIVATE-CARD-TOKEN")
+                     && !birthdayJSON.contains("橘子") && !birthdayJSON.contains("鄭測試"))
+        let updatedBirthday = try await importerB.refresh()!
+        do {
+            _ = try await importerB.claim(bBirthdayOperation, localBefore: [], localAfter: [], legacyBirthdayMatches: [match], in: updatedBirthday)
+            fatalError("A second device could import an already confirmed exact birthday")
+        } catch CloudRuleError.birthdayAlreadyMatched {}
+        let birthdayMigrationTransport = MemoryTransport()
+        let birthdayMigrator = RuleCloudSync(transport: birthdayMigrationTransport,
+                                             stateURL: directory.appendingPathComponent("birthday-migrate"))
+        var locallyImported = birthdayRule
+        locallyImported.birthdayMatchToken = birthdayToken(account: nil)
+        let birthdayMigration = try await birthdayMigrator.migrate([.init(rule: locallyImported, destination: nil, prior: [])],
+                                                                    in: birthdayMigrator.refresh()!)
+        precondition(birthdayMigration.ledger.rules.first?.rule.birthdayMatchToken == match)
         print("Cloud sync contract passed: migration, ID redaction, overlapping CAS, lost responses, takeover/stale owner, restart before CAS, tombstones, account isolation, and Development-to-Production migration of 36 synthetic rules")
     }
 }

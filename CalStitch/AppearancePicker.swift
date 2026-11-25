@@ -13,6 +13,17 @@ struct RuleAppearance: Codable, Hashable {
     }
 
     func tint(or fallback: Color) -> Color { color?.swiftUIColor ?? fallback }
+
+    func iconTint(defaultSymbol: String, baseColor: Color) -> Color {
+        if let color { return color.swiftUIColor }
+        guard symbol == nil, defaultSymbol == "birthday.cake" else { return baseColor }
+        return Color(uiColor: UIColor { traits in
+            // A slightly lighter red in Dark Mode keeps the outline readable.
+            traits.userInterfaceStyle == .dark
+                ? UIColor(red: 201/255, green: 110/255, blue: 121/255, alpha: 1)
+                : UIColor(red: 148/255, green: 61/255, blue: 71/255, alpha: 1)
+        })
+    }
 }
 
 struct AppearanceColor: Codable, Hashable {
@@ -160,13 +171,13 @@ struct AppearancePicker: View {
     }
 
     private var preview: some View {
-        let tint = appearance.tint(or: defaultColor)
+        let tint = appearance.iconTint(defaultSymbol: defaultSymbol, baseColor: defaultColor)
         return HStack(spacing: 12) {
             Image(systemName: appearance.symbol(or: defaultSymbol))
                 .font(.system(size: 22, weight: .semibold))
                 .foregroundStyle(tint)
                 .frame(width: 46, height: 46)
-                .background(tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 12))
+                .background(appearance.tint(or: defaultColor).opacity(0.13), in: RoundedRectangle(cornerRadius: 12))
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 Text(L10n.text("預覽", "Preview")).font(.caption).foregroundStyle(.secondary)
@@ -181,7 +192,7 @@ struct AppearancePicker: View {
 
     private var customColor: Binding<Color> {
         Binding {
-            appearance.tint(or: defaultColor)
+            appearance.iconTint(defaultSymbol: defaultSymbol, baseColor: defaultColor)
         } set: { color in
             if let rgb = AppearanceColor(color) { appearance.color = rgb }
         }

@@ -34,6 +34,12 @@ struct CalendarSyncPlan: Codable, Equatable {
     let previous: [PlannedOccurrence]
     let result: [PlannedOccurrence]
     let mutations: [CalendarSyncMutation]
+    var movedRuleIDs: Set<UUID>? = nil
+}
+
+struct CalendarMove {
+    let source: String
+    let destination: String
 }
 
 struct CalendarChange: Identifiable {
@@ -45,7 +51,7 @@ struct CalendarChange: Identifiable {
 }
 
 struct CalendarPreviewEvent: Identifiable, Equatable {
-    enum Kind: Equatable { case unchanged, insert, update, remove }
+    enum Kind: Equatable { case unchanged, insert, update, remove, move }
 
     let id: String
     let ruleID: UUID
@@ -58,6 +64,8 @@ struct CalendarPreviewEvent: Identifiable, Equatable {
     var previousStart: Date? = nil
     var previousEnd: Date? = nil
     var previousIsAllDay: Bool? = nil
+    var previousCalendarTitle: String? = nil
+    var destinationCalendarTitle: String? = nil
 }
 
 
@@ -102,7 +110,7 @@ struct CalendarOrphanPreview {
     let through: Date
     let events: [CalendarOrphanEvent]
     fileprivate let endExclusive: Date
-    fileprivate let existingRuleIDs: Set<UUID>
+    fileprivate let protection: OrphanProtection
 }
 
 
@@ -341,9 +349,10 @@ final class CalendarIntegration: ObservableObject {
         var previewEvents: [CalendarPreviewEvent] = []
     }
 
-    func previewEvents(ruleIDs: Set<UUID>, desired: [PlannedOccurrence], previous: [PlannedOccurrence]) throws -> [CalendarPreviewEvent] {
+    func previewEvents(ruleIDs: Set<UUID>, desired: [PlannedOccurrence], previous: [PlannedOccurrence],
+                       moves: [UUID: CalendarMove] = [:]) throws -> [CalendarPreviewEvent] {
         try reconcile(desired: desired, previous: previous, ruleIDs: ruleIDs,
-                      now: .now, includingEvents: true).previewEvents
+                      now: .now, includingEvents: true, moves: moves).previewEvents
     }
 
     func existingPreviewEvents(for ruleID: UUID, previous: [PlannedOccurrence]) throws -> [CalendarPreviewEvent] {
@@ -421,13 +430,14 @@ final class CalendarIntegration: ObservableObject {
     /// invoke applySyncPlan only after CloudKit confirms this exact attempt's ownership.
     func prepareSyncPlan(desired: [PlannedOccurrence], previous: [PlannedOccurrence], ruleIDs: Set<UUID>,
                          attemptID: UUID, matchingRemoval: [CalendarRemovalEvent]? = nil,
-                         takeover: Bool = false) throws -> CalendarSyncPlan {
+                         takeover: Bool = false, moves: [UUID: CalendarMove] = [:]) throws -> CalendarSyncPlan {
         store.reset()
-        let reconciled = try reconcile(desired: desired, previous: previous, ruleIDs: ruleIDs, now: .now, takeover: takeover)
+        let reconciled = try reconcile(desired: desired, previous: previous, ruleIDs: ruleIDs, now: .now,
+                                       takeover: takeover, moves: moves)
         if let matchingRemoval, try removalEvents(in: reconciled) != matchingRemoval {
             throw CalendarIntegrationError.removalSelectionChanged
         }
-        return try syncPlan(from: reconciled, desired: desired, previous: previous, ruleIDs: ruleIDs, attemptID: attemptID)
+        return try syncPlan(from: reconciled, desired: desired, previous: previous, ruleIDs: ruleIDs, attemptID: attemptID, movedRuleIDs: Set(moves.keys))
     }
 
     /// Verify the effective, pre-interruption occurrence identities without writing events.
@@ -494,6 +504,26 @@ final class CalendarIntegration: ObservableObject {
         }
     }
 
+    func verifyMoveDestinationsForUnfreeze(plan: CalendarSyncPlan, destinations: [UUID: String]) throws {
+        let now = Date()
+        for id in plan.movedRuleIDs ?? [] {
+            guard let localID = destinations[id] else { throw CalendarIntegrationError.noDestination }
+            let calendar = try writableCalendar(id: localID)
+            let bounds = (plan.previous + plan.desired).filter { $0.ruleID == id }
+            guard let first = bounds.map({ storageDate($0.start, allDay: $0.isAllDay) }).min(),
+                  let last = bounds.map({ storageDate($0.end, allDay: $0.isAllDay) }).max() else { continue }
+            let found = try findEvents(from: first, through: last, calendar: calendar, ruleIDs: [id])
+            let knownHistory = Set(plan.previous.filter {
+                $0.ruleID == id && storageDate($0.start, allDay: $0.isAllDay) <= now
+            }.map(\.key))
+            guard found.allSatisfy({ key, event in
+                event.startDate <= now && knownHistory.contains(key.occurrence) && attemptMarker(in: event.notes) != plan.attemptID
+            }) else {
+                throw CalendarIntegrationError.ambiguousEvent
+            }
+        }
+    }
+
     private func bind(_ value: PlannedOccurrence, to calendarID: String) -> PlannedOccurrence {
         var value = value
         value.calendarID = calendarID
@@ -509,7 +539,7 @@ final class CalendarIntegration: ObservableObject {
     }
 
     private func syncPlan(from reconciliation: Reconciliation, desired: [PlannedOccurrence],
-                          previous: [PlannedOccurrence], ruleIDs: Set<UUID>, attemptID: UUID) throws -> CalendarSyncPlan {
+                          previous: [PlannedOccurrence], ruleIDs: Set<UUID>, attemptID: UUID, movedRuleIDs: Set<UUID>) throws -> CalendarSyncPlan {
         func portable(_ records: [PlannedOccurrence]) -> [PlannedOccurrence] {
             records.map { bind($0, to: "") }.sorted {
                 $0.ruleID == $1.ruleID ? $0.key < $1.key : $0.ruleID.uuidString < $1.ruleID.uuidString
@@ -523,7 +553,8 @@ final class CalendarIntegration: ObservableObject {
             }
         }
         return .init(attemptID: attemptID, ruleIDs: ruleIDs, desired: portable(desired), previous: portable(previous),
-                     result: portable(reconciliation.snapshot), mutations: changes)
+                     result: portable(reconciliation.snapshot), mutations: changes,
+                     movedRuleIDs: movedRuleIDs.isEmpty ? nil : movedRuleIDs)
     }
 
     private struct LocalRemovalEvidence: Codable, Equatable {
@@ -578,7 +609,7 @@ final class CalendarIntegration: ObservableObject {
     /// Reconcile exactly what the operation journal claimed, even when an EventKit commit
     /// succeeded but its response was lost. No unlisted mutation can enter this transaction.
     func applySyncPlan(_ plan: CalendarSyncPlan, destinations: [UUID: String], recovering: Bool = false,
-                       removalGuard: Data? = nil) throws -> [PlannedOccurrence] {
+                       removalGuard: Data? = nil, moveSources: [UUID: String] = [:]) throws -> [PlannedOccurrence] {
         store.reset()
         guard hasFullAccess else { throw CalendarIntegrationError.denied }
         let now = Date.now
@@ -591,6 +622,16 @@ final class CalendarIntegration: ObservableObject {
         }
         var destinationCache: [String: EKCalendar] = [:]
         var found: [Identity: EKEvent] = [:]
+        var destinationMatches: [Identity: EKEvent] = [:]
+        let moved = plan.movedRuleIDs ?? []
+        guard Set(moveSources.keys) == moved, moved.isSubset(of: plan.ruleIDs) else {
+            throw CalendarIntegrationError.invalidPlan
+        }
+        for (id, source) in moveSources {
+            guard let target = destinations[id], target != source else { throw CalendarIntegrationError.invalidPlan }
+            destinationCache[target] = try writableCalendar(id: target)
+            destinationCache[source] = try writableCalendar(id: source)
+        }
         let universe = plan.previous + plan.desired + plan.result + plan.mutations.flatMap { [$0.old, $0.new].compactMap { $0 } }
         for (ruleID, values) in Dictionary(grouping: universe, by: \.ruleID) {
             guard plan.ruleIDs.contains(ruleID), let localID = destinations[ruleID], !localID.isEmpty,
@@ -600,13 +641,31 @@ final class CalendarIntegration: ObservableObject {
             }
             let calendar = try writableCalendar(id: localID)
             destinationCache[localID] = calendar
-            try found.merge(findEvents(from: first, through: last, calendar: calendar, ruleIDs: [ruleID])) { _, _ in
-                throw CalendarIntegrationError.ambiguousEvent
+            let atDestination = try findEvents(from: first, through: last, calendar: calendar, ruleIDs: [ruleID])
+            let effective: [Identity: EKEvent]
+            if let source = moveSources[ruleID], let from = destinationCache[source] {
+                let atSource = try findEvents(from: first, through: last, calendar: from, ruleIDs: [ruleID])
+                let history = Set(plan.previous.filter {
+                    $0.ruleID == ruleID && storageDate($0.start, allDay: $0.isAllDay) <= now
+                }.map(\.key))
+                let mutableDestination = atDestination.filter { key, event in
+                    event.startDate > now || !history.contains(key.occurrence) || attemptMarker(in: event.notes) == plan.attemptID
+                }
+                guard recovering || mutableDestination.isEmpty,
+                      Set(mutableDestination.keys).isDisjoint(with: atSource.keys) else {
+                    throw CalendarIntegrationError.ambiguousEvent
+                }
+                destinationMatches.merge(mutableDestination) { first, _ in first }
+                effective = atSource
+            } else {
+                effective = atDestination
             }
+            try found.merge(effective) { _, _ in throw CalendarIntegrationError.ambiguousEvent }
         }
         let changed = Set(plan.mutations.compactMap { operation in (operation.new ?? operation.old).map { Identity(rule: $0.ruleID, occurrence: $0.key) } })
         let known = Set(universe.map { Identity(rule: $0.ruleID, occurrence: $0.key) })
-        guard changed.count == plan.mutations.count, found.keys.allSatisfy(known.contains) else {
+        guard changed.count == plan.mutations.count, found.keys.allSatisfy(known.contains),
+              destinationMatches.keys.allSatisfy(changed.contains) else {
             throw CalendarIntegrationError.ambiguousEvent
         }
         // Re-check any untouched managed future rows before attempting writes.
@@ -621,6 +680,13 @@ final class CalendarIntegration: ObservableObject {
             }
             let identity = Identity(rule: value.ruleID, occurrence: value.key)
             let event = found[identity]
+            if let movedEvent = destinationMatches[identity] {
+                guard recovering, mutation.kind != .remove, let target = mutation.new,
+                      attemptMarker(in: movedEvent.notes) == plan.attemptID, !differs(movedEvent, from: target) else {
+                    throw CalendarIntegrationError.ambiguousEvent
+                }
+                continue
+            }
             let observed = try event.map { try operationState(identity, event: $0) }
             let observedAttempt = event.flatMap { attemptMarker(in: $0.notes) }
             let alreadyDone = observedAttempt == plan.attemptID
@@ -637,7 +703,7 @@ final class CalendarIntegration: ObservableObject {
                 guard let target = mutation.new, let old = mutation.old,
                       old.ruleID == identity.rule, old.key == identity.occurrence,
                       let event else { throw CalendarIntegrationError.missingEvent }
-                if recovering, alreadyDone, !differs(event, from: target) { continue }
+                if recovering, alreadyDone, !moved.contains(value.ruleID), !differs(event, from: target) { continue }
                 guard observed == old, observedAttempt == mutation.priorAttemptID,
                       event.startDate > now, storageDate(target.start, allDay: target.isAllDay) > now else {
                     throw CalendarIntegrationError.removalSelectionChanged
@@ -678,9 +744,17 @@ final class CalendarIntegration: ObservableObject {
             }
             let calendar = try writableCalendar(id: id)
             let refreshed = try findEvents(from: first, through: last, calendar: calendar, ruleIDs: [ruleID])
+            let remainingAtSource: [Identity: EKEvent]
+            if let source = moveSources[ruleID] {
+                remainingAtSource = try findEvents(from: first, through: last,
+                                                   calendar: writableCalendar(id: source), ruleIDs: [ruleID])
+            } else {
+                remainingAtSource = [:]
+            }
             for mutation in plan.mutations where (mutation.new ?? mutation.old)?.ruleID == ruleID {
                 guard let value = mutation.new ?? mutation.old else { throw CalendarIntegrationError.invalidPlan }
                 let identity = Identity(rule: ruleID, occurrence: value.key)
+                guard remainingAtSource[identity] == nil else { throw CalendarIntegrationError.writeFailed }
                 if mutation.kind == .remove {
                     guard refreshed[identity] == nil else { throw CalendarIntegrationError.writeFailed }
                 } else {
@@ -734,6 +808,10 @@ final class CalendarIntegration: ObservableObject {
                     configure(event, with: occurrence)
                     try store.save(event, span: .thisEvent, commit: false)
                 case let .update(_, event, occurrence):
+                    guard let destination = reconciliation.calendars[occurrence.calendarID] else {
+                        throw CalendarIntegrationError.invalidPlan
+                    }
+                    if event.calendar?.calendarIdentifier != occurrence.calendarID { event.calendar = destination }
                     // Keep prose and the legacy rule marker; replace only an exact old attempt marker.
                     if let attemptID { event.notes = stampedNotes(event.notes ?? "", attemptID: attemptID) }
                     configure(event, with: occurrence)
@@ -750,7 +828,7 @@ final class CalendarIntegration: ObservableObject {
         }
     }
 
-    func previewOrphans(existingRuleIDs: Set<UUID>) throws -> CalendarOrphanPreview {
+    func previewOrphans(protection: OrphanProtection) throws -> CalendarOrphanPreview {
         let now = Date.now
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: now)
@@ -759,19 +837,19 @@ final class CalendarIntegration: ObservableObject {
               let endExclusive = calendar.date(byAdding: .day, value: 1, to: through) else {
             throw CalendarIntegrationError.invalidPlan
         }
-        let candidates = try scanOrphans(start: start, endExclusive: endExclusive, existingRuleIDs: existingRuleIDs, now: now)
+        let candidates = try scanOrphans(start: start, endExclusive: endExclusive, protection: protection, now: now)
         let events = candidates.values.map(\.info).sorted {
             if $0.start != $1.start { return $0.start < $1.start }
             return $0.id < $1.id
         }
         return .init(start: start, through: through, events: events,
-                     endExclusive: endExclusive, existingRuleIDs: existingRuleIDs)
+                     endExclusive: endExclusive, protection: protection)
     }
 
     func removeOrphans(_ selected: [CalendarOrphanEvent], from preview: CalendarOrphanPreview,
-                       existingRuleIDs: Set<UUID>) throws {
+                       protection: OrphanProtection) throws {
         guard !selected.isEmpty else { return }
-        guard preview.existingRuleIDs == existingRuleIDs,
+        guard !protection.waitingForOlderWriter, preview.protection.accountID == protection.accountID,
               Set(selected.map(\.id)).count == selected.count else {
             throw CalendarIntegrationError.orphanSelectionChanged
         }
@@ -780,7 +858,7 @@ final class CalendarIntegration: ObservableObject {
             throw CalendarIntegrationError.orphanSelectionChanged
         }
         let current = try scanOrphans(start: preview.start, endExclusive: preview.endExclusive,
-                                      existingRuleIDs: existingRuleIDs, now: .now)
+                                      protection: protection, now: .now)
         // Confirm all selected rows from the same fresh scan before staging any writes.
         let confirmed = try selected.map { item in
             guard let found = current[item.id], found.info == item else {
@@ -804,7 +882,7 @@ final class CalendarIntegration: ObservableObject {
         let info: CalendarOrphanEvent
     }
 
-    private func scanOrphans(start: Date, endExclusive: Date, existingRuleIDs: Set<UUID>, now: Date) throws -> [String: OrphanCandidate] {
+    private func scanOrphans(start: Date, endExclusive: Date, protection: OrphanProtection, now: Date) throws -> [String: OrphanCandidate] {
         guard hasFullAccess else { throw CalendarIntegrationError.denied }
         store.reset()
         #if targetEnvironment(simulator)
@@ -836,13 +914,15 @@ final class CalendarIntegration: ObservableObject {
                     $0.trimmingCharacters(in: .whitespaces).hasPrefix("[CalStitch:")
                 }
                 let markers = tagLines.compactMap(Identity.init(line:))
-                let missing = markers.filter { !existingRuleIDs.contains($0.rule) }
+                let missing = markers.filter { !protection.includes(ruleID: $0.rule, occurrence: $0.occurrence) }
                 guard !missing.isEmpty else { continue }
 
                 // A duplicate or a conflicting/malformed marker taints that identity even
                 // when one matching event is ineligible for listing for another reason.
-                guard tagLines.count == 1, let identity = missing.first,
-                      !event.hasRecurrenceRules, !event.isDetached,
+                let attempts = attemptLines(in: notes)
+                guard markers.count == 1, tagLines.count == 1 + attempts.count,
+                      attempts.isEmpty || attemptMarker(in: notes) != nil,
+                      let identity = missing.first, !event.hasRecurrenceRules, !event.isDetached,
                       rawStart > now || rawEnd <= now else {
                     conflicting.formUnion(missing)
                     continue
@@ -907,7 +987,62 @@ final class CalendarIntegration: ObservableObject {
         return result
     }
 
-    private func reconcile(desired: [PlannedOccurrence], previous: [PlannedOccurrence], ruleIDs: Set<UUID>, now: Date, includingEvents: Bool = false, takeover: Bool = false) throws -> Reconciliation {
+    private func reconcile(desired: [PlannedOccurrence], previous: [PlannedOccurrence], ruleIDs: Set<UUID>, now: Date, includingEvents: Bool = false, takeover: Bool = false, moves: [UUID: CalendarMove] = [:]) throws -> Reconciliation {
+        if !moves.isEmpty {
+            guard !takeover, Set(moves.keys).isSubset(of: ruleIDs) else { throw CalendarIntegrationError.invalidPlan }
+            var batch = try reconcile(desired: desired.filter { moves[$0.ruleID] == nil },
+                                      previous: previous.filter { moves[$0.ruleID] == nil },
+                                      ruleIDs: ruleIDs.subtracting(moves.keys), now: now, includingEvents: includingEvents)
+            for (ruleID, move) in moves {
+                let source = try writableCalendar(id: move.source)
+                let destination = try writableCalendar(id: move.destination)
+                guard move.source != move.destination else { throw CalendarIntegrationError.invalidPlan }
+                let prior = previous.filter { $0.ruleID == ruleID }
+                let wanted = desired.filter { $0.ruleID == ruleID }
+                _ = try table(prior, calendarID: move.source, ruleIDs: [ruleID])
+                let newRows = try table(wanted, calendarID: move.destination, ruleIDs: [ruleID])
+                let rebased = wanted.map { bind($0, to: move.source) }
+                let bounds = prior + wanted
+                guard let first = bounds.map({ storageDate($0.start, allDay: $0.isAllDay) }).min(),
+                      let last = bounds.map({ storageDate($0.end, allDay: $0.isAllDay) }).max() else { continue }
+                let oldEvents = try findEvents(from: first, through: last, calendar: source, ruleIDs: [ruleID])
+                let destinationEvents = try findEvents(from: first, through: last, calendar: destination, ruleIDs: [ruleID])
+                guard destinationEvents.allSatisfy({ key, event in
+                    event.startDate <= now && (prior.contains { $0.key == key.occurrence && storageDate($0.start, allDay: $0.isAllDay) <= now })
+                }) else { throw CalendarIntegrationError.ambiguousEvent }
+                let baseline = try reconcileCalendar(desired: rebased, previous: prior, ruleIDs: [ruleID],
+                                                     now: now, calendar: source, includingEvents: false)
+                let changes = try baseline.operations.map { operation -> Operation in
+                    switch operation {
+                    case let .insert(key, value): return .insert(key, bind(value, to: move.destination))
+                    case let .update(key, event, _):
+                        guard let value = newRows[key] else { throw CalendarIntegrationError.invalidPlan }
+                        return .update(key, event, value)
+                    case .remove: return operation
+                    }
+                }
+                let changed = Set(changes.map { $0.change.id })
+                let unchanged = baseline.snapshot.compactMap { value -> Operation? in
+                    let key = Identity(rule: ruleID, occurrence: value.key)
+                    guard !changed.contains(key.displayID), let event = oldEvents[key],
+                          event.startDate > now, let desired = newRows[key],
+                          storageDate(value.start, allDay: value.isAllDay) > now else { return nil }
+                    return .update(key, event, desired)
+                }
+                let operations = changes + unchanged
+                batch.operations += operations
+                batch.snapshot += baseline.snapshot.map { bind($0, to: move.destination) }
+                batch.calendars[move.source] = source
+                batch.calendars[move.destination] = destination
+                if includingEvents {
+                    batch.previewEvents += makePreviewEvents(found: oldEvents, operations: operations, now: now,
+                                                              movingTo: Self.destination(destination).displayTitle)
+                }
+            }
+            batch.operations.sort { ($0.change.date, $0.change.id) < ($1.change.date, $1.change.id) }
+            batch.previewEvents.sort { ($0.start, $0.id) < ($1.start, $1.id) }
+            return batch
+        }
         let all = desired + previous
         guard !all.isEmpty else { return .init(operations: [], snapshot: []) }
         guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else {
@@ -1012,7 +1147,7 @@ final class CalendarIntegration: ObservableObject {
                      previewEvents: includingEvents ? makePreviewEvents(found: found, operations: operations, now: now) : [])
     }
 
-    private func makePreviewEvents(found: [Identity: EKEvent], operations: [Operation], now: Date) -> [CalendarPreviewEvent] {
+    private func makePreviewEvents(found: [Identity: EKEvent], operations: [Operation], now: Date, movingTo: String? = nil) -> [CalendarPreviewEvent] {
         // Reconciliation already checked exact target, matching marker and applied snapshot
         // for every event in found. Never synthesize a live record from the cached snapshot.
         func existing(_ identity: Identity, _ event: EKEvent, kind: CalendarPreviewEvent.Kind) -> CalendarPreviewEvent {
@@ -1030,14 +1165,20 @@ final class CalendarIntegration: ObservableObject {
             switch operation {
             case let .insert(identity, occurrence):
                 rows[identity] = .init(id: identity.displayID, ruleID: identity.rule, title: occurrence.title, start: occurrence.start,
-                                       end: occurrence.end, isAllDay: occurrence.isAllDay, isPast: false, kind: .insert)
+                                       end: occurrence.end, isAllDay: occurrence.isAllDay, isPast: false, kind: .insert,
+                                       destinationCalendarTitle: movingTo)
             case let .update(identity, event, occurrence):
                 let old = existing(identity, event, kind: .unchanged)
                 rows[identity] = .init(id: identity.displayID, ruleID: identity.rule, title: occurrence.title, start: occurrence.start,
-                                       end: occurrence.end, isAllDay: occurrence.isAllDay, isPast: false, kind: .update,
-                                       previousStart: old.start, previousEnd: old.end, previousIsAllDay: old.isAllDay)
+                                       end: occurrence.end, isAllDay: occurrence.isAllDay, isPast: false, kind: movingTo == nil ? .update : .move,
+                                       previousStart: old.start, previousEnd: old.end, previousIsAllDay: old.isAllDay,
+                                       previousCalendarTitle: movingTo.flatMap { _ in event.calendar.map { Self.destination($0).displayTitle } },
+                                       destinationCalendarTitle: movingTo)
             case let .remove(identity, event):
                 rows[identity] = existing(identity, event, kind: .remove)
+                if movingTo != nil, let calendar = event.calendar {
+                    rows[identity]?.previousCalendarTitle = Self.destination(calendar).displayTitle
+                }
             }
         }
         return Array(rows.values)
