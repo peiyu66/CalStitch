@@ -11,6 +11,6 @@ CalStitch is an iPhone tool for calendar rules. Set up rules in CalStitch and se
 
 Add only the holidays, anniversaries, and contacts’ birthdays you want to your own calendar. There’s no need to subscribe to a full holiday calendar or show every contact’s birthday.
 
-The app is available in Chinese and English. CalStitch is not yet on the App Store.
+Available in Chinese and English. [Get CalStitch for iPhone on the App Store](https://apps.apple.com/app/calstitch/id6838189548).
 
 [Home](https://peiyu66.github.io/CalStitch/en/) · [User Guide](https://peiyu66.github.io/CalStitch/en/guide.html) · [Privacy Policy](https://peiyu66.github.io/CalStitch/en/privacy.html) · [Support](https://peiyu66.github.io/CalStitch/en/support.html)
