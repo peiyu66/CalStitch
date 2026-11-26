@@ -1,5 +1,6 @@
 import Contacts
 import ContactsUI
+import CryptoKit
 import SwiftUI
 
 struct BirthdayImportSource: Codable, Hashable {
@@ -11,8 +12,45 @@ struct BirthdayImportSource: Codable, Hashable {
     let year: Int?
 }
 
+// Versioned, exact-match value. This is derived personal data, not anonymization.
+enum BirthdayMatchToken {
+    static func make(name: String, nickname: String?, isLunar: Bool, month: Int, day: Int,
+                     isLeapMonth: Bool, year: Int?, accountID: String?, nameFields: [String]? = nil) -> String {
+        func normalize(_ value: String) -> String {
+            value.trimmingCharacters(in: .whitespacesAndNewlines).precomposedStringWithCanonicalMapping
+        }
+        // Keep the wire envelope readable by 34; version the fingerprint input instead.
+        let nameParts = nameFields.map { ["CalStitch.birthday.v2"] + $0.map(normalize) }
+            ?? ["CalStitch.birthday.v1", normalize(name)]
+        let local = "l1:" + fingerprint(nameParts + [
+            normalize(nickname ?? ""), isLunar ? "lunar" : "gregorian", String(month), String(day),
+            isLunar && isLeapMonth ? "leap" : "regular", year.map(String.init) ?? ""
+        ])
+        return accountID.map { scoped(local, accountID: $0) } ?? local
+    }
+
+    static func scoped(_ value: String, accountID: String) -> String {
+        guard value.hasPrefix("l1:") else { return value }
+        return "a1:" + fingerprint(["CalStitch.birthday.account.v1", accountID, value])
+    }
+
+    static func isCloudValue(_ text: String) -> Bool {
+        let payload = text.dropFirst(3)
+        return text.hasPrefix("a1:") && payload.utf8.count == 64 &&
+            payload.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+
+    private static func fingerprint(_ components: [String]) -> String {
+        // UTF-8 length framing distinguishes nil placeholders, text, and adjacent fields.
+        let encoded = components.map { "\($0.utf8.count):\($0)" }.joined()
+        return SHA256.hash(data: Data(encoded.utf8)).map { String(format: "%02x", Int($0)) }.joined()
+    }
+}
+
 enum BirthdayDuplicateStatus: Equatable {
-    case available, imported, possibleDuplicate, changed
+    case available, imported, pending, possibleDuplicate
+
+    var canSelect: Bool { self == .available || self == .possibleDuplicate }
 }
 
 struct BirthdayCandidate: Identifiable, Equatable, Sendable {
@@ -30,9 +68,16 @@ struct BirthdayCandidate: Identifiable, Equatable, Sendable {
     let isLunar: Bool
     let isLeapMonth: Bool
     let year: Int?
+    var nameFields: [String]? = nil
 
-    var source: BirthdayImportSource {
-        .init(contactID: contactID, isLunar: isLunar, month: month, day: day, isLeapMonth: isLeapMonth, year: year)
+    func matchingToken(accountID: String?) -> String {
+        BirthdayMatchToken.make(name: name, nickname: nickname, isLunar: isLunar, month: month, day: day,
+                                isLeapMonth: isLeapMonth, year: year, accountID: accountID, nameFields: nameFields)
+    }
+
+    func legacyMatchingToken(accountID: String?) -> String {
+        BirthdayMatchToken.make(name: name, nickname: nickname, isLunar: isLunar, month: month, day: day,
+                                isLeapMonth: isLeapMonth, year: year, accountID: accountID)
     }
 
     private func chineseTitle(for text: String) -> String { text + (isLunar ? "農曆生日" : "生日") }
@@ -65,6 +110,22 @@ struct BirthdayCandidate: Identifiable, Equatable, Sendable {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty }
         guard let name else { return [] }
+        let trim = CharacterSet.whitespacesAndNewlines
+        let middle = contact.isKeyAvailable(CNContactMiddleNameKey) ? contact.middleName : ""
+        let parts = [given, middle, family].map { $0.trimmingCharacters(in: trim) }
+        let nameFields: [String]?
+        if contact.areKeysAvailable([CNContactGivenNameKey as NSString, CNContactMiddleNameKey as NSString,
+                                     CNContactFamilyNameKey as NSString]), parts.contains(where: { !$0.isEmpty }) {
+            nameFields = ["person"] + parts
+        } else if contact.isKeyAvailable(CNContactOrganizationNameKey),
+                  contact.areKeysAvailable([CNContactGivenNameKey as NSString, CNContactMiddleNameKey as NSString,
+                                            CNContactFamilyNameKey as NSString]),
+                  !organization.trimmingCharacters(in: trim).isEmpty {
+            nameFields = ["organization", organization]
+        } else {
+            // Never fabricate a structured identity when the system picker withholds name keys.
+            nameFields = nil
+        }
         let rawNickname = contact.isKeyAvailable(CNContactNicknameKey)
             ? contact.nickname.trimmingCharacters(in: .whitespacesAndNewlines) : ""
         let nickname = rawNickname.isEmpty ? nil : rawNickname
@@ -74,13 +135,13 @@ struct BirthdayCandidate: Identifiable, Equatable, Sendable {
            let month = birth.month, let day = birth.day,
            (1...12).contains(month), day >= 1,
            day <= [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] {
-            candidates.append(.init(contactID: contact.identifier, name: name, nickname: nickname, month: month, day: day, isLunar: false, isLeapMonth: false, year: birth.year))
+            candidates.append(.init(contactID: contact.identifier, name: name, nickname: nickname, month: month, day: day, isLunar: false, isLeapMonth: false, year: birth.year, nameFields: nameFields))
         }
         if contact.isKeyAvailable(CNContactNonGregorianBirthdayKey), let birth = contact.nonGregorianBirthday,
            birth.calendar?.identifier == .chinese,
            let month = birth.month, let day = birth.day,
            (1...12).contains(month), (1...30).contains(day) {
-            candidates.append(.init(contactID: contact.identifier, name: name, nickname: nickname, month: month, day: day, isLunar: true, isLeapMonth: birth.isLeapMonth == true, year: birth.year))
+            candidates.append(.init(contactID: contact.identifier, name: name, nickname: nickname, month: month, day: day, isLunar: true, isLeapMonth: birth.isLeapMonth == true, year: birth.year, nameFields: nameFields))
         }
         return candidates
     }
@@ -106,24 +167,14 @@ struct BirthdayImportView: View {
     let categories: [BatchCategoryOption]
     let presetCalendarIDs: () -> [String: String]
     let status: (BirthdayCandidate) -> BirthdayDuplicateStatus
-    let onImport: ([BirthdayCandidate], Int, String, Bool, String, String, Bool) throws -> Void
+    let onImport: ([BirthdayCandidate], Int, String, String, String, Bool) async throws -> Void
     private let cameFromGroup: Bool
 
-    private enum ImportMode: CaseIterable, Hashable {
-        case draft, apply
-        var label: String {
-            switch self {
-            case .draft: L10n.text("草稿", "Drafts")
-            case .apply: L10n.text("匯入後套用", "Import and Apply")
-            }
-        }
-    }
-
-    @State private var mode: ImportMode = .draft
     @State private var explicitlySelectedCalendarID: String?
     @State private var errorMessage: String?
     @State private var calendarError: String?
     @State private var connecting = false
+    @State private var isImporting = false
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -131,7 +182,7 @@ struct BirthdayImportView: View {
     @State private var candidates: [BirthdayCandidate] = []
     @State private var selected = Set<BirthdayCandidate.Key>()
     @State private var explicitlyUnchecked = Set<BirthdayCandidate.Key>()
-    @State private var preferNickname = false
+    @State private var preferNickname = true
     @State private var showWestern = true
     @State private var showLunar = true
     @State private var years = 5
@@ -143,7 +194,7 @@ struct BirthdayImportView: View {
          calendar: CalendarIntegration, categories: [BatchCategoryOption],
          presetCalendarIDs: @escaping () -> [String: String],
          status: @escaping (BirthdayCandidate) -> BirthdayDuplicateStatus,
-         onImport: @escaping ([BirthdayCandidate], Int, String, Bool, String, String, Bool) throws -> Void) {
+         onImport: @escaping ([BirthdayCandidate], Int, String, String, String, Bool) async throws -> Void) {
         self.calendar = calendar
         self.categories = categories
         self.presetCalendarIDs = presetCalendarIDs
@@ -160,8 +211,19 @@ struct BirthdayImportView: View {
         candidates.filter { $0.isLunar ? showLunar : showWestern }
     }
 
+    private var bulkSelectable: Set<BirthdayCandidate.Key> {
+        Set(visible.filter { status($0) == .available }.map(\.id))
+    }
+
+    private var needsIndividualReview: Bool {
+        visible.contains {
+            let current = status($0)
+            return current == .possibleDuplicate
+        }
+    }
+
     private var importable: [BirthdayCandidate] {
-        visible.filter { status($0) != .imported && selected.contains($0.id) }
+        visible.filter { status($0).canSelect && selected.contains($0.id) }
     }
 
     private var targetID: String? {
@@ -181,7 +243,7 @@ struct BirthdayImportView: View {
     }
 
     private var canImport: Bool {
-        !categoryName.isEmpty && !importable.isEmpty && destination != nil
+        calendar.hasFullAccess && !categoryName.isEmpty && !importable.isEmpty && destination != nil
     }
 
     var body: some View {
@@ -215,6 +277,7 @@ struct BirthdayImportView: View {
                 }
 
                 Section {
+                    if !visible.isEmpty { selectAllBirthdays }
                     if candidates.isEmpty {
                         Text(L10n.text("沒有可匯入的生日", "No birthdays to import")).foregroundStyle(.secondary)
                     } else if visible.isEmpty {
@@ -222,7 +285,7 @@ struct BirthdayImportView: View {
                     }
                     ForEach(visible) { candidate in
                         let itemStatus = status(candidate)
-                        let checked = itemStatus != .imported && selected.contains(candidate.id)
+                        let checked = itemStatus.canSelect && selected.contains(candidate.id)
                         Button {
                             if checked {
                                 selected.remove(candidate.id)
@@ -233,13 +296,13 @@ struct BirthdayImportView: View {
                             }
                         } label: {
                             HStack(spacing: 12) {
-                                checkIcon(checked)
+                                SelectionMark(isSelected: checked)
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(candidate.eventTitle(preferNickname: preferNickname)).foregroundStyle(.primary)
                                     Text(candidate.dateLabel).font(.subheadline).foregroundStyle(.secondary)
                                     if let note = statusText(itemStatus) {
                                         Text(note).font(.footnote)
-                                            .foregroundStyle(itemStatus == .imported ? Color.secondary : Color.orange)
+                                            .foregroundStyle(itemStatus.canSelect ? Color.orange : Color.secondary)
                                     }
                                 }
                                 Spacer(minLength: 0)
@@ -247,7 +310,7 @@ struct BirthdayImportView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .disabled(itemStatus == .imported)
+                        .disabled(!itemStatus.canSelect)
                         .accessibilityAddTraits(checked ? .isSelected : [])
                     }
                     if !cameFromGroup {
@@ -260,6 +323,9 @@ struct BirthdayImportView: View {
                 } header: {
                     Text(L10n.text("要匯入的生日", "Birthdays to Import"))
                 } footer: {
+                    if needsIndividualReview {
+                        Text(L10n.text("可能重複的項目，請個別確認後勾選。", "Review and select possible duplicates individually."))
+                    }
                     if skipped > 0 {
                         Text(L10n.text("這次挑選有 \(skipped) 位聯絡人缺少可匯入的姓名或生日。",
                                       skipped == 1 ? "1 selected contact is missing a name or birthday."
@@ -282,34 +348,28 @@ struct BirthdayImportView: View {
                     Text(L10n.text("次類可留空，也可輸入聯絡人群組的名稱。", "Leave the subcategory blank or enter the contact list name."))
                 }
 
-                Section(L10n.text("匯入方式", "Import Mode")) {
-                    importModePicker
+                Section {
                     birthdayCalendarFields
-                    if mode == .draft {
-                        Text(L10n.text("會保存目的行事曆，但現在只建立草稿，不寫入事件。", "The destination calendar is saved with the drafts. No events are written yet."))
-                            .font(.footnote).foregroundStyle(.secondary)
+                } footer: {
+                    if !importable.isEmpty {
+                        Text(L10n.text("按「匯入」會將選取的 \(importable.count) 筆生日加入指定行事曆。",
+                                      "Tap Import to add \(importable.count) selected \(importable.count == 1 ? "birthday" : "birthdays") to the selected calendar."))
                     }
-                    Button {
-                        performImport()
-                    } label: {
-                        Text(mode == .draft
-                             ? L10n.text("匯入 \(importable.count) 筆草稿",
-                                         "Import \(importable.count) \(importable.count == 1 ? "Draft" : "Drafts")")
-                             : L10n.text("匯入並套用 \(importable.count) 筆",
-                                         "Import and Apply \(importable.count)"))
-                            .fontWeight(.semibold)
-                            .frame(maxWidth: .infinity, minHeight: 32)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!canImport)
-                    .accessibilityIdentifier("confirm-birthday-import")
                 }
             }
+            .disabled(isImporting)
             .navigationTitle(L10n.text("匯入生日", "Import Birthdays"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(L10n.text("取消", "Cancel")) { dismiss() }
+                        .disabled(isImporting)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L10n.text("匯入", "Import"), action: performImport)
+                        .fontWeight(.semibold)
+                        .disabled(!canImport || isImporting)
+                        .accessibilityIdentifier("confirm-birthday-import")
                 }
             }
             .background {
@@ -318,6 +378,7 @@ struct BirthdayImportView: View {
                     .accessibilityHidden(true)
             }
         }
+        .interactiveDismissDisabled(isImporting)
     }
 
     @ViewBuilder
@@ -360,13 +421,6 @@ struct BirthdayImportView: View {
             Text(L10n.text("匯入前請先連接或選擇一個可寫入的行事曆。", "Connect or select a writable calendar before importing."))
                 .font(.footnote).foregroundStyle(.secondary)
         }
-    }
-
-    private var importModePicker: some View {
-        capsulePicker(ImportMode.allCases, selection: $mode, identifier: "birthday-import-mode",
-                      label: { $0.label },
-                      optionIdentifier: { $0 == .draft ? "birthday-import-draft" : "birthday-import-apply" },
-                      softTint: { $0 == .draft })
     }
 
     private func capsulePicker<Value: Hashable>(
@@ -420,13 +474,22 @@ struct BirthdayImportView: View {
     }
 
     private func performImport() {
-        guard canImport, let destination else { return }
+        guard canImport, !isImporting, let destination else { return }
+        let selectedCandidates = importable
+        let repeatYears = years
+        let category = categoryName
+        let subcategory = subcategoryName
+        let useNickname = preferNickname
         errorMessage = nil
-        do {
-            try onImport(importable, years, destination.id, mode == .apply, categoryName, subcategoryName, preferNickname)
-            dismiss()
-        } catch {
-            errorMessage = error.localizedDescription
+        isImporting = true
+        Task { @MainActor in
+            defer { isImporting = false }
+            do {
+                try await onImport(selectedCandidates, repeatYears, destination.id, category, subcategory, useNickname)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -435,7 +498,7 @@ struct BirthdayImportView: View {
         case .available: nil
         case .imported: L10n.text("已匯入", "Already imported")
         case .possibleDuplicate: L10n.text("可能重複", "Possible duplicate")
-        case .changed: L10n.text("生日與舊規則不同，匯入不會覆寫舊規則", "This birthday differs from the existing rule. Importing it will not replace that rule.")
+        case .pending: L10n.text("正在套用", "Applying")
         }
     }
 
@@ -474,17 +537,37 @@ struct BirthdayImportView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func checkIcon(_ checked: Bool) -> some View {
-        Image(systemName: checked ? "checkmark.square.fill" : "square")
-            .font(.title3)
-            .foregroundStyle(checked ? Color.accentColor : .secondary)
-            .accessibilityHidden(true)
+    private var selectAllBirthdays: some View {
+        let ids = bulkSelectable
+        let selectedCount = ids.intersection(selected).count
+        let checked = !ids.isEmpty && selectedCount == ids.count
+        return Button {
+            if checked {
+                selected.subtract(ids)
+                explicitlyUnchecked.formUnion(ids)
+            } else {
+                selected.formUnion(ids)
+                explicitlyUnchecked.subtract(ids)
+            }
+        } label: {
+            HStack(spacing: 12) {
+                SelectionMark(isSelected: checked)
+                Text(L10n.text("全選", "Select All")).fontWeight(.semibold)
+                Spacer()
+                Text(L10n.text("\(selectedCount)／\(ids.count)", "\(selectedCount)/\(ids.count)")).foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .disabled(ids.isEmpty)
+        .accessibilityAddTraits(checked ? .isSelected : [])
+        .accessibilityValue(L10n.text("已選 \(selectedCount) 筆，共 \(ids.count) 筆", "\(selectedCount) of \(ids.count) selected"))
+        .accessibilityIdentifier("birthday-select-all")
     }
 
     private func checkbox(_ title: String, checked: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack {
-                checkIcon(checked)
+                SelectionMark(isSelected: checked)
                 Text(title).foregroundStyle(.primary)
             }
             .frame(minHeight: 44)
@@ -502,7 +585,7 @@ struct BirthdayImportView: View {
 
         // A filter affects only presentation/import eligibility, not explicit selections.
         var known = Set(candidates.map(\.id))
-        let retained = candidates.filter { !explicitlyUnchecked.contains($0.id) || status($0) == .imported }
+        let retained = candidates.filter { !explicitlyUnchecked.contains($0.id) || !status($0).canSelect }
         let added = selection.candidates.filter { known.insert($0.id).inserted }
         candidates = retained + added
         selected.formIntersection(retained.map(\.id))
@@ -622,7 +705,7 @@ struct BirthdayGroupImportView: View {
     let presetCalendarIDs: () -> [String: String]
     let status: (BirthdayCandidate) -> BirthdayDuplicateStatus
     let onChoosePeople: () -> Void
-    let onImport: ([BirthdayCandidate], Int, String, Bool, String, String, Bool) throws -> Void
+    let onImport: ([BirthdayCandidate], Int, String, String, String, Bool) async throws -> Void
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
@@ -646,8 +729,8 @@ struct BirthdayGroupImportView: View {
                         switch state {
                         case .intro:
                             Text(L10n.text(
-                                "按「讀取聯絡人群組」後，iPhone 會顯示系統授權視窗。請在視窗中選擇「完整取用權限」。",
-                                "Tap Load Contact Lists to open the iPhone permission prompt, then choose Full Access."
+                                "按「讀取聯絡人群組」後，請在系統授權視窗選擇「完整取用權限」。",
+                                "Tap Load Contact Lists, then choose Full Access in the system prompt."
                             ))
                             Text(L10n.text(
                                 "CalStitch 只會讀取所選群組成員的姓名、暱稱和生日。若不想授予完整取用權限，可以改用個別選人。",
@@ -823,7 +906,7 @@ struct BirthdayGroupImportView: View {
         let store = CNContactStore()
         let keys: [any CNKeyDescriptor] = [
             CNContactFormatter.descriptorForRequiredKeys(for: .fullName),
-            CNContactGivenNameKey as NSString, CNContactFamilyNameKey as NSString,
+            CNContactGivenNameKey as NSString, CNContactMiddleNameKey as NSString, CNContactFamilyNameKey as NSString,
             CNContactOrganizationNameKey as NSString, CNContactNicknameKey as NSString,
             CNContactBirthdayKey as NSString, CNContactNonGregorianBirthdayKey as NSString
         ]

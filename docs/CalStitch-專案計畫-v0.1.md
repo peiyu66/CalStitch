@@ -15,12 +15,12 @@ CalStitch 是 iPhone 上的**行事曆規則工具**。使用者在 CalStitch �
 
 不列入首版：OpenAI 週重設、事件詳情瀏覽、多父且以任務完成狀態為條件的專案管理。直接串 Google API 或自建同步服務不在目前方案內。
 
-## 2. 目前正式版
+## 2. 目前版本
 
-- 目前正式版基準為 [1.0 (15)](development/version-history.md#build-15)。與 iPhone Air 上最後核對的 [0.1 (14)](development/version-history.md#build-14) 是同一套程式，只改版號。
-- 開發與試用回饋已全數結案。已實作而未再收到回饋的項目，依使用者確認視為沒有新問題，不保留為開發待辦。
-- GitHub Pages 提供中英文產品文件，App 支援中文及英文。
-- App Store Connect 的 1.0 草稿已選入相同功能的合規建置 [1.0 (16)](development/version-history.md#build-16)，尚未送審或在 App Store 上架。上架行政及合規流程另見[上架文件草稿](CalStitch-上架文件草稿.md)，不列入開發待辦。
+- **App Store 版：1.0.1 (36)**，支援 iPhone 和 iPad；iPad 採雙欄，可透過私人 iCloud 同步規則與分類順序。參見 [App Store](https://apps.apple.com/tw/app/calstitch/id6838189548)。
+- **實機開發版：1.0 (36)**，曾安裝於 iPhone Air 與 iPad Pro；與商店封存版的安裝及驗證紀錄分開。新開發以已上架的 1.0.1 (36) 程式為基準。
+- App 支援中文及英文；中英文指南與按版本說明的隱私聲明已在 [GitHub Pages](https://peiyu66.github.io/CalStitch/) 上線。
+- [上架文件草稿](CalStitch-上架文件草稿.md)保留既有商店文案與下次送審待辦；[開發決策紀錄](development/decision-log.md)區分規格、已實作及驗證情境。
 
 ## 3. 驗收結案
 
@@ -35,3 +35,7 @@ CalStitch 是 iPhone 上的**行事曆規則工具**。使用者在 CalStitch �
 | [英文本地化與日期格式](development/rules.md#section-11) | 已結案。 |
 
 [建置與驗證](development/build-and-test.md)保留當時的驗收方法、已驗證範圍及未涵蓋情境，供日後回歸測試使用，不代表仍有未結案問題。
+
+## 4. iCloud 規則同步與 iPad 介面
+
+iPhone/iCloud 里程碑為 1.0 (25)；之後在獨立開發分支接續 iPad 雙欄。詳見 [iCloud 規則同步計畫](development/icloud-sync-plan.md)及[開發會議與決策紀錄](development/decision-log.md)。33 至 36 版的實際驗證範圍見[版本紀錄](development/version-history.md#current-versions)。
